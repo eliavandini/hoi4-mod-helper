@@ -1,0 +1,3 @@
+/target
+# per-machine viewer state (layers, view, editor settings), recreated on first run
+/mod-helper.project.json
