@@ -258,6 +258,25 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
             out.push(Issue { severity: Severity::Warning, msg: format!("adjacency {label}: the provinces touch already"), at: None, prov: Some(a.from) });
         }
     }
+    // rivers and supply (what the build would leave out)
+    let (w, h) = (doc.w as usize, doc.h as usize);
+    let ras = super::rivers::rasterize(&d.rivers, w, h, super::supply::ground(d, &doc.labels));
+    for p in &ras.problems {
+        out.push(Issue { severity: Severity::Warning, msg: p.msg.clone(), at: Some(p.at), prov: None });
+    }
+    let plan = super::supply::plan(d, &doc.stats, &doc.labels, &Default::default());
+    let px = |pt: [f32; 2]| Some([pt[0].max(0.0) as u32, pt[1].max(0.0) as u32]);
+    for (ri, msg) in &plan.lines.faults {
+        let at = d.railways.as_ref().and_then(|r| r.get(*ri)).and_then(|r| r.stops.first().copied()).and_then(px);
+        out.push(Issue { severity: Severity::Warning, msg: format!("railway {}: {msg}", ri + 1), at, prov: None });
+    }
+    for &i in &plan.bad_hubs {
+        let at = d.supply_hubs.as_ref().and_then(|h| h.get(i).copied()).and_then(px);
+        out.push(Issue { severity: Severity::Warning, msg: format!("supply hub {} is not on passable land (left out)", i + 1), at, prov: None });
+    }
+    for &i in &plan.bad_ports {
+        out.push(Issue { severity: Severity::Warning, msg: format!("port {} is not on a coast (left out)", i + 1), at: px(d.ports[i].at), prov: None });
+    }
     out.sort_by(|a, b| a.severity.cmp(&b.severity));
     out
 }

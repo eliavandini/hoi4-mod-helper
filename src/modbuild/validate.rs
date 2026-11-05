@@ -89,6 +89,13 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
         log(&format!("  {name}.bmp {}x{} {}-bit (vanilla {}x{} -> expected {}x{})", b.w, b.h, b.bpp, v.w, v.h, exp.0, exp.1));
         c.check(b.bpp == want_bpp && b.compression == 0 && (b.w, b.h) == exp, || format!("{name}.bmp format/size"));
     }
+    {
+        let rv = img::read_bmp(&m.join("rivers.bmp"))?;
+        let breaks = crate::editor::rivers::check(&rv.data, rv.w as usize, rv.h as usize);
+        let river_px = rv.data.iter().filter(|&&v| crate::editor::rivers::is_river(v)).count();
+        log(&format!("  rivers: {river_px} px, {} breaks of the river rules", breaks.len()));
+        c.check(breaks.is_empty(), || format!("rivers.bmp: {} at {:?}", breaks[0].1, breaks[0].0));
+    }
     let tp = img::read_bmp(&m.join("terrain.bmp"))?.palette;
     let vp = img::read_bmp(&g.join("map/terrain.bmp"))?.palette;
     let k = tp.len().min(vp.len());
@@ -186,6 +193,7 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
     let mut cat_of: BTreeMap<u32, String> = BTreeMap::new();
     let mut blds: BTreeMap<u32, BTreeMap<String, u32>> = BTreeMap::new();
     let mut imp_states: HashSet<u32> = HashSet::new();
+    let mut naval_bases: Vec<(u32, u32, u32, bool)> = Vec::new();
     for f in txt_files(&md.join("history/states"))? {
         let t = read_text(&f)?;
         let name = f.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -210,7 +218,16 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
         if t.contains("impassable = yes") {
             imp_states.insert(sid);
         }
+        for x in re(r"(\d+)\s*=\s*\{\s*naval_base\s*=\s*(\d+)").captures_iter(&t) {
+            let (p, lv): (u32, u32) = (x[1].parse()?, x[2].parse()?);
+            naval_bases.push((sid, p, lv, provs.contains(&p)));
+        }
     }
+    for &(sid, p, lv, inside) in &naval_bases {
+        c.check(inside && is(p, "land") && nb.get(p as usize).is_some_and(|s| s.iter().any(|&q| is(q, "sea"))), || format!("naval base in province {p} of state {sid}: not a coastal province of the state"));
+        c.check((1..=10).contains(&lv), || format!("naval base in province {p}: level {lv}"));
+    }
+    log(&format!("naval bases: {}", naval_bases.len()));
     let land: Vec<u32> = (1..=n as u32).filter(|&p| is(p, "land")).collect();
     let mut sp: Vec<u32> = state_prov.keys().copied().collect();
     sp.sort();
@@ -399,6 +416,7 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
         }
         nrails += 1;
         c.check(r[1] as usize == r.len() - 2, || "railway count".into());
+        c.check((1..=5).contains(&r[0]), || format!("railway {l:?}: level {} (1 to 5)", r[0]));
         let path = &r[2..];
         rail_len += path.len();
         let head = || format!("{:?}..", &path[..3.min(path.len())]);

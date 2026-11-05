@@ -1,6 +1,6 @@
-//! Terrain-aware province density, as in make_provinces.py: built-up land gets
-//! the smallest provinces, then valley floors, slopes, and high mountains the
-//! largest.
+//! Terrain-aware province density: a wanted province size for every pixel,
+//! from the user's height and slope rules, with smaller provinces on
+//! built-up land.
 
 use std::path::Path;
 
@@ -25,16 +25,63 @@ pub struct Terrain {
     pub urban: Vec<u8>,
     /// Sealed (built-up) pixel.
     pub sealed: Vec<bool>,
+    /// What the mod build's terrain rule looks at, per pixel: [`FOREST`],
+    /// [`STEEP`], [`GENTLE`] and [`HIGH`] bits.
+    pub class: Vec<u8>,
+}
+
+pub const FOREST: u8 = 1;
+/// Slope 25° or more (not smoothed).
+pub const STEEP: u8 = 2;
+/// Slope under 10°.
+pub const GENTLE: u8 = 4;
+/// 2200 m or more.
+pub const HIGH: u8 = 8;
+
+/// A province size for the land within a height and slope range. A missing
+/// limit means none.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerrainRule {
+    /// Shown in the editor only.
+    pub name: String,
+    /// From this height up (m).
+    pub from_m: Option<f32>,
+    /// Below this height (m).
+    pub below_m: Option<f32>,
+    /// From this slope up (degrees, mean over 9×9 px).
+    pub from_slope: Option<f32>,
+    /// Below this slope.
+    pub below_slope: Option<f32>,
+    pub km2: f32,
+}
+
+impl Default for TerrainRule {
+    fn default() -> Self {
+        TerrainRule { name: "new rule".into(), from_m: None, below_m: None, from_slope: None, below_slope: None, km2: 8.0 }
+    }
+}
+
+impl TerrainRule {
+    pub fn matches(&self, height: f32, slope: f32) -> bool {
+        self.from_m.is_none_or(|v| height >= v)
+            && self.below_m.is_none_or(|v| height < v)
+            && self.from_slope.is_none_or(|v| slope >= v)
+            && self.below_slope.is_none_or(|v| slope < v)
+    }
 }
 
 /// Wanted province sizes (km²) by terrain; `detail` multiplies the number of
 /// provinces (2 = twice as many, half the size).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "StoredDensity")]
 pub struct DensityParams {
+    /// Built-up land (where it asks for smaller provinces than its rule).
     pub urban_km2: f32,
-    pub valley_km2: f32,
-    pub slope_km2: f32,
-    pub mountain_km2: f32,
+    /// Land by height and slope: the first rule that matches a pixel.
+    pub rules: Vec<TerrainRule>,
+    /// Land no rule matches.
+    pub other_km2: f32,
     /// Size of sea provinces.
     pub sea_km2: f32,
     pub detail: f32,
@@ -43,7 +90,48 @@ pub struct DensityParams {
 impl Default for DensityParams {
     fn default() -> Self {
         // make_provinces.py defaults
-        DensityParams { urban_km2: 0.5, valley_km2: 1.5, slope_km2: 8.0, mountain_km2: 30.0, sea_km2: 0.8, detail: 1.0 }
+        DensityParams::from(StoredDensity::default())
+    }
+}
+
+impl DensityParams {
+    /// Province size (km²) of land at this height and slope, before
+    /// built-up areas and `detail`.
+    pub fn land_km2(&self, height: f32, slope: f32) -> f32 {
+        self.rules.iter().find(|r| r.matches(height, slope)).map_or(self.other_km2, |r| r.km2)
+    }
+}
+
+/// What settings files hold: the rules, or the fixed sizes from before them.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct StoredDensity {
+    urban_km2: Option<f32>,
+    rules: Option<Vec<TerrainRule>>,
+    other_km2: Option<f32>,
+    sea_km2: Option<f32>,
+    detail: Option<f32>,
+    // before the rules: valley floors below 1600 m and 12°, mountains from 2000 m
+    valley_km2: Option<f32>,
+    slope_km2: Option<f32>,
+    mountain_km2: Option<f32>,
+}
+
+impl From<StoredDensity> for DensityParams {
+    fn from(s: StoredDensity) -> Self {
+        let rules = s.rules.unwrap_or_else(|| {
+            vec![
+                TerrainRule { name: "valley floors".into(), below_m: Some(1600.0), below_slope: Some(12.0), km2: s.valley_km2.unwrap_or(1.5), ..Default::default() },
+                TerrainRule { name: "mountains".into(), from_m: Some(2000.0), km2: s.mountain_km2.unwrap_or(30.0), ..Default::default() },
+            ]
+        });
+        DensityParams {
+            urban_km2: s.urban_km2.unwrap_or(0.5),
+            rules,
+            other_km2: s.other_km2.or(s.slope_km2).unwrap_or(8.0),
+            sea_km2: s.sea_km2.unwrap_or(0.8),
+            detail: s.detail.unwrap_or(1.0),
+        }
     }
 }
 
@@ -82,11 +170,18 @@ pub fn load_terrain(dir: &Path, w: u32, h: u32, pixel_m: f64, progress: &Progres
             })
         })
         .collect();
+    let class: Vec<u8> = (0..wu * hu)
+        .into_par_iter()
+        .map(|i| {
+            let s = slope_deg[i];
+            (matches!(lc[i], 2..=4) as u8 * FOREST) | ((s >= 25.0) as u8 * STEEP) | ((s < 10.0) as u8 * GENTLE) | ((dem[i] >= 2200.0) as u8 * HIGH)
+        })
+        .collect();
     let slope = box_mean(&slope_deg, wu, hu, 4).into_iter().map(|v| v.round().clamp(0.0, 255.0) as u8).collect();
     let sealed: Vec<bool> = lc.iter().map(|&c| c == SEALED).collect();
     let sealed_f: Vec<f32> = sealed.iter().map(|&s| s as u8 as f32).collect();
     let urban = box_mean(&sealed_f, wu, hu, 7).into_iter().map(|v| (v * 255.0).round().clamp(0.0, 255.0) as u8).collect();
-    Ok(Terrain { w, h, dem, slope, urban, sealed })
+    Ok(Terrain { w, h, dem, slope, urban, sealed, class })
 }
 
 /// Mean over a (2r+1)² window (shrunk at the borders).
@@ -129,13 +224,9 @@ pub fn density(t: &Terrain, p: &DensityParams) -> Vec<f32> {
     let raw: Vec<f32> = (0..t.dem.len())
         .into_par_iter()
         .map(|i| {
-            let dem = t.dem[i];
-            let mut d = if dem >= 2000.0 { 1.0 / p.mountain_km2 } else { 1.0 / p.slope_km2 };
-            if (t.slope[i] as f32) < 12.0 && dem < 1600.0 {
-                d = 1.0 / p.valley_km2;
-            }
+            let mut d = 1.0 / p.land_km2(t.dem[i], t.slope[i] as f32).max(0.001);
             let urban = t.urban[i] as f32 / 255.0;
-            d = d.max((urban / 0.3).clamp(0.0, 1.0) / p.urban_km2);
+            d = d.max((urban / 0.3).clamp(0.0, 1.0) / p.urban_km2.max(0.001));
             d * p.detail
         })
         .collect();
@@ -148,6 +239,31 @@ pub fn density(t: &Terrain, p: &DensityParams) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rules_first_match_wins() {
+        let p = DensityParams::default();
+        assert_eq!(p.land_km2(1000.0, 5.0), 1.5); // valley floor
+        assert_eq!(p.land_km2(1000.0, 20.0), 8.0); // slope: no rule
+        assert_eq!(p.land_km2(1800.0, 5.0), 8.0);
+        assert_eq!(p.land_km2(2000.0, 5.0), 30.0);
+        let mut q = p.clone();
+        q.rules.insert(0, TerrainRule { from_m: Some(2500.0), km2: 60.0, ..Default::default() });
+        assert_eq!(q.land_km2(2600.0, 30.0), 60.0);
+        assert_eq!(q.land_km2(2400.0, 30.0), 30.0);
+    }
+
+    #[test]
+    fn old_settings_become_rules() {
+        let old = r#"{"urban_km2":0.1,"valley_km2":0.13,"slope_km2":3.0,"mountain_km2":30.0,"sea_km2":0.8,"detail":1.0}"#;
+        let p: DensityParams = serde_json::from_str(old).unwrap();
+        assert_eq!((p.urban_km2, p.other_km2, p.rules.len()), (0.1, 3.0, 2));
+        assert_eq!(p.land_km2(1000.0, 5.0), 0.13);
+        assert_eq!(p.land_km2(2100.0, 5.0), 30.0);
+        // and the new form reads back as it was written
+        let back: DensityParams = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
 
     #[test]
     fn box_mean_of_constant_is_constant() {

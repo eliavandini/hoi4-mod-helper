@@ -187,8 +187,10 @@ pub struct Limits {
 }
 
 /// Cut pixels into about `k` compact clusters of equal weight, raising k until
-/// every cluster fits `lim` (box and size). Returns a cluster per pixel.
-pub fn split_pixels(pts: &[[u32; 2]], w: &[f32], k: usize, lim: &Limits, seed: u64) -> Vec<u32> {
+/// every cluster fits `lim` (box and size). With `organic` > 0 the borders
+/// wind (see [`Warp`]) instead of running straight between the centres.
+/// Returns a cluster per pixel.
+pub fn split_pixels(pts: &[[u32; 2]], w: &[f32], k: usize, lim: &Limits, seed: u64, organic: f32) -> Vec<u32> {
     let n = pts.len();
     let fits = |lbl: &[u32], k: usize| {
         let mut b = vec![[u32::MAX, u32::MAX, 0u32, 0u32, 0u32]; k];
@@ -215,21 +217,150 @@ pub fn split_pixels(pts: &[[u32; 2]], w: &[f32], k: usize, lim: &Limits, seed: u
     let sw: Vec<f32> = sample.iter().map(|&i| w[i]).collect();
     let kmax = (n / lim.min_px.max(1) as usize).max(1);
     let mut lbl = vec![0; n];
+    let mut centres = Vec::new();
+    let mut straight_fits = false;
     for _ in 0..40 {
         k = k.min(kmax).max(1);
-        let centres = kmeans(&spts, &sw, k, 50, &mut rng);
+        centres = kmeans(&spts, &sw, k, 50, &mut rng);
         lbl = assign(&fpts, &centres);
-        if fits(&lbl, centres.len()) || k >= kmax {
+        straight_fits = fits(&lbl, centres.len());
+        if straight_fits || k >= kmax {
             break;
         }
         k += (k / 8).max(1);
     }
+    if organic <= 0.0 || centres.len() < 2 {
+        return lbl;
+    }
+    // the same centres, but each pixel finds its nearest one from a displaced
+    // position: the borders bend. Kept if the pieces still fit (else with a
+    // few more pieces; else straight borders).
+    let warp = Warp { strength: organic, seed: seed ^ 0x0516_A11C_B0DE_5EED };
+    let wsum: f64 = w.iter().map(|&x| x.max(0.0) as f64).sum();
+    let top = lim.max_w.max(lim.max_h) as f32;
+    for _ in 0..6 {
+        let kc = centres.len() as f64;
+        // cells are about sqrt(px per cell) across: from the weights where
+        // there are any (finer where the density is higher), else even
+        let per = wsum / kc;
+        let even = (n as f64 / kc).sqrt() as f32;
+        let bent: Vec<[f32; 2]> = fpts
+            .par_iter()
+            .zip(w.par_iter())
+            .map(|(&p, &wi)| {
+                let s = if per > 0.0 && wi > 0.0 { (per / wi as f64).sqrt() as f32 } else { even };
+                warp.apply(p, s.clamp(4.0, top), FINE_PX)
+            })
+            .collect();
+        let l2 = assign(&bent, &centres);
+        if !straight_fits || fits(&l2, centres.len()) {
+            return l2;
+        }
+        if k >= kmax {
+            break;
+        }
+        k = (k + (k / 8).max(1)).min(kmax);
+        centres = kmeans(&spts, &sw, k, 50, &mut rng);
+    }
     lbl
+}
+
+/// Smallest bends of province borders (px).
+const FINE_PX: f32 = 4.0;
+
+/// Smooth random displacement of points ("domain warp"). Points that pick
+/// their nearest centre from a displaced position draw cells whose borders
+/// wind like natural ones instead of running straight: bends at every
+/// scale from the cell size down, each about as deep as it is long times
+/// [`Warp::DEPTH`].
+#[derive(Clone, Copy, Debug)]
+pub struct Warp {
+    /// 0: straight borders; 1: the default bends.
+    pub strength: f32,
+    pub seed: u64,
+}
+
+impl Warp {
+    /// Depth of a bend per length at strength 1.
+    pub const DEPTH: f32 = 0.22;
+    /// Small bends are shallower than large ones by (length ratio)^SMOOTH.
+    pub const SMOOTH: f32 = 1.35;
+
+    /// `p` moved, where cells are about `scale` across; bends shorter than
+    /// `fine` are left out. Every point of one cut must use the same `fine`.
+    pub fn apply(&self, p: [f32; 2], scale: f32, fine: f32) -> [f32; 2] {
+        if self.strength <= 0.0 {
+            return p;
+        }
+        let (mut dx, mut dy) = (0f32, 0f32);
+        let mut len = fine.max(1.0);
+        let mut octave = 0u64;
+        // bends up to twice the cell size, fading out above the cell size
+        while len < 2.0 * scale {
+            let fade = (2.0 - len / scale).clamp(0.0, 1.0);
+            let a = Self::DEPTH * self.strength * scale * (len.min(scale) / scale).powf(Self::SMOOTH) * fade;
+            let s = self.seed.wrapping_add(octave.wrapping_mul(0x632B_E59B_D9B4_E019));
+            let (x, y) = (p[0] / len, p[1] / len);
+            dx += a * noise(s, x, y);
+            dy += a * noise(s ^ 0xA076_1D64_78BD_642F, x + 0.37, y - 0.61);
+            len *= 2.0;
+            octave += 1;
+        }
+        [p[0] + dx, p[1] + dy]
+    }
+}
+
+/// 16 unit gradient directions.
+#[allow(clippy::approx_constant)]
+const GRAD: [[f32; 2]; 16] = [
+    [1.0, 0.0],
+    [0.92388, 0.382683],
+    [0.707107, 0.707107],
+    [0.382683, 0.92388],
+    [0.0, 1.0],
+    [-0.382683, 0.92388],
+    [-0.707107, 0.707107],
+    [-0.92388, 0.382683],
+    [-1.0, 0.0],
+    [-0.92388, -0.382683],
+    [-0.707107, -0.707107],
+    [-0.382683, -0.92388],
+    [0.0, -1.0],
+    [0.382683, -0.92388],
+    [0.707107, -0.707107],
+    [0.92388, -0.382683],
+];
+
+fn lattice(seed: u64, x: i32, y: i32) -> [f32; 2] {
+    let mut z = seed ^ (x as u32 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (y as u32 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    GRAD[((z ^ (z >> 31)) & 15) as usize]
+}
+
+/// Gradient (Perlin) noise with features about 1 unit apart, roughly -1..1.
+fn noise(seed: u64, x: f32, y: f32) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (ix, iy) = (x0 as i32, y0 as i32);
+    let (fx, fy) = (x - x0, y - y0);
+    let dot = |dx: i32, dy: i32| {
+        let g = lattice(seed, ix + dx, iy + dy);
+        g[0] * (fx - dx as f32) + g[1] * (fy - dy as f32)
+    };
+    let ease = |t: f32| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    let (u, v) = (ease(fx), ease(fy));
+    let (a, b) = (dot(0, 0), dot(1, 0));
+    let (c, d) = (dot(0, 1), dot(1, 1));
+    let top = a + u * (b - a);
+    let bottom = c + u * (d - c);
+    (top + v * (bottom - top)) * 1.4
 }
 
 /// Group nodes (provinces, states) into `k` contiguous groups of about equal
 /// weight. `nb` lists neighbours by node index. Returns a group per node.
-pub fn partition(pos: &[[f32; 2]], w: &[f32], nb: &[Vec<usize>], k: usize, seed: u64) -> Vec<u32> {
+/// `w` is the area of each node (px); with `organic` > 0 the outlines of the
+/// groups wind (see [`Warp`]).
+pub fn partition(pos: &[[f32; 2]], w: &[f32], nb: &[Vec<usize>], k: usize, seed: u64, organic: f32) -> Vec<u32> {
     let n = pos.len();
     if n == 0 {
         return Vec::new();
@@ -237,7 +368,18 @@ pub fn partition(pos: &[[f32; 2]], w: &[f32], nb: &[Vec<usize>], k: usize, seed:
     let k = k.clamp(1, n);
     let mut rng = Rng::new(seed);
     let centres = kmeans(pos, w, k, 60, &mut rng);
-    let mut lbl = assign(pos, &centres);
+    let mut lbl = if organic > 0.0 && k > 1 {
+        // groups are about sqrt(area / k) across, nodes sqrt(area / n): bends
+        // from the node size up
+        let area: f64 = w.iter().map(|&x| x.max(0.0) as f64).sum();
+        let scale = (area / k as f64).sqrt() as f32;
+        let fine = (area / n as f64).sqrt() as f32;
+        let warp = Warp { strength: organic, seed: seed ^ 0x0516_A11C_B0DE_5EED };
+        let bent: Vec<[f32; 2]> = pos.iter().map(|&p| warp.apply(p, scale.max(1.0), fine.max(1.0))).collect();
+        assign(&bent, &centres)
+    } else {
+        assign(pos, &centres)
+    };
     make_contiguous(&mut lbl, nb, w);
     lbl
 }
@@ -325,7 +467,7 @@ mod tests {
         let pts: Vec<[u32; 2]> = (0..200).flat_map(|y| (0..300).map(move |x| [x, y])).collect();
         let w = vec![1.0 / pts.len() as f32; pts.len()];
         let lim = Limits { max_w: 100, max_h: 100, max_px: u32::MAX, min_px: 8 };
-        let lbl = split_pixels(&pts, &w, 1, &lim, 1);
+        let lbl = split_pixels(&pts, &w, 1, &lim, 1, 1.0);
         let k = *lbl.iter().max().unwrap() as usize + 1;
         assert!(k >= 6, "need at least 6 pieces of < 100 px, got {k}");
         for c in 0..k as u32 {
@@ -336,12 +478,86 @@ mod tests {
         }
     }
 
+    /// Mean distance (px) of border pixels from the straight line through the
+    /// border of each pair of clusters (pairs with at least 20 border pixels).
+    fn crookedness(lbl: &[u32], w: usize) -> f64 {
+        let mut by_pair: std::collections::HashMap<(u32, u32), Vec<[f64; 2]>> = Default::default();
+        for i in 0..lbl.len() {
+            for j in [i + 1, i + w] {
+                if j < lbl.len() && (j != i + 1 || i % w + 1 < w) && lbl[i] != lbl[j] {
+                    let key = (lbl[i].min(lbl[j]), lbl[i].max(lbl[j]));
+                    by_pair.entry(key).or_default().push([(i % w) as f64, (i / w) as f64]);
+                }
+            }
+        }
+        let mut dev = Vec::new();
+        for pts in by_pair.values().filter(|v| v.len() >= 20) {
+            let n = pts.len() as f64;
+            let (mx, my) = (pts.iter().map(|p| p[0]).sum::<f64>() / n, pts.iter().map(|p| p[1]).sum::<f64>() / n);
+            let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+            for p in pts {
+                let (dx, dy) = (p[0] - mx, p[1] - my);
+                sxx += dx * dx;
+                syy += dy * dy;
+                sxy += dx * dy;
+            }
+            // distance from the main axis: the smaller eigenvalue of the covariance
+            let tr = sxx + syy;
+            let det = sxx * syy - sxy * sxy;
+            let small = tr / 2.0 - ((tr * tr / 4.0 - det).max(0.0)).sqrt();
+            dev.push((small / n).max(0.0).sqrt());
+        }
+        dev.iter().sum::<f64>() / dev.len().max(1) as f64
+    }
+
+    #[test]
+    fn organic_borders_wind() {
+        let (w, h) = (300u32, 200u32);
+        let pts: Vec<[u32; 2]> = (0..h).flat_map(|y| (0..w).map(move |x| [x, y])).collect();
+        let wt = vec![30.0 / pts.len() as f32; pts.len()];
+        let lim = Limits { max_w: 1000, max_h: 1000, max_px: u32::MAX, min_px: 9 };
+        let straight = split_pixels(&pts, &wt, 30, &lim, 3, 0.0);
+        let bent = split_pixels(&pts, &wt, 30, &lim, 3, 1.0);
+        assert_eq!(bent, split_pixels(&pts, &wt, 30, &lim, 3, 1.0), "same seed, same cut");
+        let count = |l: &[u32]| l.iter().collect::<std::collections::HashSet<_>>().len();
+        assert_eq!(count(&straight), count(&bent));
+        let (a, b) = (crookedness(&straight, w as usize), crookedness(&bent, w as usize));
+        assert!(a < 0.5 && b > 2.0 * a.max(0.2), "borders stray from straight lines by {a:.2} px, winding ones by {b:.2} px");
+        // the pieces stay about the same size
+        let sizes = |l: &[u32]| {
+            let mut s = vec![0usize; 30];
+            l.iter().for_each(|&c| s[c as usize] += 1);
+            s
+        };
+        let (s0, s1) = (sizes(&straight), sizes(&bent));
+        for c in 0..30 {
+            assert!((s1[c] as f32 - s0[c] as f32).abs() < s0[c] as f32 * 0.5, "cluster {c}: {} -> {}", s0[c], s1[c]);
+        }
+    }
+
+    #[test]
+    fn warp_is_smooth() {
+        let warp = Warp { strength: 1.0, seed: 9 };
+        let mut max_move = 0f32;
+        for y in 0..60 {
+            for x in 0..60 {
+                let p = [x as f32 * 3.7, y as f32 * 2.9];
+                let (a, b) = (warp.apply(p, 40.0, 4.0), warp.apply([p[0] + 1.0, p[1]], 40.0, 4.0));
+                max_move = max_move.max((a[0] - p[0]).hypot(a[1] - p[1]));
+                // neighbouring pixels move nearly alike
+                assert!((b[0] - a[0] - 1.0).hypot(b[1] - a[1]) < 1.5, "{p:?}");
+            }
+        }
+        assert!(max_move > 2.0 && max_move < 40.0, "{max_move}");
+        assert_eq!(Warp { strength: 0.0, seed: 9 }.apply([5.0, 7.0], 40.0, 4.0), [5.0, 7.0]);
+    }
+
     #[test]
     fn partition_is_contiguous() {
         // a 1-D chain of 30 nodes, split in 3: each group must be one run
         let pos: Vec<[f32; 2]> = (0..30).map(|i| [i as f32 * 10.0, if i % 2 == 0 { 0.0 } else { 3.0 }]).collect();
         let nb: Vec<Vec<usize>> = (0..30usize).map(|i| [i.wrapping_sub(1), i + 1].into_iter().filter(|&j| j < 30).collect()).collect();
-        let lbl = partition(&pos, &vec![1.0; 30], &nb, 3, 5);
+        let lbl = partition(&pos, &vec![1.0; 30], &nb, 3, 5, 1.0);
         let changes = lbl.windows(2).filter(|w| w[0] != w[1]).count();
         let groups: std::collections::HashSet<u32> = lbl.iter().copied().collect();
         assert_eq!(changes + 1, groups.len(), "{lbl:?}");

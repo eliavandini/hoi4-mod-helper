@@ -1,48 +1,9 @@
-//! Railways: shortest paths between victory points, a minimum spanning tree
-//! over neighbouring states, and the rail links chained into lines.
+//! Railways: a minimum spanning tree over neighbouring states, and the rail
+//! links chained into lines (the shortest ways are in editor::supply).
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
-
-#[derive(PartialEq)]
-struct Item(f64, usize);
-impl Eq for Item {}
-impl PartialOrd for Item {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for Item {
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.0.total_cmp(&self.0).then(o.1.cmp(&self.1)) // min-heap
-    }
-}
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const NONE: usize = usize::MAX;
-
-/// Distances and predecessors (NONE for the source and unreachable nodes)
-/// from `src` over a graph given as adjacency lists of (node, weight).
-pub fn dijkstra(adj: &[Vec<(usize, f64)>], src: usize) -> (Vec<f64>, Vec<usize>) {
-    let mut dist = vec![f64::INFINITY; adj.len()];
-    let mut pred = vec![NONE; adj.len()];
-    let mut heap = BinaryHeap::new();
-    dist[src] = 0.0;
-    heap.push(Item(0.0, src));
-    while let Some(Item(d, u)) = heap.pop() {
-        if d > dist[u] {
-            continue;
-        }
-        for &(v, w) in &adj[u] {
-            let nd = d + w;
-            if nd < dist[v] {
-                dist[v] = nd;
-                pred[v] = u;
-                heap.push(Item(nd, v));
-            }
-        }
-    }
-    (dist, pred)
-}
 
 /// Kruskal's minimum spanning forest of the undirected edges (i, j, weight).
 pub fn spanning_tree(n: usize, edges: &[(usize, usize, f64)]) -> Vec<(usize, usize)> {
@@ -105,16 +66,6 @@ pub fn rail_chains(edges: &BTreeSet<(u32, u32)>) -> Vec<Vec<u32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn shortest_paths() {
-        // 0 -1- 1 -1- 2, and 0 -5- 2
-        let adj = vec![vec![(1, 1.0), (2, 5.0)], vec![(0, 1.0), (2, 1.0)], vec![(1, 1.0), (0, 5.0)]];
-        let (d, p) = dijkstra(&adj, 0);
-        assert_eq!(d, vec![0.0, 1.0, 2.0]);
-        assert_eq!(p[2], 1);
-        assert_eq!(p[0], NONE);
-    }
 
     #[test]
     fn tree_takes_cheapest() {

@@ -14,7 +14,7 @@ use super::kmeans::{self, Limits};
 use super::model::{Adjacency, Id, Index, Kind, Labels, Nation, Province, Region, State};
 
 /// Parameters of the generate tools.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GenParams {
     pub density: DensityParams,
@@ -27,6 +27,9 @@ pub struct GenParams {
     pub state_provinces: f32,
     pub state_max_km2: f32,
     pub region_km2: f32,
+    /// How much generated borders wind: 0 straight lines between the
+    /// centres, 1 gentle bends (see [`kmeans::Warp`]).
+    pub organic: f32,
 }
 
 impl Default for GenParams {
@@ -39,6 +42,7 @@ impl Default for GenParams {
             state_provinces: 10.0,
             state_max_km2: 300.0,
             region_km2: 1500.0,
+            organic: 1.0,
         }
     }
 }
@@ -75,6 +79,67 @@ fn seg_dist2(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let t = if l2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
     let (qx, qy) = (a[0] + t * dx - p[0], a[1] + t * dy - p[1]);
     qx * qx + qy * qy
+}
+
+/// HOI4's smallest province, in pixels.
+pub const MIN_PROVINCE_PX: u32 = 8;
+
+/// The pixels a shape takes (`take`, over labels `lab`), tidied: its specks
+/// under [`MIN_PROVINCE_PX`] (by the new province they go to, `target` of the
+/// province under them) stay as they are, and a province it leaves fewer
+/// than that goes with it entirely. `size`: pixels of a province.
+fn tidy_shape(take: &mut [bool], lab: &[Id], w: usize, target: &[Id], size: impl Fn(Id) -> u32) {
+    let n = take.len();
+    let mut seen = vec![false; n];
+    let mut stack = Vec::new();
+    let mut part = Vec::new();
+    for s in 0..n {
+        if !take[s] || seen[s] {
+            continue;
+        }
+        let t = target[lab[s] as usize];
+        seen[s] = true;
+        stack.push(s);
+        part.clear();
+        while let Some(i) = stack.pop() {
+            part.push(i);
+            let x = i % w;
+            for (ok, j) in [(x > 0, i.wrapping_sub(1)), (x + 1 < w, i + 1), (i >= w, i.wrapping_sub(w)), (i + w < n, i + w)] {
+                if ok && take[j] && !seen[j] && target[lab[j] as usize] == t {
+                    seen[j] = true;
+                    stack.push(j);
+                }
+            }
+        }
+        if part.len() < MIN_PROVINCE_PX as usize {
+            for &i in &part {
+                take[i] = false;
+            }
+        }
+    }
+    let mut taken = vec![0u32; target.len()];
+    for (&p, _) in lab.iter().zip(take.iter()).filter(|(_, t)| **t) {
+        taken[p as usize] += 1;
+    }
+    let whole: Vec<bool> = taken.iter().enumerate().map(|(p, &k)| k > 0 && (1..MIN_PROVINCE_PX).contains(&size(p as Id).saturating_sub(k))).collect();
+    for (t, &p) in take.iter_mut().zip(lab) {
+        *t |= whole[p as usize];
+    }
+}
+
+/// Whether a new province of kind `new` takes the pixels of a province of
+/// kind `under` ("only over …"): the same kind, and for removed land also
+/// land in play (never sea, as with "Remove from play").
+pub fn shape_takes(new: Kind, under: Kind) -> bool {
+    under == new || (new == Kind::Lake && under == Kind::Land)
+}
+
+fn kind_word(k: Kind) -> &'static str {
+    match k {
+        Kind::Land => "land",
+        Kind::Sea => "sea",
+        Kind::Lake => "land or removed",
+    }
 }
 
 pub fn roman(n: usize) -> String {
@@ -388,8 +453,20 @@ impl Doc {
 
     /// Re-cut provinces (see [`Retile`]). Returns (provinces before, after).
     pub fn retile(&mut self, ids: &[Id], mode: Retile, g: &GenParams) -> Result<(usize, usize)> {
+        self.retile_round(ids, mode, g, 0)
+    }
+
+    /// One round of [`Self::retile`]. Joining stray bits to a neighbouring
+    /// piece can make it larger than HOI4 allows: those pieces are cut once
+    /// more, smaller (up to three rounds; not with `Count`, which asks for a
+    /// number of pieces).
+    fn retile_round(&mut self, ids: &[Id], mode: Retile, g: &GenParams, round: u32) -> Result<(usize, usize)> {
         let km2 = self.data.km2_per_px() as f32;
         let mut lim = self.limits(g);
+        let smaller = 0.85f32.powi(round as i32);
+        lim.max_w = ((lim.max_w as f32 * smaller) as u32).max(8);
+        lim.max_h = ((lim.max_h as f32 * smaller) as u32).max(8);
+        let (hoi_w, hoi_h) = ((self.w / 8) as usize, (self.h / 8) as usize);
         if matches!(mode, Retile::Coarse) {
             lim.max_px = u32::MAX;
         }
@@ -416,6 +493,7 @@ impl Doc {
         let before = ids.len();
         let mut after = 0;
         let mut touched = [usize::MAX, usize::MAX, 0, 0];
+        let mut too_big: Vec<Id> = Vec::new();
         for (gi, (_, provs)) in groups.into_iter().enumerate() {
             // pixels and their original province
             let (px, orig): (Vec<usize>, Vec<Id>) = {
@@ -458,7 +536,7 @@ impl Doc {
                     }
                 };
                 let k = (wts.iter().map(|&x| x as f64).sum::<f64>().round() as usize).max(1);
-                let lbl = kmeans::split_pixels(&pts, &wts, k, &lim, (p0 as u64) << 16 ^ (gi as u64) << 8 ^ pi as u64);
+                let lbl = kmeans::split_pixels(&pts, &wts, k, &lim, (p0 as u64) << 16 ^ (gi as u64) << 8 ^ pi as u64, g.organic);
                 let nk = lbl.iter().max().map(|&m| m + 1).unwrap_or(1);
                 for (&k, &l) in members.iter().zip(&lbl) {
                     cluster[k] = next_cluster + l;
@@ -520,16 +598,31 @@ impl Doc {
                     wr.set(i, id_of[&cluster[k]]);
                 }
             });
+            let mut boxes: FxHashMap<u32, [usize; 4]> = FxHashMap::default();
+            for (k, &i) in px.iter().enumerate() {
+                let b = boxes.entry(cluster[k]).or_insert([usize::MAX, usize::MAX, 0, 0]);
+                *b = [b[0].min(i % w), b[1].min(i / w), b[2].max(i % w), b[3].max(i / w)];
+            }
+            // as the checks measure it (the box is one wider than max - min)
+            too_big.extend(boxes.iter().filter(|(_, b)| b[2] - b[0] + 1 >= hoi_w || b[3] - b[1] + 1 >= hoi_h).map(|(c, _)| id_of[c]));
         }
         if touched[0] != usize::MAX {
             self.fix_crossings(Some([touched[0], touched[1], touched[2], touched[3]]));
+        }
+        if !too_big.is_empty() && !matches!(mode, Retile::Count(_)) && round < 3 {
+            too_big.sort_unstable();
+            self.restat();
+            let (b, a) = self.retile_round(&too_big, mode, g, round + 1)?;
+            after = after + a - b;
         }
         Ok((before, after))
     }
 
     /// Remove points where four provinces meet and diagonal-only contacts
     /// (HOI4 map errors), within `bbox` [x0, y0, x1, y1] or everywhere.
-    /// Pixels only change to a neighbouring province of the same type.
+    /// Pixels only change to a neighbouring province of the same type, or
+    /// between land and removed land where nothing else helps; never to or
+    /// from sea.
     pub fn fix_crossings(&mut self, bbox: Option<[usize; 4]>) -> usize {
         let (w, h) = (self.w as usize, self.h as usize);
         let [x0, y0, x1, y1] = bbox.map(|b| [b[0].saturating_sub(1), b[1].saturating_sub(1), (b[2] + 1).min(w - 1), (b[3] + 1).min(h - 1)]).unwrap_or([0, 0, w - 1, h - 1]);
@@ -562,17 +655,25 @@ impl Doc {
                     if !(all4 || diag) {
                         continue;
                     }
-                    // d takes b or c; else a takes b or c
-                    let same = |p: Id, q: Id| data.kind(p) == data.kind(q);
+                    // d takes b or c; else a takes b or c. Same type first;
+                    // else land and removed land may swap the pixel (where
+                    // two removed provinces touch at a corner between two
+                    // land provinces); sea never changes.
                     let pref = |p: Id, q: Id| data.state_of(p) == data.state_of(q) && data.region_of(p) == data.region_of(q);
                     let mut done = false;
-                    for (pix, cur) in [(i + w + 1, d), (i, a)] {
-                        let mut cands = [b, c];
-                        cands.sort_by_key(|&q| !pref(cur, q));
-                        if let Some(&q) = cands.iter().find(|&&q| same(cur, q)) {
-                            wr.set(pix, q);
-                            done = true;
-                            break;
+                    'kinds: for loose in [false, true] {
+                        let ok = |p: Id, q: Id| {
+                            let (kp, kq) = (data.kind(p), data.kind(q));
+                            kp == kq || (loose && kp != Kind::Sea && kq != Kind::Sea)
+                        };
+                        for (pix, cur) in [(i + w + 1, d), (i, a)] {
+                            let mut cands = [b, c];
+                            cands.sort_by_key(|&q| !pref(cur, q));
+                            if let Some(&q) = cands.iter().find(|&&q| ok(cur, q)) {
+                                wr.set(pix, q);
+                                done = true;
+                                break 'kinds;
+                            }
                         }
                     }
                     if done {
@@ -628,6 +729,162 @@ impl Doc {
 
     /// Hand the pixels of provinces to their neighbours (same type, the same
     /// state first). Returns how many could not be dissolved.
+    /// A new province of `kind` from the pixels where `in_shape(i)` (with
+    /// `only_kind`, only over provinces that [`shape_takes`]). Its state, zone
+    /// and look are those of the provinces most of it lies on. Crossings along
+    /// its edge are fixed, as after the generate tools.
+    ///
+    /// Specks of the shape under HOI4's 8 px stay as they are; what it leaves
+    /// of a province under 8 px goes with it.
+    ///
+    /// Land and sea: one province; size and separate pieces are left to the
+    /// checks. Removed land (lake) works like "Remove from play": every part
+    /// keeps its air zone (one province per zone), and with `coarsen` each is
+    /// cut into as few provinces as HOI4's size limits allow.
+    ///
+    /// Returns the new provinces and the pixels they took.
+    pub fn province_from_shape(
+        &mut self,
+        in_shape: impl Fn(usize) -> bool,
+        kind: Kind,
+        only_kind: bool,
+        name: String,
+        coarsen: Option<&GenParams>,
+    ) -> Result<(Vec<Id>, usize)> {
+        let cap = self.data.provinces.cap();
+        let kinds: Vec<Kind> = (0..cap).map(|p| self.data.kind(p as Id)).collect();
+        let takes = |p: Id| p != 0 && (p as usize) < cap && (!only_kind || shape_takes(kind, kinds[p as usize]));
+        let mut counts = vec![0u64; cap];
+        for (i, &p) in self.labels.read().px.iter().enumerate() {
+            if takes(p) && in_shape(i) {
+                counts[p as usize] += 1;
+            }
+        }
+        // the most common, ties to the lower id
+        fn most<K: Copy + Ord>(m: &BTreeMap<K, u64>) -> Option<K> {
+            m.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0))).map(|(k, _)| *k)
+        }
+        let zone_ok = |r: Id| self.data.regions.get(r).is_some_and(|z| z.naval == (kind == Kind::Sea));
+        let mut by_state = BTreeMap::new();
+        let mut by_region = BTreeMap::new();
+        for (p, &n) in counts.iter().enumerate().filter(|(_, n)| **n > 0) {
+            let p = p as Id;
+            let st = self.data.state_of(p);
+            if st != 0 {
+                *by_state.entry(st).or_insert(0) += n;
+            }
+            let r = self.data.region_of(p);
+            if zone_ok(r) {
+                *by_region.entry(r).or_insert(0u64) += n;
+            }
+        }
+        let fallback = most(&by_region).unwrap_or(0);
+        // the zone each taken province's pixels go to: their own for removed
+        // land, otherwise the one of most of the shape
+        let zone_of = |p: Id| -> Id {
+            let r = self.data.region_of(p);
+            if kind == Kind::Lake && zone_ok(r) { r } else { fallback }
+        };
+        let mut groups: BTreeMap<Id, BTreeMap<Id, u64>> = BTreeMap::new();
+        for (p, &n) in counts.iter().enumerate().filter(|(_, n)| **n > 0) {
+            groups.entry(zone_of(p as Id)).or_default().insert(p as Id, n);
+        }
+        if groups.is_empty() {
+            bail!("the shape covers no {} provinces", if only_kind { kind_word(kind) } else { "map" });
+        }
+        let state = if kind == Kind::Land { most(&by_state).unwrap_or(0) } else { 0 };
+        let first = self.data.provinces.cap() as Id;
+        let mut target = vec![0 as Id; cap];
+        for (zone, provs) in &groups {
+            let like = most(provs).unwrap();
+            let region = if *zone != 0 { *zone } else { self.data.region_of(like) };
+            let id = self.new_province(kind, state, region, name.clone(), Some(like));
+            for &p in provs.keys() {
+                target[p as usize] = id;
+            }
+        }
+        let w = self.w as usize;
+        let take = {
+            let lab = self.labels.read();
+            let mut take: Vec<bool> = lab.px.iter().enumerate().map(|(i, &p)| takes(p) && in_shape(i)).collect();
+            tidy_shape(&mut take, &lab.px, w, &target, |p| self.stats.get(p).px);
+            take
+        };
+        let (n, bbox) = self.with_pixels(|wr, _| {
+            let (mut n, mut b) = (0, [usize::MAX, usize::MAX, 0, 0]);
+            for (i, _) in take.iter().enumerate().filter(|(_, t)| **t) {
+                let cur = wr.get(i);
+                wr.set(i, target[cur as usize]);
+                n += 1;
+                let (x, y) = (i % w, i / w);
+                b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+            }
+            (n, b)
+        });
+        if n > 0 {
+            self.fix_crossings(Some(bbox));
+        }
+        if let Some(g) = coarsen.filter(|_| kind == Kind::Lake && n > 0) {
+            self.restat();
+            let made: Vec<Id> = (first..self.data.provinces.cap() as Id).filter(|&p| self.stats.get(p).px > 0).collect();
+            self.retile(&made, Retile::Coarse, g)?;
+        }
+        if n > 0 {
+            self.mend_crossings(first, bbox, |p| (p as usize) < cap && takes(p));
+        }
+        let made = (first..self.data.provinces.cap() as Id).filter(|&p| self.data.provinces.contains(p)).collect();
+        Ok((made, n))
+    }
+
+    /// Points where four provinces meet or that touch only diagonally, within
+    /// `bbox`, at the edge of new provinces (ids from `first`) and others of
+    /// another kind, which [`Self::fix_crossings`] leaves: one pixel goes from
+    /// a province the new ones `may_take` from to a new one next to it, or
+    /// back. Returns the pixels changed.
+    fn mend_crossings(&mut self, first: Id, bbox: [usize; 4], may_take: impl Fn(Id) -> bool) -> usize {
+        let (w, h) = (self.w as usize, self.h as usize);
+        let [x0, y0, x1, y1] = [bbox[0].saturating_sub(1), bbox[1].saturating_sub(1), (bbox[2] + 1).min(w - 2), (bbox[3] + 1).min(h - 2)];
+        let new = |p: Id| p >= first;
+        let bad = |f: [Id; 4]| {
+            let [a, b, c, d] = f;
+            (a != b && a != c && a != d && b != c && b != d && c != d) || (a == d && b == c && a != b)
+        };
+        self.with_pixels(|wr, _| {
+            let mut total = 0;
+            for _ in 0..20 {
+                let mut fixed = 0;
+                for y in y0..=y1 {
+                    for x in x0..=x1 {
+                        let i = y * w + x;
+                        let q = [i, i + 1, i + w, i + w + 1];
+                        let f = q.map(|j| wr.get(j));
+                        if !f.iter().any(|&p| new(p)) || !bad(f) {
+                            continue;
+                        }
+                        // pixel k of the block and its two neighbours in it
+                        let pairs = [(0, 1), (0, 2), (1, 0), (1, 3), (2, 0), (2, 3), (3, 1), (3, 2)];
+                        let grow = pairs.iter().filter(|&&(k, m)| !new(f[k]) && may_take(f[k]) && new(f[m]));
+                        let shrink = pairs.iter().filter(|&&(k, m)| new(f[k]) && !new(f[m]) && may_take(f[m]));
+                        for &(k, m) in grow.chain(shrink) {
+                            let mut g = f;
+                            g[k] = f[m];
+                            if !bad(g) {
+                                wr.set(q[k], f[m]);
+                                fixed += 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                total += fixed;
+                if fixed == 0 {
+                    break;
+                }
+            }
+            total
+        })
+    }
+
     pub fn dissolve_provinces(&mut self, ids: &[Id]) -> Result<usize> {
         let set: FxHashSet<Id> = ids.iter().copied().filter(|&p| self.data.provinces.contains(p)).collect();
         if set.is_empty() {
@@ -798,8 +1055,9 @@ impl Doc {
         provs.iter().map(|&p| self.stats.get(p).px as u64).sum()
     }
 
-    /// Partition `items` (each a set of provinces) into k contiguous groups.
-    fn partition_items(&self, items: &[Vec<Id>], k: usize, seed: u64) -> Vec<u32> {
+    /// Partition `items` (each a set of provinces) into k contiguous groups;
+    /// `organic`: how much their outlines wind.
+    fn partition_items(&self, items: &[Vec<Id>], k: usize, seed: u64, organic: f32) -> Vec<u32> {
         let pos: Vec<[f32; 2]> = items.iter().map(|v| {
             let c = self.centre_of(v);
             [c[0] as f32, c[1] as f32]
@@ -834,7 +1092,7 @@ impl Doc {
             }
         }
         let nb: Vec<Vec<usize>> = nb.into_iter().map(|s| s.into_iter().collect()).collect();
-        kmeans::partition(&pos, &w, &nb, k, seed)
+        kmeans::partition(&pos, &w, &nb, k, seed, organic)
     }
 
     // ================================================================ states
@@ -920,13 +1178,13 @@ impl Doc {
     }
 
     /// Cut a state into `k` states.
-    pub fn divide_state(&mut self, s: Id, k: usize) -> Result<Vec<Id>> {
+    pub fn divide_state(&mut self, s: Id, k: usize, organic: f32) -> Result<Vec<Id>> {
         let provs = self.index.provs_of_state(s).to_vec();
         if provs.len() < 2 {
             bail!("{} has only one province (divide the province first)", self.data.state_name(s));
         }
         let items: Vec<Vec<Id>> = provs.iter().map(|&p| vec![p]).collect();
-        let lbl = self.partition_items(&items, k.min(provs.len()), s as u64);
+        let lbl = self.partition_items(&items, k.min(provs.len()), s as u64, organic);
         Ok(self.apply_state_groups(s, &provs, &lbl))
     }
 
@@ -1045,7 +1303,7 @@ impl Doc {
                     .max(1)
                     .min(members.len());
                 let items: Vec<Vec<Id>> = members.iter().map(|&p| vec![p]).collect();
-                let lbl = self.partition_items(&items, k, n as u64 * 1000 + pi as u64);
+                let lbl = self.partition_items(&items, k, n as u64 * 1000 + pi as u64, g.organic);
                 let mut by: BTreeMap<u32, Vec<Id>> = BTreeMap::new();
                 for (i, &l) in lbl.iter().enumerate() {
                     by.entry(l).or_default().push(members[i]);
@@ -1162,13 +1420,13 @@ impl Doc {
     }
 
     /// Cut a nation into `k` nations (by its states).
-    pub fn divide_nation(&mut self, n: Id, k: usize) -> Result<Vec<Id>> {
+    pub fn divide_nation(&mut self, n: Id, k: usize, organic: f32) -> Result<Vec<Id>> {
         let states = self.index.states_of_nation(n).to_vec();
         if states.len() < 2 {
             bail!("{} has only one state (divide the state first)", self.data.nation_name(n));
         }
         let items: Vec<Vec<Id>> = states.iter().map(|&s| self.index.provs_of_state(s).to_vec()).collect();
-        let lbl = self.partition_items(&items, k.min(states.len()), n as u64);
+        let lbl = self.partition_items(&items, k.min(states.len()), n as u64, organic);
         let cap = self.data.nations.get(n).map(|x| x.capital_state).unwrap_or(0);
         let keep = states.iter().position(|&s| s == cap).map(|i| lbl[i]).unwrap_or(0);
         let mut by: BTreeMap<u32, Vec<Id>> = BTreeMap::new();
@@ -1372,14 +1630,14 @@ impl Doc {
         by.into_values().chain(loose).collect()
     }
 
-    pub fn divide_region(&mut self, r: Id, k: usize) -> Result<Vec<Id>> {
+    pub fn divide_region(&mut self, r: Id, k: usize, organic: f32) -> Result<Vec<Id>> {
         let Some(reg) = self.data.regions.get(r).cloned() else { bail!("no such zone") };
         let provs = self.index.provs_of_region(r).to_vec();
         let items = self.region_items(&provs, reg.naval);
         if items.len() < 2 {
             bail!("{} cannot be divided further", reg.name);
         }
-        let lbl = self.partition_items(&items, k.min(items.len()), r as u64);
+        let lbl = self.partition_items(&items, k.min(items.len()), r as u64, organic);
         Ok(self.apply_region_groups(r, &items, &lbl))
     }
 
@@ -1475,7 +1733,7 @@ impl Doc {
         let items = self.region_items(&provs, naval);
         let area = self.px_of(&provs) as f64 * self.data.km2_per_px();
         let k = count.unwrap_or_else(|| if naval { regs.len() } else { (area / g.region_km2.max(1.0) as f64).round().max(1.0) as usize }).clamp(1, items.len());
-        let lbl = self.partition_items(&items, k, first.id as u64 * 7);
+        let lbl = self.partition_items(&items, k, first.id as u64 * 7, g.organic);
         // reuse the selected ids for the biggest groups
         let mut size: BTreeMap<u32, u64> = BTreeMap::new();
         for (i, &l) in lbl.iter().enumerate() {
@@ -1865,7 +2123,82 @@ impl Doc {
 
 #[cfg(test)]
 mod tests {
+    use super::super::model::{Loaded, MapData};
     use super::*;
+
+    /// A map from a label raster; province i (from 1) has kinds[i - 1].
+    fn tiny_doc(w: u32, h: u32, px: Vec<Id>, kinds: &[Kind]) -> Doc {
+        let mut data = MapData {
+            provinces: Default::default(),
+            states: Default::default(),
+            nations: Default::default(),
+            regions: Default::default(),
+            adjacencies: Vec::new(),
+            header: Default::default(),
+            pixel_m: 100.0,
+            ..Default::default()
+        };
+        for (i, &kind) in kinds.iter().enumerate() {
+            data.provinces.push(|id| Province {
+                id,
+                rgb: [10 + 40 * i as u8, 0, 0],
+                kind,
+                edge: false,
+                coastal: false,
+                name: format!("p{id}"),
+                terrain: None,
+                km2: 0.0,
+                nation: None,
+                extra: Default::default(),
+                state: 0,
+                region: 0,
+            });
+        }
+        let geo = crate::geo::FileGeoInfo { transform: None, crs: None, nodata: None };
+        Doc::new(std::path::PathBuf::new(), Loaded { data, labels: Labels { w, h, px }, geo })
+    }
+
+    /// 2×2 blocks with four provinces or a diagonal-only contact.
+    fn bad_blocks(doc: &Doc) -> usize {
+        let lab = doc.labels.read();
+        let w = doc.w as usize;
+        let mut n = 0;
+        for y in 0..doc.h as usize - 1 {
+            for x in 0..w - 1 {
+                let i = y * w + x;
+                let (a, b, c, d) = (lab.px[i], lab.px[i + 1], lab.px[i + w], lab.px[i + w + 1]);
+                n += ((a != b && a != c && a != d && b != c && b != d && c != d) || (a == d && b == c && a != b)) as usize;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn crossing_between_removed_and_land_is_fixed() {
+        // removed 1 | land 2
+        // land 3    | removed 4: no two of a kind side by side at the centre
+        let px = vec![1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4];
+        let mut doc = tiny_doc(4, 4, px, &[Kind::Lake, Kind::Land, Kind::Land, Kind::Lake]);
+        assert_eq!(bad_blocks(&doc), 1);
+        doc.begin("fix");
+        assert!(doc.fix_crossings(None) > 0);
+        doc.commit();
+        assert_eq!(bad_blocks(&doc), 0);
+    }
+
+    #[test]
+    fn crossings_never_change_sea() {
+        // sea 1 | land 2 / land 3 | sea 4: cannot be fixed without touching sea
+        let px = vec![1, 1, 2, 2, 1, 1, 2, 2, 3, 3, 4, 4, 3, 3, 4, 4];
+        let mut doc = tiny_doc(4, 4, px.clone(), &[Kind::Sea, Kind::Land, Kind::Land, Kind::Sea]);
+        doc.begin("fix");
+        doc.fix_crossings(None);
+        doc.commit();
+        let lab = doc.labels.read();
+        for (i, &p) in px.iter().enumerate() {
+            assert_eq!(p == 1 || p == 4, lab.px[i] == 1 || lab.px[i] == 4, "pixel {i}");
+        }
+    }
 
     #[test]
     fn roman_numerals() {

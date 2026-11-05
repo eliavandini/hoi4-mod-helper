@@ -10,11 +10,17 @@
 pub mod build;
 pub mod density;
 pub mod doc;
+pub mod from_image;
 pub mod kmeans;
 pub mod launcher;
 pub mod model;
 pub mod ops;
 pub mod render;
+pub mod rivers;
+mod pending;
+mod rivers_ui;
+pub mod supply;
+mod supply_ui;
 pub mod validate;
 
 #[cfg(test)]
@@ -36,7 +42,7 @@ use crate::tiles::TileManager;
 use crate::util::Progress;
 use crate::view::{self, DrawCtx};
 
-use density::Terrain;
+use density::{Terrain, TerrainRule};
 use doc::Doc;
 use model::{Adjacency, Id, Kind, Nation, Province, Region, State};
 use ops::{Constraint, GenParams, Retile};
@@ -59,11 +65,22 @@ pub enum Level {
     SeaZones,
     Adjacencies,
     Inaccessible,
+    Rivers,
+    Supply,
 }
 
 impl Level {
-    pub const ALL: [Level; 7] =
-        [Level::Provinces, Level::States, Level::Nations, Level::AirZones, Level::SeaZones, Level::Adjacencies, Level::Inaccessible];
+    pub const ALL: [Level; 9] = [
+        Level::Provinces,
+        Level::States,
+        Level::Nations,
+        Level::AirZones,
+        Level::SeaZones,
+        Level::Adjacencies,
+        Level::Inaccessible,
+        Level::Rivers,
+        Level::Supply,
+    ];
     pub fn name(self) -> &'static str {
         match self {
             Level::Provinces => "Provinces",
@@ -73,7 +90,13 @@ impl Level {
             Level::SeaZones => "Sea zones",
             Level::Adjacencies => "Adjacencies",
             Level::Inaccessible => "Inaccessible",
+            Level::Rivers => "Rivers",
+            Level::Supply => "Supply",
         }
+    }
+    /// Levels that edit lines and points rather than provinces.
+    fn is_network(self) -> bool {
+        matches!(self, Level::Rivers | Level::Supply)
     }
     fn noun(self) -> &'static str {
         match self {
@@ -83,6 +106,8 @@ impl Level {
             Level::AirZones => "air zone",
             Level::SeaZones => "sea zone",
             Level::Adjacencies => "adjacency",
+            Level::Rivers => "river",
+            Level::Supply => "railway",
         }
     }
 }
@@ -100,10 +125,11 @@ pub enum MapMode {
     Size,
     SizeVsTarget,
     Issues,
+    Supply,
 }
 
 impl MapMode {
-    const ALL: [MapMode; 10] = [
+    const ALL: [MapMode; 11] = [
         MapMode::Auto,
         MapMode::ProvinceColours,
         MapMode::Types,
@@ -114,6 +140,7 @@ impl MapMode {
         MapMode::Size,
         MapMode::SizeVsTarget,
         MapMode::Issues,
+        MapMode::Supply,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -127,6 +154,7 @@ impl MapMode {
             MapMode::Size => "province size (km²)",
             MapMode::SizeVsTarget => "province size vs. terrain target",
             MapMode::Issues => "validation issues",
+            MapMode::Supply => "supply (estimate)",
         }
     }
     fn effective(self, level: Level) -> MapMode {
@@ -136,7 +164,8 @@ impl MapMode {
             (MapMode::Auto, Level::Nations | Level::Adjacencies) => MapMode::Nations,
             (MapMode::Auto, Level::AirZones) => MapMode::AirZones,
             (MapMode::Auto, Level::SeaZones) => MapMode::SeaZones,
-            (MapMode::Auto, Level::Inaccessible) => MapMode::Types,
+            (MapMode::Auto, Level::Inaccessible | Level::Rivers) => MapMode::Types,
+            (MapMode::Auto, Level::Supply) => MapMode::Supply,
             (m, _) => m,
         }
     }
@@ -151,6 +180,26 @@ pub enum Tool {
     /// Click or drag across borders to make them impassable (or passable).
     Border,
     Pan,
+    /// Rivers: click points of a new river.
+    Draw,
+    /// Supply: lay a railway through the provinces clicked.
+    Rail,
+    /// Supply: add or remove a supply hub.
+    Hub,
+    /// Supply: add or remove a naval base.
+    Port,
+}
+
+impl Tool {
+    /// The tools of a level.
+    fn of(level: Level) -> &'static [Tool] {
+        match level {
+            Level::Rivers => &[Tool::Select, Tool::Draw, Tool::Pan],
+            Level::Supply => &[Tool::Select, Tool::Rail, Tool::Hub, Tool::Port, Tool::Pan],
+            Level::Adjacencies => &[Tool::Select, Tool::Link, Tool::Border, Tool::Pan],
+            _ => &[Tool::Select, Tool::Paint, Tool::Border, Tool::Pan],
+        }
+    }
 }
 
 /// Editor settings, saved in the viewer's project file.
@@ -171,6 +220,8 @@ pub struct Settings {
     pub labels: bool,
     pub borders: bool,
     pub adjacencies: bool,
+    /// Draw the rivers on every level.
+    pub rivers: bool,
     pub coarsen: bool,
     pub auto_check: bool,
     /// The HOI4 install (None: the Steam default).
@@ -194,6 +245,7 @@ impl Default for Settings {
             labels: true,
             borders: true,
             adjacencies: true,
+            rivers: true,
             coarsen: true,
             auto_check: true,
             game_dir: None,
@@ -232,6 +284,7 @@ enum Act {
     SplitParts(bool),
     SetKind(Kind),
     NewProvince,
+    FromImage,
     NewStateFromSel,
     NewZoneFromSel(bool),
     GrowTo(Level),
@@ -256,8 +309,6 @@ enum Act {
     AdjacencyPoints(usize),
     SetMapFrame(bool),
     SetModMeta(Box<ModMeta>),
-    ApplyDraft,
-    RevertDraft,
     Check,
     FixCrossings,
 }
@@ -304,12 +355,19 @@ struct StyleKey {
     borders: bool,
     issues: u64,
     targets: Option<(u64, density::DensityParams)>,
+    supply: u64,
 }
+
+/// Shares of the land per terrain rule, for (map pixels version, rules).
+type RuleShares = ((u64, Vec<TerrainRule>), Vec<f32>);
 
 pub struct Editor {
     pub settings: Settings,
     pub doc: Option<Doc>,
     loading: Option<(Arc<Progress>, Receiver<Result<Doc, String>>)>,
+    /// The "Backups" window (open with the list), and a backup being read.
+    backups: Option<Vec<model::Backup>>,
+    restoring: Option<(model::Backup, Receiver<Result<model::Loaded, String>>)>,
     terrain_rx: Option<Receiver<Result<Terrain, String>>>,
     terrain_msg: Option<String>,
     load_err: Option<String>,
@@ -345,10 +403,18 @@ pub struct Editor {
     game_version: Option<(PathBuf, String)>,
     /// Open "Mod details" with the map ($MOD_HELPER_OPEN=details, for screenshots).
     meta_at_start: bool,
+    /// Open "Backups" with the map ($MOD_HELPER_OPEN=backups, for screenshots).
+    backups_at_start: bool,
+    /// Open and show "Generation parameters" ($MOD_HELPER_OPEN=generation, for screenshots).
+    generation_at_start: bool,
     /// The game launcher in the build window.
     launcher: launcher::Launcher,
+    /// The "Province from image" window.
+    from_image: from_image::FromImage,
     pub ask_close: bool,
     pub close_ok: bool,
+    /// Reload or Open asked with unsaved changes: waits for "discard them".
+    ask_discard: Option<Act>,
     draft: Option<Draft>,
     draft_orig: Option<Draft>,
     draft_meta: u64,
@@ -358,6 +424,12 @@ pub struct Editor {
     labels_cache: Option<((u64, u64, Level), Vec<MapLabel>)>,
     targets: Option<((u64, density::DensityParams), Vec<f32>)>,
     sealed: Option<(u64, Vec<f64>)>,
+    /// Share of the land under each terrain rule (last: no rule), for the map
+    /// and rules it was counted for.
+    rule_shares: Option<RuleShares>,
+    /// The Rivers and Supply levels.
+    rv: rivers_ui::RiverUi,
+    su: supply_ui::SupplyUi,
 }
 
 /// The "Mod details" window: the edited copy, the stored value it started
@@ -401,6 +473,8 @@ impl Editor {
             settings,
             doc: None,
             loading: None,
+            backups: None,
+            restoring: None,
             terrain_rx: None,
             terrain_msg: None,
             load_err: None,
@@ -432,9 +506,13 @@ impl Editor {
             thumb: None,
             game_version: None,
             meta_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "details"),
+            backups_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "backups"),
+            generation_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "generation"),
             launcher: launcher::Launcher::default(),
+            from_image: from_image::FromImage::at_start(),
             ask_close: false,
             close_ok: false,
+            ask_discard: None,
             draft: None,
             draft_orig: None,
             draft_meta: 0,
@@ -444,6 +522,9 @@ impl Editor {
             labels_cache: None,
             targets: None,
             sealed: None,
+            rule_shares: None,
+            rv: rivers_ui::RiverUi::default(),
+            su: supply_ui::SupplyUi::default(),
         }
     }
 
@@ -469,14 +550,15 @@ impl Editor {
     /// Cursor for the map.
     pub fn cursor(&self) -> egui::CursorIcon {
         match self.settings.tool {
-            Tool::Paint | Tool::Link | Tool::Border => egui::CursorIcon::Crosshair,
+            Tool::Paint | Tool::Link | Tool::Border | Tool::Draw | Tool::Rail | Tool::Hub | Tool::Port => egui::CursorIcon::Crosshair,
             Tool::Select => egui::CursorIcon::Default,
             Tool::Pan => egui::CursorIcon::Grab,
         }
     }
 
+    /// Unsaved changes, including edits not yet applied in the panels.
     pub fn is_dirty(&self) -> bool {
-        self.doc.as_ref().is_some_and(|d| d.dirty)
+        self.doc.as_ref().is_some_and(|d| d.dirty) || (self.doc.is_some() && self.edits_pending())
     }
 
     fn info(&mut self, m: impl Into<String>) {
@@ -695,6 +777,7 @@ impl Editor {
                     0
                 }
             }
+            Level::Rivers | Level::Supply => 0,
         };
         (r != 0).then_some(r)
     }
@@ -712,6 +795,7 @@ impl Editor {
                     }
                 }
                 Level::AirZones | Level::SeaZones => out.extend_from_slice(doc.index.provs_of_region(id)),
+                Level::Rivers | Level::Supply => {}
             }
         }
         out.sort_unstable();
@@ -730,6 +814,7 @@ impl Editor {
         if level == self.settings.level {
             return;
         }
+        self.flush_pending();
         if let Some(doc) = &self.doc {
             let provs = Self::provinces_of(doc, self.settings.level, &self.sel);
             let mut seen = FxHashSet::default();
@@ -775,6 +860,7 @@ impl Editor {
             Level::States => d.states.contains(i),
             Level::Nations => d.nations.contains(i),
             Level::AirZones | Level::SeaZones => d.regions.contains(i),
+            Level::Rivers | Level::Supply => false,
         });
         if self.sel_adj.is_some_and(|i| i >= d.adjacencies.len()) {
             self.sel_adj = None;
@@ -785,7 +871,7 @@ impl Editor {
 
     /// Run an edit as one undo step.
     fn run(&mut self, label: &str, f: impl FnOnce(&mut Doc, &GenParams) -> anyhow::Result<String>) {
-        let g = self.settings.params;
+        let g = self.settings.params.clone();
         let Some(doc) = self.doc.as_mut() else { return };
         if doc.in_txn() {
             doc.commit();
@@ -811,6 +897,8 @@ impl Editor {
     }
 
     fn apply(&mut self, act: Act, ctx: &egui::Context) {
+        // edits in the panels go in first, as their own undo step
+        self.flush_pending();
         let sel = self.sel.clone();
         let provs = self.sel_provinces();
         let n = self.divide_n.max(2);
@@ -819,14 +907,8 @@ impl Editor {
             Act::Save => self.save(),
             Act::Build => {
                 // edits in the open "Mod details" window count
-                if let Some(m) = self.meta.as_ref().map(|e| e.m.clone())
-                    && self.doc.as_ref().is_some_and(|d| d.data.mod_meta() != m)
-                {
-                    if let Err(e) = m.check() {
-                        self.error(format!("Mod details: {e:#}"));
-                        return;
-                    }
-                    self.apply(Act::SetModMeta(Box::new(m)), ctx);
+                if !self.flush_all() {
+                    return;
                 }
                 if self.is_dirty() {
                     self.save();
@@ -848,6 +930,7 @@ impl Editor {
                     self.after_edit();
                 }
             }
+            Act::Reload | Act::Open if self.is_dirty() => self.ask_discard = Some(act),
             Act::Reload => {
                 if let Some(dir) = self.doc.as_ref().map(|d| d.dir.clone()).or(self.settings.map_dir.clone()) {
                     self.doc = None;
@@ -901,6 +984,7 @@ impl Editor {
                 self.run("Split separate parts", |d, _| Ok(format!("{} new provinces from separate parts", d.split_disconnected(&ids))))
             }
             Act::SetKind(k) if need(&provs) => self.run(&format!("Make {}", k.name()), |d, _| Ok(format!("{} provinces are now {}", d.set_kind(&provs, k)?, k.name()))),
+            Act::FromImage => self.from_image.open = true,
             Act::NewProvince => {
                 self.new_province = true;
                 self.settings.tool = Tool::Paint;
@@ -946,10 +1030,10 @@ impl Editor {
                 let s = d.merge_states(&sel)?;
                 Ok(format!("merged {} states into {}", sel.len(), d.data.state_name(s)))
             }),
-            Act::DivideStates if need(&sel) => self.run("Divide states", |d, _| {
+            Act::DivideStates if need(&sel) => self.run("Divide states", |d, g| {
                 let mut made = 0;
                 for &s in &sel {
-                    made += d.divide_state(s, n)?.len();
+                    made += d.divide_state(s, n, g.organic)?.len();
                 }
                 Ok(format!("{} states became {made}", sel.len()))
             }),
@@ -998,10 +1082,10 @@ impl Editor {
                 let t = d.merge_nations(&sel)?;
                 Ok(format!("merged {} nations into {}", sel.len(), d.data.nation_name(t)))
             }),
-            Act::DivideNations if need(&sel) => self.run("Divide nations", |d, _| {
+            Act::DivideNations if need(&sel) => self.run("Divide nations", |d, g| {
                 let mut made = 0;
                 for &x in &sel {
-                    made += d.divide_nation(x, n)?.len();
+                    made += d.divide_nation(x, n, g.organic)?.len();
                 }
                 Ok(format!("{} nations became {made}", sel.len()))
             }),
@@ -1011,10 +1095,10 @@ impl Editor {
                 let r = d.merge_regions(&sel)?;
                 Ok(format!("merged into {}", d.data.region_name(r)))
             }),
-            Act::DivideRegions if need(&sel) => self.run("Divide zones", |d, _| {
+            Act::DivideRegions if need(&sel) => self.run("Divide zones", |d, g| {
                 let mut made = 0;
                 for &r in &sel {
-                    made += d.divide_region(r, n)?.len();
+                    made += d.divide_region(r, n, g.organic)?.len();
                 }
                 Ok(format!("{} zones became {made}", sel.len()))
             }),
@@ -1037,13 +1121,7 @@ impl Editor {
                     self.error(format!("Mod details: {e:#}"));
                     return;
                 }
-                self.run("Mod details", |d, _| {
-                    d.data.set_mod_meta(&m);
-                    Ok(format!("mod details of \"{}\" {} set", m.name.trim(), m.version.trim()))
-                });
-                if let Some(meta) = &mut self.meta {
-                    *meta = MetaEdit::new(*m);
-                }
+                self.set_mod_meta(*m);
             }
             Act::SetMapFrame(on) => self.run(if on { "Map frame on" } else { "Map frame off" }, |d, _| {
                 d.data.set_map_frame(on);
@@ -1066,41 +1144,26 @@ impl Editor {
                 adj.stop = Some([b[0] as i64, b[1] as i64]);
                 Ok(String::new())
             }),
-            Act::ApplyDraft => {
-                if let Some(draft) = self.draft.clone() {
-                    self.run("Edit properties", move |d, _| {
-                        match draft {
-                            Draft::Province(id, p) => {
-                                let cur = d.data.provinces.get_mut(id).ok_or_else(|| anyhow::anyhow!("province is gone"))?;
-                                let (kind, state, region) = (cur.kind, cur.state, cur.region);
-                                *cur = Province { kind, state, region, ..p };
-                            }
-                            Draft::State(id, s) => {
-                                *d.data.states.get_mut(id).ok_or_else(|| anyhow::anyhow!("state is gone"))? = s;
-                            }
-                            Draft::Nation(id, n) => {
-                                *d.data.nations.get_mut(id).ok_or_else(|| anyhow::anyhow!("nation is gone"))? = n;
-                            }
-                            Draft::Region(id, r) => {
-                                *d.data.regions.get_mut(id).ok_or_else(|| anyhow::anyhow!("zone is gone"))? = r;
-                            }
-                            Draft::Adjacency(i, a) => {
-                                *d.data.adjacencies.get_mut(i).ok_or_else(|| anyhow::anyhow!("adjacency is gone"))? = a;
-                            }
-                        }
-                        Ok("properties applied".into())
-                    });
-                    self.draft = None;
-                }
-            }
-            Act::RevertDraft => self.draft = None,
             Act::Check => self.start_check(ctx),
             Act::FixCrossings => self.run("Fix crossings", |d, _| Ok(format!("{} pixels changed", d.fix_crossings(None)))),
             other => self.error(format!("{other:?}: nothing (or not enough) selected")),
         }
     }
 
+    fn set_mod_meta(&mut self, m: ModMeta) {
+        self.run("Mod details", |d, _| {
+            d.data.set_mod_meta(&m);
+            Ok(format!("mod details of \"{}\" {} set", m.name.trim(), m.version.trim()))
+        });
+        if let Some(meta) = &mut self.meta {
+            *meta = MetaEdit::new(m);
+        }
+    }
+
+    /// Save the map, with the edits still pending in the panels.
     pub fn save(&mut self) {
+        // invalid mod details stay in their window; the rest is saved
+        self.flush_all();
         let Some(doc) = self.doc.as_mut() else { return };
         match doc.save() {
             Ok(r) => {
@@ -1133,7 +1196,12 @@ impl Editor {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7];
+        match self.settings.level {
+            Level::Rivers => self.rivers_keys(ctx),
+            Level::Supply => self.supply_keys(ctx),
+            _ => {}
+        }
+        let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
         for (i, k) in keys.into_iter().enumerate() {
             if ctx.input(|inp| inp.key_pressed(k) && inp.modifiers.is_none()) {
                 self.set_level(Level::ALL[i]);
@@ -1143,15 +1211,17 @@ impl Editor {
         if pressed(Key::S) {
             self.settings.tool = Tool::Select;
         }
-        if pressed(Key::B) && self.settings.level != Level::Adjacencies {
-            self.settings.tool = Tool::Paint;
+        let level = self.settings.level;
+        // P stays the pan tool (the viewer's key); a key used here is taken
+        // so the viewer does not act on it too (H hides a layer there)
+        for (k, t) in [(Key::B, Tool::Paint), (Key::I, Tool::Border), (Key::D, Tool::Draw), (Key::R, Tool::Rail), (Key::H, Tool::Hub), (Key::N, Tool::Port)] {
+            if Tool::of(level).contains(&t) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k)) {
+                self.settings.tool = t;
+            }
         }
         if pressed(Key::L) {
             self.set_level(Level::Adjacencies);
             self.settings.tool = Tool::Link;
-        }
-        if pressed(Key::I) {
-            self.settings.tool = Tool::Border;
         }
         if pressed(Key::OpenBracket) {
             self.settings.brush = (self.settings.brush / 1.25).max(0.5);
@@ -1172,7 +1242,7 @@ impl Editor {
                 Level::Nations => Some(Act::DissolveNations),
                 Level::AirZones | Level::SeaZones => Some(Act::DissolveRegions),
                 Level::Adjacencies => self.sel_adj.map(Act::DeleteAdjacency),
-                Level::Inaccessible => None,
+                Level::Inaccessible | Level::Rivers | Level::Supply => None,
             };
             if let Some(a) = act {
                 self.apply(a, ctx);
@@ -1189,6 +1259,9 @@ impl Editor {
             // cached; computed once the terrain is there and after pixel edits
             self.update_targets();
         }
+        if mode == MapMode::Supply {
+            self.supply_estimate();
+        }
         let Some(doc) = &self.doc else { return };
         let mut h: u64 = 1469598103934665603;
         for &i in &self.sel {
@@ -1203,7 +1276,8 @@ impl Editor {
             adj: self.sel_adj,
             borders: self.settings.borders,
             issues: self.issues_gen,
-            targets: if mode == MapMode::SizeVsTarget { self.targets.as_ref().map(|t| t.0) } else { None },
+            targets: if mode == MapMode::SizeVsTarget { self.targets.as_ref().map(|t| t.0.clone()) } else { None },
+            supply: if mode == MapMode::Supply { self.su.est_gen } else { 0 },
         };
         if self.style_key.as_ref() == Some(&key) {
             return;
@@ -1216,9 +1290,9 @@ impl Editor {
 
     /// Expected number of provinces per province by terrain (1 = right size).
     fn update_targets(&mut self) {
-        let p = self.settings.params.density;
+        let p = self.settings.params.density.clone();
         let Some(doc) = self.doc.as_mut() else { return };
-        let key = (doc.pixel_version, p);
+        let key = (doc.pixel_version, p.clone());
         if self.targets.as_ref().is_some_and(|t| t.0 == key) {
             return;
         }
@@ -1299,6 +1373,15 @@ impl Editor {
                     1 => [240, 170, 60],
                     _ => [105, 110, 105],
                 },
+                MapMode::Supply => match pr.kind {
+                    Kind::Sea => SEA,
+                    Kind::Lake => LAKE,
+                    Kind::Land if imp || pr.edge => [60, 60, 60],
+                    Kind::Land => match &self.su.est {
+                        Some((_, e)) => supply_ui::supply_colour(e.flow.get(i).copied().unwrap_or(0.0)),
+                        None => [90, 90, 90],
+                    },
+                },
             };
             fill[i] = [c[0], c[1], c[2], 255];
             let (a, b) = match pr.kind {
@@ -1364,7 +1447,7 @@ impl Editor {
                     }
                 }
             }
-            Level::Provinces => {}
+            Level::Provinces | Level::Rivers | Level::Supply => {}
         }
         let labels = groups
             .into_iter()
@@ -1420,6 +1503,13 @@ impl Editor {
 
         // drawings on top
         self.draw_adjacencies(dc, &pl);
+        let level = self.settings.level;
+        if self.settings.rivers || level.is_network() {
+            self.draw_rivers(dc, &pl, px_scale, level == Level::Rivers);
+        }
+        if level == Level::Supply {
+            self.draw_supply(dc, &pl, px_scale);
+        }
         if self.settings.labels {
             self.map_labels();
             self.draw_labels(dc, &pl, px_scale);
@@ -1462,6 +1552,11 @@ impl Editor {
             return false;
         }
         let level = self.settings.level;
+        match level {
+            Level::Rivers => return self.rivers_input(dc, response, pl),
+            Level::Supply => return self.supply_input(dc, response, pl),
+            _ => {}
+        }
         let mods = dc.ctx.input(|i| i.modifiers);
         let to_px = |p: Pos2| pl.world_to_pixel(dc.cam.to_world(dc.rect, p));
         let pos = response.interact_pointer_pos().or(response.hover_pos()).and_then(to_px);
@@ -1926,9 +2021,15 @@ impl Editor {
         self.header_ui(ui, &mut acts);
         ui.separator();
         egui::ScrollArea::vertical().id_salt("editor_scroll").auto_shrink([false, false]).show(ui, |ui| {
-            self.selection_ui(ui, &mut acts);
-            self.actions_ui(ui, &mut acts);
-            self.properties_ui(ui, &mut acts);
+            match self.settings.level {
+                Level::Rivers => self.rivers_panel(ui),
+                Level::Supply => self.supply_panel(ui),
+                _ => {
+                    self.selection_ui(ui, &mut acts);
+                    self.actions_ui(ui, &mut acts);
+                    self.properties_ui(ui, &mut acts);
+                }
+            }
             self.generation_ui(ui);
             self.hover_ui(ui);
             self.validation_ui(ui, &mut acts);
@@ -1948,6 +2049,7 @@ impl Editor {
     }
 
     fn header_ui(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let dirty = self.is_dirty();
         let doc = self.doc.as_ref().unwrap();
         ui.label(RichText::new(doc.dir.display().to_string()).small().weak());
         ui.label(format!(
@@ -1957,14 +2059,14 @@ impl Editor {
             doc.data.nations.count(),
             doc.data.regions.count(),
             doc.data.adjacencies.len(),
-            if doc.dirty { " · unsaved" } else { "" }
+            if dirty { " · unsaved" } else { "" }
         ));
         if let Some(t) = &self.terrain_msg {
             ui.label(RichText::new(t).small().color(WARN));
         }
         let (undo, redo) = (doc.can_undo().map(str::to_string), doc.can_redo().map(str::to_string));
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(doc.dirty, egui::Button::new("💾 Save")).on_hover_text("Write provinces.bmp / provinces.json (Ctrl+S); the old files go to backups/").clicked() {
+            if ui.add_enabled(dirty, egui::Button::new("💾 Save")).on_hover_text("Write provinces.bmp / provinces.json (Ctrl+S); the old files go to backups/").clicked() {
                 acts.push(Act::Save);
             }
             let building = self.build.as_ref().is_some_and(|b| b.state() == build::RUNNING);
@@ -1986,6 +2088,9 @@ impl Editor {
             if ui.button("Open…").clicked() {
                 acts.push(Act::Open);
             }
+            if ui.button("Backups…").on_hover_text("The map as it was before each of the last saves; load one into the editor").clicked() {
+                self.backups = Some(model::backups(&doc.dir));
+            }
         });
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -1999,26 +2104,29 @@ impl Editor {
         ui.horizontal_wrapped(|ui| {
             ui.label("Tool:");
             let level = self.settings.level;
-            ui.selectable_value(&mut self.settings.tool, Tool::Select, "⬚ Select").on_hover_text(
-                "S · click: select, Shift: add/remove, Ctrl: remove, drag: select with the brush, Alt+click: pick",
-            );
-            if level != Level::Adjacencies {
-                let tip = match level {
-                    Level::Provinces => "B · paint the selected province over others (redraw borders)",
-                    Level::Inaccessible => "B · brush-select provinces to make inaccessible",
-                    _ => "B · paint: what the brush touches joins the selected entity",
+            for &t in Tool::of(level) {
+                let (text, tip) = match (t, level) {
+                    (Tool::Select, Level::Rivers) => ("⬚ Select", "S · click a river; drag its points"),
+                    (Tool::Select, Level::Supply) => ("⬚ Select", "S · click a railway, supply hub or port"),
+                    (Tool::Select, _) => ("⬚ Select", "S · click: select, Shift: add/remove, Ctrl: remove, drag: select with the brush, Alt+click: pick"),
+                    (Tool::Paint, Level::Provinces) => ("🖌 Paint", "B · paint the selected province over others (redraw borders)"),
+                    (Tool::Paint, Level::Inaccessible) => ("🖌 Paint", "B · brush-select provinces to make inaccessible"),
+                    (Tool::Paint, _) => ("🖌 Paint", "B · paint: what the brush touches joins the selected entity"),
+                    (Tool::Link, _) => ("🔗 Link", "L · click two provinces to add an adjacency"),
+                    (Tool::Border, _) => (
+                        "⛔ Border",
+                        "I · click a border between two provinces to make it impassable (click again: passable); drag across borders to block (or open) them all",
+                    ),
+                    (Tool::Pan, _) => ("✋ Pan", "P · left drag pans (middle/right drag always pans)"),
+                    (Tool::Draw, _) => ("〰 Draw", "D · click the points of a new river, from its source to its mouth"),
+                    (Tool::Rail, _) => ("🚂 Railway", "R · click the provinces a new railway stops in"),
+                    (Tool::Hub, _) => ("■ Hub", "H · click a province to add or remove a supply hub"),
+                    (Tool::Port, _) => ("⚓ Port", "N · click a coastal province to add or remove a naval base"),
                 };
-                ui.selectable_value(&mut self.settings.tool, Tool::Paint, "🖌 Paint").on_hover_text(tip);
-            } else {
-                ui.selectable_value(&mut self.settings.tool, Tool::Link, "🔗 Link").on_hover_text("L · click two provinces to add an adjacency");
+                ui.selectable_value(&mut self.settings.tool, t, text).on_hover_text(tip);
             }
-            ui.selectable_value(&mut self.settings.tool, Tool::Border, "⛔ Border").on_hover_text(
-                "I · click a border between two provinces to make it impassable (click again: passable); \
-                 drag across borders to block (or open) them all",
-            );
-            ui.selectable_value(&mut self.settings.tool, Tool::Pan, "✋ Pan").on_hover_text("left drag pans (middle/right drag always pans)");
         });
-        if matches!(self.settings.tool, Tool::Paint | Tool::Select) {
+        if matches!(self.settings.tool, Tool::Paint | Tool::Select) && !self.settings.level.is_network() {
             ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut self.settings.brush, 0.5..=400.0).logarithmic(true).text("brush px ([ ])"));
             });
@@ -2047,6 +2155,7 @@ impl Editor {
             ui.checkbox(&mut self.settings.borders, "borders");
             ui.checkbox(&mut self.settings.labels, "names");
             ui.checkbox(&mut self.settings.adjacencies, "adjacencies");
+            ui.checkbox(&mut self.settings.rivers, "rivers");
         });
         if self.settings.tool == Tool::Border {
             ui.label(
@@ -2100,6 +2209,129 @@ impl Editor {
         });
         if open_meta && self.meta.is_none() {
             self.meta = Some(MetaEdit::new(meta));
+        }
+    }
+
+    /// "Province from image": the window, and the province it asks for.
+    fn image_province_window(&mut self, ctx: &egui::Context) {
+        let Some(doc) = &self.doc else { return };
+        let Some(req) = self.from_image.ui(ctx, doc, version(doc), &mut self.settings.coarsen) else { return };
+        let mut made = Vec::new();
+        let coarsen = self.settings.coarsen;
+        self.run("Province from image", |d, g| {
+            let (vals, t, below) = (&req.values, req.threshold, req.below);
+            let (ids, n) = d.province_from_shape(|i| from_image::in_shape(vals[i], t, below), req.kind, req.only_kind, req.name.clone(), coarsen.then_some(g))?;
+            made = ids;
+            Ok(match made.as_slice() {
+                [id] => format!("new province {} ({id}) from the image: {n} px", req.name),
+                _ => format!("{} new provinces \"{}\" from the image: {n} px", made.len(), req.name),
+            })
+        });
+        // ids of provinces that a clean-up removed again drop out here
+        made.retain(|&p| self.doc.as_ref().is_some_and(|d| d.data.provinces.contains(p)));
+        if !made.is_empty() {
+            self.settings.level = if req.kind == Kind::Lake { Level::Inaccessible } else { Level::Provinces };
+            self.apply(Act::Select(self.settings.level, made.clone()), ctx);
+            self.zoom_provinces(&made);
+        }
+    }
+
+    /// The "Backups" window: the map as it was before each of the last saves.
+    /// Loading one is an edit like any other: Undo goes back, and nothing is
+    /// written until Save (which backs up the current files first).
+    fn backups_window(&mut self, ctx: &egui::Context) {
+        if let Some((b, rx)) = &self.restoring {
+            match rx.try_recv() {
+                Ok(r) => {
+                    let b = b.clone();
+                    self.restoring = None;
+                    match r {
+                        Ok(mut l) => {
+                            // edits pending in the panels belong to the map before
+                            self.flush_pending();
+                            // the map of the backup; the mod details stay as they are
+                            if let Some(d) = &self.doc {
+                                for k in ["mod", "map_frame"] {
+                                    match d.data.header.get(k) {
+                                        Some(v) => l.data.header.insert(k.to_string(), v.clone()),
+                                        None => l.data.header.remove(k),
+                                    };
+                                }
+                            }
+                            let label = format!("Load backup {}", b.name);
+                            self.run(&label, |d, _| {
+                                let n = d.replace_map(l)?;
+                                Ok(format!("loaded the backup of {} ({}): {n} px differ; Undo goes back, Save writes it", b.name, b.age()))
+                            });
+                            self.sel.clear();
+                            self.backups = None;
+                        }
+                        Err(e) => self.error(format!("backup {}: {e}", b.name)),
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
+                Err(_) => self.restoring = None,
+            }
+        }
+        if let Some(d) = self.doc.as_ref().filter(|_| self.backups_at_start) {
+            self.backups = Some(model::backups(&d.dir));
+            self.backups_at_start = false;
+        }
+        let Some(list) = &self.backups else { return };
+        let Some(doc) = &self.doc else { return };
+        let mut open = true;
+        let mut load = None;
+        let busy = self.restoring.is_some();
+        egui::Window::new("Backups").open(&mut open).default_width(420.0).show(ctx, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Every Save first copies the files it replaces to {}. The newest {} are kept.",
+                    doc.dir.join("backups").display(),
+                    model::BACKUPS_KEPT
+                ))
+                .small()
+                .weak(),
+            );
+            ui.label(
+                RichText::new("Loading one replaces the map in the editor as one edit: Undo goes back. Nothing is written until you Save. Mod details and the map frame setting stay as they are.")
+                    .small(),
+            );
+            if doc.dirty {
+                ui.colored_label(WARN, "The map has unsaved changes: after loading a backup, Undo still brings them back.");
+            }
+            ui.add_space(4.0);
+            if list.is_empty() {
+                ui.label("No backups yet.");
+            }
+            egui::Grid::new("backups").striped(true).num_columns(4).show(ui, |ui| {
+                for b in list {
+                    ui.label(&b.name).on_hover_text("when it was made (UTC): the map as it was before the save at that time");
+                    ui.label(b.age());
+                    ui.label(b.provinces.map(|n| format!("{n} provinces")).unwrap_or_else(|| "?".into()));
+                    if ui.add_enabled(!busy, egui::Button::new("Load")).clicked() {
+                        load = Some(b.clone());
+                    }
+                    ui.end_row();
+                }
+            });
+            if busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("reading the backup…");
+                });
+            }
+        });
+        if !open {
+            self.backups = None;
+        }
+        if let Some(b) = load {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (dir, c) = (b.dir.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(model::load(&dir, &Progress::default()).map_err(|e| format!("{e:#}")));
+                c.request_repaint();
+            });
+            self.restoring = Some((b, rx));
         }
     }
 
@@ -2313,11 +2545,11 @@ impl Editor {
                 if ui.add_enabled(changed, egui::Button::new("Revert")).clicked() {
                     e = MetaEdit::new(e.orig.clone());
                 }
-                if ui.button("Close").on_hover_text(if changed { "Close and drop the changes" } else { "" }).clicked() {
+                if ui.button("Close").on_hover_text(if changed { "Apply the changes and close" } else { "" }).clicked() {
                     close = true;
                 }
                 if changed {
-                    ui.colored_label(WARN, "not applied");
+                    ui.colored_label(WARN, "not applied yet (Apply, Close, Save or Build applies them)");
                 }
             });
         });
@@ -2330,6 +2562,16 @@ impl Editor {
         }
         self.settings.game_dir = game_dir;
         self.settings.mods_dir = mods_dir;
+        if (!open || close) && e.m != e.orig && act.is_none() {
+            // closing keeps the changes: apply them, or stay open while they are invalid
+            match e.m.check() {
+                Ok(()) => act = Some(Act::SetModMeta(Box::new(e.m.clone()))),
+                Err(err) => {
+                    self.error(format!("Mod details: {err:#} (fix it or Revert to close)"));
+                    (open, close) = (true, false);
+                }
+            }
+        }
         if open && !close {
             self.meta = Some(e);
         }
@@ -2346,7 +2588,7 @@ impl Editor {
         }
         let d = &doc.data;
         let name = |id: Id| match level {
-            Level::Provinces | Level::Inaccessible | Level::Adjacencies => d.prov_name(id),
+            Level::Provinces | Level::Inaccessible | Level::Adjacencies | Level::Rivers | Level::Supply => d.prov_name(id),
             Level::States => d.state_name(id),
             Level::Nations => d.nation_name(id),
             Level::AirZones | Level::SeaZones => d.region_name(id),
@@ -2400,9 +2642,10 @@ impl Editor {
                         btn(ui, two, "Merge", "merge the selected provinces into the first one", Act::MergeProvinces);
                         divide_row(ui, &mut self.divide_n, "");
                         btn(ui, has, "Divide", "cut each selected province into that many compact pieces", Act::DivideProvinces);
-                        btn(ui, has, "Generate by terrain", "re-cut the selection: small provinces in towns and valleys, large ones in the mountains (parameters below)", Act::GenerateProvinces);
+                        btn(ui, has, "Generate by terrain", "re-cut the selection with the province sizes of the terrain rules (\"Generation parameters\" below)", Act::GenerateProvinces);
                         btn(ui, has, "Dissolve (Del)", "remove: the pixels go to neighbouring provinces of the same type", Act::DissolveProvinces);
                         btn(ui, true, "New (paint)", "paint a new province", Act::NewProvince);
+                        btn(ui, true, "From image…", "one new province with the shape of a colour channel of an image", Act::FromImage);
                     });
                     ui.horizontal_wrapped(|ui| {
                         btn(ui, has, "Make land", "turn into land (joins a neighbouring state)", Act::SetKind(Kind::Land));
@@ -2473,6 +2716,7 @@ impl Editor {
                     );
                 }
                 Level::Adjacencies => self.adjacency_list_ui(ui, acts),
+                Level::Rivers | Level::Supply => {}
                 Level::Inaccessible => {
                     ui.label(RichText::new(
                         "Select provinces (click, or drag the brush). Then:\n\
@@ -2539,7 +2783,7 @@ impl Editor {
                 Level::States => d.states.get(id).map(|s| Draft::State(id, s.clone())),
                 Level::Nations => d.nations.get(id).map(|n| Draft::Nation(id, n.clone())),
                 Level::AirZones | Level::SeaZones => d.regions.get(id).map(|r| Draft::Region(id, r.clone())),
-                Level::Adjacencies => None,
+                Level::Adjacencies | Level::Rivers | Level::Supply => None,
             }),
         };
         let same_entity = |a: &Draft, b: &Draft| match (a, b) {
@@ -2550,11 +2794,16 @@ impl Editor {
             (Draft::Adjacency(x, _), Draft::Adjacency(y, _)) => x == y,
             _ => false,
         };
-        let modified = self.draft.is_some() && self.draft != self.draft_orig;
+        let modified = self.draft_pending();
         let keep = match (&self.draft, &current) {
             (Some(dr), Some(cur)) => same_entity(dr, cur) && (modified || self.draft_meta == doc.meta_version),
             _ => false,
         };
+        if !keep && modified {
+            // something else is selected now: the edits go to what they were made on
+            self.flush_draft();
+            return self.sync_draft();
+        }
         if !keep {
             self.draft = current.clone();
             self.draft_orig = current;
@@ -2589,19 +2838,19 @@ impl Editor {
                 Draft::Adjacency(i, a) => adjacency_props(ui, *i, a, doc, acts),
             }
             let modified = Some(&draft) != self.draft_orig.as_ref();
-            ui.horizontal(|ui| {
-                if ui.add_enabled(modified, egui::Button::new("Apply")).clicked() {
-                    acts.push(Act::ApplyDraft);
-                }
-                if ui.add_enabled(modified, egui::Button::new("Revert")).clicked() {
-                    acts.push(Act::RevertDraft);
-                }
-                if modified {
-                    ui.colored_label(WARN, "not applied yet");
-                }
-            });
+            ui.label(
+                RichText::new(if modified { "Enter or a click elsewhere applies the change" } else { "Changes apply as you make them (Ctrl+Z undoes them)" })
+                    .small()
+                    .color(if modified { WARN } else { ui.visuals().weak_text_color() }),
+            );
         });
         self.draft = Some(draft);
+        // a change is done once no text field is being edited and no drag is
+        // under way (a slider or colour being dragged): then it goes in
+        let busy = ui.ctx().egui_wants_keyboard_input() || ui.ctx().input(|i| i.pointer.any_down());
+        if !busy {
+            self.flush_pending();
+        }
         if want_sealed {
             if let Some(doc) = &self.doc {
                 if let Some(s) = doc.sealed_km2() {
@@ -2612,20 +2861,99 @@ impl Editor {
     }
 
     fn generation_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Generation parameters").id_salt("gen").default_open(false).show(ui, |ui| {
+        let show = self.generation_at_start && self.doc.is_some();
+        if show {
+            self.generation_at_start = false;
+        }
+        let r = egui::CollapsingHeader::new("Generation parameters").id_salt("gen").default_open(false).open(show.then_some(true)).show(ui, |ui| {
+            let shares = self.rule_shares();
             let g = &mut self.settings.params;
-            ui.label(RichText::new("Province sizes by terrain, as in make_provinces.py. \"detail\" scales the number of provinces of a generate run; use it per area (e.g. 1.5 in a valley, 0.5 in the mountains).").small().weak());
-            egui::Grid::new("gengrid").num_columns(2).show(ui, |ui| {
-                let row = |ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str| {
-                    ui.label(label);
-                    ui.add(egui::DragValue::new(v).range(range).speed(0.05).suffix(suffix));
-                    ui.end_row();
-                };
+            let row = |ui: &mut egui::Ui, label: &str, v: &mut f32, range: std::ops::RangeInclusive<f32>, suffix: &str| {
+                ui.label(label);
+                ui.add(egui::DragValue::new(v).range(range).speed(0.05).suffix(suffix));
+                ui.end_row();
+            };
+            ui.label(RichText::new("Province sizes for \"Generate by terrain\". \"detail\" scales the number of provinces of a run; use it per area (e.g. 1.5 in a valley, 0.5 in the mountains).").small().weak());
+            egui::Grid::new("gengrid0").num_columns(2).show(ui, |ui| {
                 row(ui, "detail", &mut g.density.detail, 0.05..=20.0, " ×");
                 row(ui, "built-up areas", &mut g.density.urban_km2, 0.05..=100.0, " km²");
-                row(ui, "valley floors", &mut g.density.valley_km2, 0.05..=200.0, " km²");
-                row(ui, "slopes < 2000 m", &mut g.density.slope_km2, 0.1..=500.0, " km²");
-                row(ui, "mountains ≥ 2000 m", &mut g.density.mountain_km2, 0.1..=2000.0, " km²");
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new("Land by height and slope").strong());
+            ui.label(
+                RichText::new("The first rule from the top that fits a pixel sets its province size; \"any\" is no limit. Slopes are in degrees (mean over 9×9 px). Built-up areas get the smaller of the two sizes.")
+                    .small()
+                    .weak(),
+            );
+            let share = |i: usize| shares.as_ref().and_then(|v| v.get(i).copied());
+            let n = g.density.rules.len();
+            let mut action: Option<(usize, i8)> = None; // -1 up, 1 down, 0 delete
+            for (i, r) in g.density.rules.iter_mut().enumerate() {
+                egui::Frame::group(ui.style()).inner_margin(4.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut r.name).desired_width(110.0).hint_text("name"));
+                        ui.add(egui::DragValue::new(&mut r.km2).range(0.01..=5000.0).speed(0.05).suffix(" km²"));
+                        if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).on_hover_text("check earlier").clicked() {
+                            action = Some((i, -1));
+                        }
+                        if ui.add_enabled(i + 1 < n, egui::Button::new("⏷").small()).on_hover_text("check later").clicked() {
+                            action = Some((i, 1));
+                        }
+                        if ui.small_button("🗑").on_hover_text("delete the rule").clicked() {
+                            action = Some((i, 0));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("height from");
+                        limit(ui, &mut r.from_m, 1500.0, -500.0..=9000.0, 10.0, " m");
+                        ui.label("below");
+                        limit(ui, &mut r.below_m, 2000.0, -500.0..=9000.0, 10.0, " m");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("slope from");
+                        limit(ui, &mut r.from_slope, 25.0, 0.0..=90.0, 0.2, "°");
+                        ui.label("below");
+                        limit(ui, &mut r.below_slope, 12.0, 0.0..=90.0, 0.2, "°");
+                    });
+                    let empty = matches!((r.from_m, r.below_m), (Some(a), Some(b)) if a >= b) || matches!((r.from_slope, r.below_slope), (Some(a), Some(b)) if a >= b);
+                    match share(i) {
+                        _ if empty => {
+                            ui.colored_label(WARN, "matches nothing: \"from\" is not below \"below\"");
+                        }
+                        Some(0.0) => {
+                            ui.colored_label(WARN, "applies nowhere (rules above take all of this land?)");
+                        }
+                        Some(f) => {
+                            ui.label(RichText::new(format!("{} of the land", pct(f))).small().weak());
+                        }
+                        None => {}
+                    }
+                });
+            }
+            match action {
+                Some((i, 0)) => {
+                    g.density.rules.remove(i);
+                }
+                Some((i, d)) => g.density.rules.swap(i, (i as i64 + d as i64) as usize),
+                None => {}
+            }
+            egui::Grid::new("gengrid1").num_columns(3).show(ui, |ui| {
+                ui.label("other land");
+                ui.add(egui::DragValue::new(&mut g.density.other_km2).range(0.01..=5000.0).speed(0.05).suffix(" km²")).on_hover_text("land that no rule fits");
+                if let Some(f) = share(n) {
+                    ui.label(RichText::new(pct(f)).small().weak());
+                }
+                ui.end_row();
+            });
+            if ui.button("Add rule").on_hover_text("a rule at the top (it is checked first); set its limits").clicked() {
+                g.density.rules.insert(0, TerrainRule { name: format!("rule {}", n + 1), ..Default::default() });
+            }
+            if shares.is_none() {
+                ui.label(RichText::new("(how much land each rule covers shows once the terrain is loaded)").small().weak());
+            }
+            ui.add_space(4.0);
+            egui::Grid::new("gengrid").num_columns(2).show(ui, |ui| {
                 row(ui, "sea", &mut g.density.sea_km2, 0.05..=500.0, " km²");
                 row(ui, "largest province", &mut g.max_km2, 1.0..=5000.0, " km²");
                 row(ui, "smallest piece", &mut g.min_km2, 0.01..=50.0, " km²");
@@ -2633,11 +2961,66 @@ impl Editor {
                 row(ui, "provinces per state", &mut g.state_provinces, 1.0..=200.0, "");
                 row(ui, "largest state", &mut g.state_max_km2, 1.0..=50_000.0, " km²");
                 row(ui, "air zone size", &mut g.region_km2, 10.0..=100_000.0, " km²");
+                ui.label("winding borders").on_hover_text(
+                    "How much the borders of generated and divided provinces, states, nations and zones bend: 0 straight lines between the centres, 1 natural-looking bends, 2 or more strongly winding.",
+                );
+                ui.add(egui::Slider::new(&mut g.organic, 0.0..=3.0).step_by(0.05));
+                ui.end_row();
             });
-            if ui.button("Reset to defaults").clicked() {
+            if ui.button("Reset to defaults").on_hover_text("all generation parameters, also the terrain rules").clicked() {
                 *g = GenParams::default();
             }
         });
+        if show {
+            r.header_response.scroll_to_me(Some(egui::Align::Min));
+        }
+    }
+
+    /// Share of the land (not the map frame) under each terrain rule, the last
+    /// for land no rule fits; counted on every 13th pixel. None until the
+    /// terrain is loaded.
+    fn rule_shares(&mut self) -> Option<Vec<f32>> {
+        use rayon::prelude::*;
+        let doc = self.doc.as_ref()?;
+        let t = doc.terrain.clone()?;
+        let rules = &self.settings.params.density.rules;
+        if let Some(((v, r), shares)) = &self.rule_shares
+            && *v == doc.pixel_version
+            && r == rules
+        {
+            return Some(shares.clone());
+        }
+        let land: Vec<bool> = (0..doc.data.provinces.cap()).map(|i| doc.data.provinces.get(i as Id).is_some_and(|p| p.kind == Kind::Land && !p.edge)).collect();
+        let nr = rules.len();
+        let counts = {
+            let lab = doc.labels.read();
+            (0..lab.px.len().min(t.dem.len()))
+                .into_par_iter()
+                .step_by(13)
+                .fold(
+                    || vec![0u64; nr + 1],
+                    |mut c, i| {
+                        if land.get(lab.px[i] as usize).copied().unwrap_or(false) {
+                            let (h, sl) = (t.dem[i], t.slope[i] as f32);
+                            c[rules.iter().position(|r| r.matches(h, sl)).unwrap_or(nr)] += 1;
+                        }
+                        c
+                    },
+                )
+                .reduce(
+                    || vec![0u64; nr + 1],
+                    |mut a, b| {
+                        for (x, y) in a.iter_mut().zip(b) {
+                            *x += y;
+                        }
+                        a
+                    },
+                )
+        };
+        let total = counts.iter().sum::<u64>().max(1) as f32;
+        let shares: Vec<f32> = counts.iter().map(|&c| c as f32 / total).collect();
+        self.rule_shares = Some(((doc.pixel_version, rules.clone()), shares.clone()));
+        Some(shares)
     }
 
     fn hover_ui(&self, ui: &mut egui::Ui) {
@@ -2678,6 +3061,9 @@ impl Editor {
                         ui.label(format!("{e:.2} provinces here"));
                         ui.end_row();
                     }
+                }
+                if self.settings.level == Level::Supply || self.settings.mode.effective(self.settings.level) == MapMode::Supply {
+                    self.supply_hover_rows(ui, p);
                 }
             });
         });
@@ -2727,7 +3113,50 @@ impl Editor {
 
     /// Build log and the unsaved-changes dialog.
     pub fn windows(&mut self, ctx: &egui::Context) {
+        if let Some(act) = self.ask_discard.clone() {
+            let what = if matches!(act, Act::Open) { "Open another map" } else { "Read the files again" };
+            let mut choice = None;
+            egui::Window::new("Discard unsaved changes?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+                ui.label(format!("The map has changes that are not saved. {what} and lose them?"));
+                ui.horizontal(|ui| {
+                    if ui.button("Save first").clicked() {
+                        choice = Some(0);
+                    }
+                    if ui.button("Discard the changes").clicked() {
+                        choice = Some(1);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        choice = Some(2);
+                    }
+                });
+            });
+            match choice {
+                Some(0) => {
+                    self.ask_discard = None;
+                    self.save();
+                    if !self.is_dirty() {
+                        self.apply(act, ctx);
+                    }
+                }
+                Some(1) => {
+                    self.ask_discard = None;
+                    // what is pending in the panels goes too
+                    self.draft = None;
+                    self.draft_orig = None;
+                    self.rv.name_edit = None;
+                    self.meta = None;
+                    if let Some(d) = self.doc.as_mut() {
+                        d.dirty = false;
+                    }
+                    self.apply(act, ctx);
+                }
+                Some(_) => self.ask_discard = None,
+                None => {}
+            }
+        }
         self.meta_window(ctx);
+        self.image_province_window(ctx);
+        self.backups_window(ctx);
         if self.show_build {
             let mut open = true;
             let dirs = self.dirs();
@@ -2803,6 +3232,28 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 }
 
 // ---------------------------------------------------------------- properties
+
+/// An optional limit of a terrain rule: a button "any" until one is set.
+fn limit(ui: &mut egui::Ui, v: &mut Option<f32>, default: f32, range: std::ops::RangeInclusive<f32>, speed: f64, suffix: &str) {
+    match v {
+        None => {
+            if ui.small_button("any").on_hover_text("no limit; click to set one").clicked() {
+                *v = Some(default);
+            }
+        }
+        Some(x) => {
+            ui.add(egui::DragValue::new(x).range(range).speed(speed).suffix(suffix));
+            if ui.small_button("×").on_hover_text("no limit").clicked() {
+                *v = None;
+            }
+        }
+    }
+}
+
+/// A share as a percentage ("< 1 %" for small non-zero ones).
+fn pct(f: f32) -> String {
+    if f > 0.0 && f < 0.01 { "< 1 %".into() } else { format!("{:.0} %", f * 100.0) }
+}
 
 const LAND_TERRAIN: [&str; 8] = ["plains", "forest", "hills", "mountain", "marsh", "urban", "jungle", "desert"];
 const CATEGORIES: [&str; 13] = [
@@ -2931,7 +3382,7 @@ fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut
                 s.manpower = if auto { None } else { Some(100_000) };
             }
             if let Some(m) = &mut s.manpower {
-                ui.add(egui::DragValue::new(m).range(0..=100_000_000u64).speed(500.0));
+                ui.add(egui::DragValue::new(m).clamp_existing_to_range(false).range(0..=100_000_000u64).speed(500.0));
             }
         });
         ui.end_row();
@@ -2956,7 +3407,7 @@ fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut
                 }
             }
             if let Some(v) = s.buildings.get_mut(k) {
-                ui.add(egui::DragValue::new(v).range(0..=50));
+                ui.add(egui::DragValue::new(v).clamp_existing_to_range(false).range(0..=50));
             } else {
                 ui.label("");
             }
@@ -2968,7 +3419,7 @@ fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut
         for k in RESOURCES {
             let mut v = s.resources.get(k).copied().unwrap_or(0);
             ui.label(k);
-            if ui.add(egui::DragValue::new(&mut v).range(0..=1000)).changed() {
+            if ui.add(egui::DragValue::new(&mut v).clamp_existing_to_range(false).range(0..=1000)).changed() {
                 if v == 0 {
                     s.resources.remove(k);
                 } else {
@@ -2985,7 +3436,7 @@ fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut
             if ui.link(d.prov_name(vp[0])).clicked() {
                 acts.push(Act::ZoomProvince(vp[0]));
             }
-            ui.add(egui::DragValue::new(&mut vp[1]).range(1..=100));
+            ui.add(egui::DragValue::new(&mut vp[1]).clamp_existing_to_range(false).range(1..=100));
             if ui.small_button("🗑").clicked() {
                 remove = Some(i);
             }

@@ -35,6 +35,7 @@ use regex::{Captures, Regex};
 use rustc_hash::FxHashSet;
 
 use crate::editor::model::{self, Id, Kind, Nation, State};
+use crate::editor::{rivers, supply};
 use crate::raster::{self, Pixels};
 use crate::util::Progress;
 use countries::{Rng, ascii_name, place_rank, short_name};
@@ -206,6 +207,35 @@ fn scaled(size: (u32, u32), vanilla_map: (u32, u32), map: (usize, usize)) -> (us
 }
 
 /// The first item with the largest key (Python's max()).
+/// HOI4 terrain of a land province from the shares (0..1) of its pixels that
+/// are built-up, steep (25° or more), high (2200 m or more), gentle (under
+/// 10°) and forest.
+pub fn land_terrain(sealed: f64, steep: f64, high: f64, gentle: f64, forest: f64) -> &'static str {
+    if sealed >= 0.2 {
+        "urban"
+    } else if steep + 0.5 * high >= 0.55 {
+        "mountain"
+    } else if gentle >= 0.35 {
+        "plains"
+    } else if forest >= 0.55 {
+        "forest"
+    } else {
+        "hills"
+    }
+}
+
+/// Infrastructure of a state when none is set: 3 with 1.5 km² or more
+/// built-up land, else 2 (0 if impassable).
+pub fn default_infrastructure(impassable: bool, urban_km2: f64) -> u32 {
+    if impassable {
+        0
+    } else if urban_km2 >= 1.5 {
+        3
+    } else {
+        2
+    }
+}
+
 fn first_max<T: Copy, K: PartialOrd>(items: impl IntoIterator<Item = T>, key: impl Fn(T) -> K) -> Option<T> {
     let mut best: Option<(T, K)> = None;
     for x in items {
@@ -401,7 +431,6 @@ pub fn build(map_dir: &Path, dirs: &Dirs, log: &dyn Fn(&str)) -> Result<PathBuf>
             bail!("strategic region {} ({}) has no provinces", r.id, r.name);
         }
     }
-    let (w, h) = (labels.w as usize, labels.h as usize);
 
     // the new folder is built next to the old one, which is replaced at the end
     let mod_dir = dirs.mods.join(&meta.folder);
@@ -412,7 +441,7 @@ pub fn build(map_dir: &Path, dirs: &Dirs, log: &dyn Fn(&str)) -> Result<PathBuf>
     if out.exists() {
         std::fs::remove_dir_all(&out).with_context(|| format!("cannot remove {}", out.display()))?;
     }
-    let result = build_into(&out, map_dir, dirs, &meta, &d, &labels.px, w, h, log);
+    let result = build_into(&out, map_dir, dirs, &meta, &d, &labels, log);
     let report = match result {
         Ok(r) => r,
         Err(e) => {
@@ -442,11 +471,10 @@ fn build_into(
     dirs: &Dirs,
     meta: &ModMeta,
     d: &model::MapData,
-    pmap: &[Id],
-    w: usize,
-    h: usize,
+    labels: &model::Labels,
     log: &dyn Fn(&str),
 ) -> Result<Vec<String>> {
+    let (pmap, w, h): (&[Id], usize, usize) = (&labels.px, labels.w as usize, labels.h as usize);
     let n = d.provinces.count();
     let provs: Vec<&model::Province> = (1..=n as Id).map(|i| d.provinces.get(i).unwrap()).collect();
     let states: Vec<&State> = d.states.iter().map(|(_, s)| s).collect();
@@ -454,7 +482,6 @@ fn build_into(
     let nations: BTreeMap<Id, &Nation> = d.nations.iter().collect();
     let adjs = &d.adjacencies;
     let crossings: Vec<&model::Adjacency> = adjs.iter().filter(|x| x.kind == "sea" || x.kind.is_empty()).collect();
-    let blocked: HashSet<(Id, Id)> = adjs.iter().filter(|x| x.kind == "impassable").map(|x| pair(x.from, x.to)).collect();
     let px_m = d.pixel_m;
     let mut rng = Rng::new(meta.seed);
 
@@ -565,7 +592,20 @@ fn build_into(
             .collect();
         img::write_bmp24(&mapdir.join("world_normal.bmp"), nw as u32, nh as u32, &rgb)?;
     }
-    img::write_bmp8(&mapdir.join("rivers.bmp"), w as u32, h as u32, &vec![v.rivers.bg; w * h], &v.rivers.palette)?;
+    // rivers as drawn in the editor (one pixel wide, with source and junction markers)
+    let ground = |i: usize| {
+        let p = pmap[i] as usize;
+        if is_sea[p] {
+            rivers::Ground::Sea
+        } else if is_lake[p] {
+            rivers::Ground::Lake
+        } else {
+            rivers::Ground::Land
+        }
+    };
+    let river_px = rivers::rasterize(&d.rivers, w, h, ground);
+    let mut warnings: Vec<String> = river_px.problems.iter().map(|p| format!("rivers: {} (at {}, {})", p.msg, p.at[0], p.at[1])).collect();
+    img::write_bmp8(&mapdir.join("rivers.bmp"), w as u32, h as u32, &river_px.image(w, h, |i| sea_px[i]), &v.rivers.palette)?;
     let is_forest = |c: u8| matches!(c, NEEDLE | BROAD | BROAD_EVERGREEN);
     let (tw, th) = scaled(v.trees.size, v.map_size, (w, h));
     {
@@ -664,16 +704,8 @@ fn build_into(
             t.clone()
         } else if is_edge[i as usize] {
             "mountain".into()
-        } else if share(i, s.sealed) >= 0.2 {
-            "urban".into()
-        } else if share(i, s.steep) + 0.5 * share(i, s.high) >= 0.55 {
-            "mountain".into()
-        } else if share(i, s.gentle) >= 0.35 {
-            "plains".into()
-        } else if share(i, s.forest) >= 0.55 {
-            "forest".into()
         } else {
-            "hills".into()
+            land_terrain(share(i, s.sealed), share(i, s.steep), share(i, s.high), share(i, s.gentle), share(i, s.forest)).into()
         }
     };
     let terrain_of: Vec<String> = std::iter::once(String::new()).chain((1..=n as Id).map(gameplay_terrain)).collect();
@@ -769,26 +801,15 @@ fn build_into(
 
     // victory points: set in the editor, else the most built-up province; vp is
     // the main one (capital province, unit and supply location) of each passable state
-    let mut vps: BTreeMap<Id, Vec<(Id, u32)>> = BTreeMap::new();
-    let mut vp: BTreeMap<Id, (Id, u32)> = BTreeMap::new();
     for s in &states {
-        if !s.victory_points.is_empty() {
-            let list: Vec<(Id, u32)> = s.victory_points.iter().map(|v| (v[0], v[1])).collect();
-            if let Some((p, _)) = list.iter().find(|(p, _)| !s.provinces.contains(p)) {
-                bail!("victory point province {p} of state {} ({}) is not in the state", s.id, s.name);
-            }
-            vps.insert(s.id, list);
-        } else if !s.impassable {
-            let best = first_max(s.provinces.iter().copied(), |p| (urban_km2[p as usize], size(p))).unwrap();
-            let val = (urban_km2[best as usize] / 2.0).round_ties_even().clamp(1.0, 10.0) as u32;
-            vps.insert(s.id, vec![(best, val)]);
-        }
-        if !s.impassable
-            && let Some(list) = vps.get(&s.id)
-        {
-            vp.insert(s.id, first_max(list.iter().copied(), |(p, val)| (val, size(p))).unwrap());
+        if let Some(p) = s.victory_points.iter().map(|v| v[0]).find(|p| !s.provinces.contains(p)) {
+            bail!("victory point province {p} of state {} ({}) is not in the state", s.id, s.name);
         }
     }
+    let pstats = model::compute_stats(labels, n + 1);
+    let vps: BTreeMap<Id, Vec<(Id, u32)>> = supply::state_vps(d, &pstats, &urban_km2);
+    let main_vp: BTreeMap<Id, Id> = supply::main_vps(d, &pstats, &vps);
+    let vp: BTreeMap<Id, (Id, u32)> = main_vp.iter().map(|(&s, &p)| (s, (p, vps[&s].iter().find(|x| x.0 == p).unwrap().1))).collect();
     let state_urban: BTreeMap<Id, f64> = states.iter().map(|s| (s.id, s.provinces.iter().fold(0.0, |a, &p| a + urban_km2[p as usize]))).collect();
 
     // ------------------------------------------------------------- nations
@@ -941,7 +962,18 @@ fn build_into(
         }
     }
     write(&mapdir.join("weatherpositions.txt"), &wp)?;
-    write(&mapdir.join("supply_nodes.txt"), &vp.values().map(|(p, _)| format!("1 {p}\n")).collect::<String>())?;
+    // supply: railways, hubs and naval bases as set in the editor, else automatic
+    let sup = supply::plan(d, &pstats, labels, &main_vp);
+    for &i in &sup.bad_hubs {
+        warnings.push(format!("supply hub {} is not on passable land; left out", i + 1));
+    }
+    for &i in &sup.bad_ports {
+        warnings.push(format!("port {} is not on a coast; left out", i + 1));
+    }
+    for (ri, msg) in &sup.lines.faults {
+        warnings.push(format!("railway {}: {msg}", ri + 1));
+    }
+    write(&mapdir.join("supply_nodes.txt"), &sup.hubs.iter().map(|p| format!("1 {p}\n")).collect::<String>())?;
     // vanilla's frame, logo and Great Wall sit at fixed positions of its 5632x2048 map
     let water: Vec<(f64, f64)> = regions
         .iter()
@@ -953,66 +985,11 @@ fn build_into(
         .collect();
     write(&mapdir.join("ambient_object.txt"), &ambient_objects(&dirs.game, d.map_frame(), &water)?)?;
 
-    // railways: a minimum spanning tree over neighbouring passable states (any
-    // owner), each link the shortest land path between their victory points;
-    // shared stretches laid once
-    let impassable_states: HashSet<Id> = states.iter().filter(|s| s.impassable).map(|s| s.id).collect();
-    let passable: Vec<Id> = (1..=n as Id).filter(|&p| is_land[p as usize] && !impassable_states.contains(&state_of[p as usize])).collect();
-    let mut pidx = vec![rail::NONE; n + 1];
-    for (i, &p) in passable.iter().enumerate() {
-        pidx[p as usize] = i;
-    }
-    let mut links: Vec<BTreeMap<Id, f64>> = passable.iter().map(|&p| nb[p as usize].iter().filter(|&&q| !blocked.contains(&pair(p, q))).map(|&q| (q, 1.0)).collect()).collect();
-    for x in &crossings {
-        // over the water costs 50 px extra
-        let (a, b) = (x.from as usize, x.to as usize);
-        if a <= n && b <= n && pidx[a] != rail::NONE && pidx[b] != rail::NONE {
-            links[pidx[a]].insert(x.to, 50.0);
-            links[pidx[b]].insert(x.from, 50.0);
-        }
-    }
-    let dist_c = |p: Id, q: Id| {
-        let (a, b) = (centre[p as usize], centre[q as usize]);
-        (a.0 as f64 - b.0 as f64).hypot(a.1 as f64 - b.1 as f64)
-    };
-    let graph: Vec<Vec<(usize, f64)>> = passable
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| links[i].iter().filter(|(q, _)| pidx[**q as usize] != rail::NONE).map(|(&q, &extra)| (pidx[q as usize], dist_c(p, q) + extra)).collect())
-        .collect();
-    let mut state_nb: BTreeSet<(Id, Id)> = BTreeSet::new();
-    for (i, &p) in passable.iter().enumerate() {
-        for &q in links[i].keys() {
-            if pidx[q as usize] != rail::NONE && state_of[p as usize] != state_of[q as usize] {
-                state_nb.insert(pair(state_of[p as usize], state_of[q as usize]));
-            }
-        }
-    }
-    let rstates: Vec<Id> = vp.keys().copied().collect();
-    let sidx: BTreeMap<Id, usize> = rstates.iter().enumerate().map(|(i, &s)| (s, i)).collect();
-    let src: Vec<usize> = rstates.iter().map(|s| pidx[vp[s].0 as usize]).collect();
-    let paths: Vec<(Vec<f64>, Vec<usize>)> = src.par_iter().map(|&s| rail::dijkstra(&graph, s)).collect();
-    let mut tree_edges: Vec<(usize, usize, f64)> = Vec::new();
-    for &(s1, s2) in &state_nb {
-        if let (Some(&i), Some(&j)) = (sidx.get(&s1), sidx.get(&s2)) {
-            let dd = paths[i].0[src[j]];
-            if dd.is_finite() {
-                tree_edges.push((i, j, dd + 1e-3));
-            }
-        }
-    }
-    let mut rail_edges: BTreeSet<(Id, Id)> = BTreeSet::new();
-    for (i, j) in rail::spanning_tree(rstates.len(), &tree_edges) {
-        let mut node = src[j];
-        while node != src[i] {
-            let prev = paths[i].1[node];
-            rail_edges.insert(pair(passable[prev], passable[node]));
-            node = prev;
-        }
-    }
-    let rails: Vec<String> =
-        rail::rail_chains(&rail_edges).iter().map(|c| format!("1 {} {}", c.len(), c.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(" "))).collect();
-    write(&mapdir.join("railways.txt"), &(rails.join("\n") + if rails.is_empty() { "" } else { "\n" }))?;
+    // railways: as laid in the editor, else a minimum spanning tree over
+    // neighbouring passable states (any owner), each link the shortest land
+    // way between their victory points; shared stretches laid once
+    let (rail_txt, rail_lines) = sup.lines.railways_txt();
+    write(&mapdir.join("railways.txt"), &rail_txt)?;
 
     // adjacency rules: from adjacency_rules.txt next to provinces.json, if there is one
     let rules_file = map_dir.join("adjacency_rules.txt");
@@ -1104,7 +1081,7 @@ fn build_into(
         }
         let (civ, arms) = plan.get(&s.id).copied().unwrap_or((0, 0));
         let mut blds: Vec<(String, u32)> = vec![
-            ("infrastructure".into(), if s.impassable { 0 } else if u >= 1.5 { 3 } else { 2 }),
+            ("infrastructure".into(), default_infrastructure(s.impassable, u)),
             ("industrial_complex".into(), civ),
             ("arms_factory".into(), arms),
         ];
@@ -1114,10 +1091,11 @@ fn build_into(
                 None => blds.push((k.clone(), val)),
             }
         }
+        let naval: String = s.provinces.iter().filter_map(|p| sup.ports.get(p).map(|lv| format!("\t\t\t{p} = {{\n\t\t\t\tnaval_base = {lv}\n\t\t\t}}\n"))).collect();
         factories[0] += blds.iter().find(|b| b.0 == "industrial_complex").map_or(0, |b| b.1);
         factories[1] += blds.iter().find(|b| b.0 == "arms_factory").map_or(0, |b| b.1);
         hist.push(format!(
-            "\t\tbuildings = {{\n{}\t\t}}",
+            "\t\tbuildings = {{\n{}{naval}\t\t}}",
             blds.iter().filter(|(k, v)| *v != 0 || k == "infrastructure").map(|(k, v)| format!("\t\t\t{k} = {v}\n")).collect::<String>()
         ));
         let mut extra = if s.impassable { "\timpassable = yes\n".to_string() } else { String::new() };
@@ -1420,7 +1398,18 @@ set_popularities = {{
             is_lake.iter().filter(|&&l| l).count()
         ),
         format!("gameplay terrain: {}", sorted_desc(&tcount)),
-        format!("{} countries, {} railway lines ({} rail links); factories {} civilian, {} military", by_rank.len(), rails.len(), rail_edges.len(), factories[0], factories[1]),
+        format!("{} countries; factories {} civilian, {} military", by_rank.len(), factories[0], factories[1]),
+        format!(
+            "{} railway lines ({} rail links, {}), {} supply hubs ({}), {} naval bases, {} rivers ({} px)",
+            rail_lines,
+            sup.lines.level.len(),
+            if sup.custom_rail { "as laid" } else { "automatic" },
+            sup.hubs.len(),
+            if sup.custom_hubs { "as set" } else { "automatic" },
+            sup.ports.len(),
+            d.rivers.len(),
+            river_px.px.len()
+        ),
         format!("state categories: {}", sorted_desc(&cat_counts)),
         format!(
             "player {player} ({}); bookmark: {}",
@@ -1437,6 +1426,7 @@ set_popularities = {{
         format!("map frame {}", if d.map_frame() { "on" } else { "off" }),
         tutorial_note,
     ];
+    report.extend(warnings);
     report.extend(notes);
     Ok(report)
 }

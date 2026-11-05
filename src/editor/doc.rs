@@ -21,6 +21,8 @@ struct Txn {
     label: String,
     before: MapData,
     pixels: Vec<(u32, Id, Id)>,
+    /// The whole map was replaced: its impassable borders are its own.
+    whole: bool,
 }
 
 struct Step {
@@ -114,7 +116,7 @@ impl Doc {
         if self.txn.is_some() {
             self.commit();
         }
-        self.txn = Some(Txn { label: label.into(), before: self.data.clone(), pixels: Vec::new() });
+        self.txn = Some(Txn { label: label.into(), before: self.data.clone(), pixels: Vec::new(), whole: false });
     }
 
     /// Finish the edit: refresh derived data, push an undo step.
@@ -123,7 +125,7 @@ impl Doc {
         let px = !txn.pixels.is_empty();
         let touched_before = if px { std::mem::take(&mut self.stats.border) } else { Default::default() };
         self.refresh(px);
-        if px && self.carry_walls(&txn.before, &touched_before, &txn.pixels) {
+        if px && !txn.whole && self.carry_walls(&txn.before, &touched_before, &txn.pixels) {
             self.refresh(false);
         }
         self.undo.push(Step { label: txn.label.clone(), data: txn.before, pixels: txn.pixels });
@@ -257,6 +259,39 @@ impl Doc {
         r
     }
 
+    /// Replace the whole map with another of the same size (a backup), inside
+    /// a transaction: undo brings the current one back. Returns the pixels
+    /// that changed.
+    pub fn replace_map(&mut self, l: model::Loaded) -> anyhow::Result<usize> {
+        anyhow::ensure!((l.labels.w, l.labels.h) == (self.w, self.h), "it is {}×{} px, the map {}×{}", l.labels.w, l.labels.h, self.w, self.h);
+        let n = self.with_pixels(|wr, _| {
+            let mut n = 0;
+            for (i, &v) in l.labels.px.iter().enumerate() {
+                if wr.get(i) != v {
+                    wr.set(i, v);
+                    n += 1;
+                }
+            }
+            n
+        });
+        self.data = l.data;
+        if let Some(t) = self.txn.as_mut() {
+            t.whole = true;
+        }
+        Ok(n)
+    }
+
+    /// Statistics of the pixels as they are now, for an operation that goes on
+    /// working on pixels it changed. The contacts from before the transaction
+    /// stay for `commit`, which compares them with those after.
+    pub fn restat(&mut self) {
+        let before = std::mem::take(&mut self.stats.border);
+        self.stats = model::compute_stats(&self.labels.read(), self.data.provinces.cap());
+        if self.txn.is_some() {
+            self.stats.border = before;
+        }
+    }
+
     /// Statistics, clean-up and member lists after a change.
     pub fn refresh(&mut self, pixels_changed: bool) {
         if pixels_changed {
@@ -386,7 +421,7 @@ impl Doc {
             }
         }
         let d = Arc::new(density::density(t, p));
-        self.density_cache = Some((*p, d.clone()));
+        self.density_cache = Some((p.clone(), d.clone()));
         Some(d)
     }
 

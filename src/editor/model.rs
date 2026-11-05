@@ -234,6 +234,43 @@ impl<T> Table<T> {
     }
 }
 
+/// A point of a river: map pixel x, y and the width there (1 narrowest ..=
+/// [`RIVER_WIDTHS`] widest).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RiverPoint(pub f32, pub f32, pub u8);
+
+/// River widths (rivers.bmp indexes 3..=11).
+pub const RIVER_WIDTHS: u8 = 9;
+/// Widths up to this are small rivers for the game (smaller crossing penalty).
+pub const SMALL_RIVER_MAX: u8 = 4;
+
+/// A river from its source (first point) to its mouth (last point). Where it
+/// ends at another river it flows into it; where it starts at one it branches
+/// off it (see [`super::rivers`]).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct River {
+    #[serde(default)]
+    pub name: String,
+    pub points: Vec<RiverPoint>,
+}
+
+/// A railway through the provinces under its stops (map pixels), each leg the
+/// shortest way over land between two stops (see [`super::supply`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Railway {
+    /// 1..=5
+    pub level: u8,
+    pub stops: Vec<[f32; 2]>,
+}
+
+/// A naval base in the coastal province under `at` (map pixel).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Port {
+    pub at: [f32; 2],
+    /// 1..=10
+    pub level: u8,
+}
+
 /// Everything in provinces.json (cloned for undo; the bitmap is not).
 #[derive(Clone, Debug, Default)]
 pub struct MapData {
@@ -242,6 +279,14 @@ pub struct MapData {
     pub nations: Table<Nation>,
     pub regions: Table<Region>,
     pub adjacencies: Vec<Adjacency>,
+    pub rivers: Vec<River>,
+    /// None: the mod build lays them (a tree between the states' main victory
+    /// points, [`super::supply::auto_links`]).
+    pub railways: Option<Vec<Railway>>,
+    /// Supply hubs (map pixels); None: one at the main victory point of every
+    /// passable state.
+    pub supply_hubs: Option<Vec<[f32; 2]>>,
+    pub ports: Vec<Port>,
     /// Other top-level keys (size, pixel_m, origin, crs, ...), kept as they are.
     pub header: Map<String, Value>,
     pub pixel_m: f64,
@@ -536,9 +581,13 @@ pub fn load(dir: &Path, progress: &Progress) -> Result<Loaded> {
             a.kind = "sea".into();
         }
     }
+    let rivers: Vec<River> = serde_json::from_value(take("rivers")).context("rivers")?;
+    let ports: Vec<Port> = serde_json::from_value(take("ports")).context("ports")?;
+    let railways: Option<Vec<Railway>> = root.remove("railways").map(serde_json::from_value).transpose().context("railways")?;
+    let supply_hubs: Option<Vec<[f32; 2]>> = root.remove("supply_hubs").map(serde_json::from_value).transpose().context("supply_hubs")?;
     let pixel_m = root.get("pixel_m").and_then(Value::as_f64).unwrap_or(1.0);
 
-    let mut data = MapData { header: root, pixel_m, adjacencies, ..Default::default() };
+    let mut data = MapData { header: root, pixel_m, adjacencies, rivers, railways, supply_hubs, ports, ..Default::default() };
     for p in provinces {
         if p.id == 0 || data.provinces.contains(p.id) {
             bail!("province id {} is 0 or used twice", p.id);
@@ -627,6 +676,66 @@ pub fn timestamp() -> String {
 }
 
 pub const BACKUPS_KEPT: usize = 10;
+
+/// Seconds since 1970 of a [`timestamp`] ("YYYYMMDD-HHMMSS", UTC).
+pub fn parse_timestamp(s: &str) -> Option<u64> {
+    let (date, time) = s.split_once('-')?;
+    if date.len() != 8 || time.len() != 6 || !date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n = |t: &str| t.parse::<i64>().ok();
+    let (y, m, d) = (n(&date[..4])?, n(&date[4..6])?, n(&date[6..])?);
+    let (hh, mm, ss) = (n(&time[..2])?, n(&time[2..4])?, n(&time[4..])?);
+    // days_from_civil (Howard Hinnant)
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
+/// A copy of the map's files that "Save" made before writing over them.
+#[derive(Clone, Debug)]
+pub struct Backup {
+    pub dir: PathBuf,
+    /// When it was made (UTC, as the folder is named).
+    pub name: String,
+    pub provinces: Option<usize>,
+}
+
+impl Backup {
+    /// "3 h 10 min ago" and the like.
+    pub fn age(&self) -> String {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        match parse_timestamp(&self.name).map(|t| now.saturating_sub(t) / 60) {
+            None => String::new(),
+            Some(m) if m < 60 => format!("{m} min ago"),
+            Some(m) if m < 48 * 60 => format!("{} h {} min ago", m / 60, m % 60),
+            Some(m) => format!("{} days ago", m / (24 * 60)),
+        }
+    }
+}
+
+/// The backups of the map in `dir`, newest first.
+pub fn backups(dir: &Path) -> Vec<Backup> {
+    #[derive(Deserialize)]
+    struct Count {
+        provinces: Vec<serde::de::IgnoredAny>,
+    }
+    let Ok(entries) = std::fs::read_dir(dir.join("backups")) else { return Vec::new() };
+    let mut out: Vec<Backup> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("provinces.bmp").is_file() && p.join("provinces.json").is_file())
+        .map(|p| {
+            let provinces = std::fs::read_to_string(p.join("provinces.json")).ok().and_then(|t| serde_json::from_str::<Count>(&t).ok()).map(|c| c.provinces.len());
+            Backup { name: p.file_name().unwrap_or_default().to_string_lossy().into_owned(), dir: p, provinces }
+        })
+        .collect();
+    out.sort_by(|a, b| b.name.cmp(&a.name));
+    out
+}
 
 /// Copy the current files to `dir/backups/<time>/` and drop the oldest backups
 /// beyond [`BACKUPS_KEPT`] (only folders this function made).
@@ -796,6 +905,19 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats) -> Resul
     root.insert("states".into(), Value::Array(states));
     root.insert("regions".into(), Value::Array(regions));
     root.insert("adjacencies".into(), Value::Array(adjacencies));
+    // map points, not province ids: nothing to renumber
+    if !data.rivers.is_empty() {
+        root.insert("rivers".into(), serde_json::to_value(&data.rivers)?);
+    }
+    if let Some(r) = &data.railways {
+        root.insert("railways".into(), serde_json::to_value(r)?);
+    }
+    if let Some(h) = &data.supply_hubs {
+        root.insert("supply_hubs".into(), serde_json::to_value(h)?);
+    }
+    if !data.ports.is_empty() {
+        root.insert("ports".into(), serde_json::to_value(&data.ports)?);
+    }
 
     let w = labels.w as usize;
     write_bmp24(&dir.join("provinces.bmp"), labels.w, labels.h, |y, out| {
@@ -810,4 +932,19 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats) -> Resul
     std::fs::write(&tmp, json).with_context(|| format!("cannot write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("cannot write {}", path.display()))?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_times() {
+        assert_eq!(parse_timestamp("19700101-000000"), Some(0));
+        assert_eq!(parse_timestamp("20261104-234427"), Some(1_793_835_867));
+        assert_eq!(parse_timestamp("20240229-120000"), Some(1_709_208_000));
+        assert_eq!(parse_timestamp(&timestamp()).map(|t| t / 10), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() / 10));
+        assert_eq!(parse_timestamp("backups"), None);
+        assert_eq!(parse_timestamp("2026110-2344270"), None);
+    }
 }

@@ -67,29 +67,81 @@ plus `provinces.json` (names, types, states, nations, strategic regions,
 adjacencies, overrides), as written by `make_provinces.py`. The viewer's
 layers stay underneath ("Background layers" at the bottom of the panel).
 
-**Levels** (keys `1`–`7`): what clicks select and what the actions work on.
+**Levels** (keys `1`–`9`): what clicks select and what the actions work on.
 
 | Level | Select / paint | Actions |
 |---|---|---|
-| Provinces | provinces; the paint brush redraws borders with the first selected province (only over the same type by default, optionally only within the same state / nation) | merge, divide into *n*, **generate by terrain**, dissolve, new (paint), make land / sea, split separate parts, new state / air zone / sea zone from the selection |
+| Provinces | provinces; the paint brush redraws borders with the first selected province (only over the same type by default, optionally only within the same state / nation) | merge, divide into *n*, **generate by terrain**, dissolve, new (paint), new from an image, make land / sea, split separate parts, new state / air zone / sea zone from the selection |
 | States | states; paint moves provinces into the first selected state | merge, divide, dissolve, generate states, new nation, impassable on / off |
 | Nations | nations; paint moves whole states | merge, divide, dissolve, share out land (each state to the nearest capital), generate states |
 | Air zones / Sea zones | land / naval strategic regions | merge, divide, dissolve, generate |
 | Adjacencies | straits (`sea`), `impassable` borders, links (empty type, optionally with an `adjacency_rule_name`); Link tool (`L`): click the two provinces | edit, recompute the crossing points, delete |
 | Inaccessible | brush-select provinces | make impassable, remove from play, restore access |
+| Rivers | rivers; Draw tool (`D`): click a new river from its source to its mouth | move, add and remove points, widths, rename, reverse, simplify, delete, **generate from the heights** |
+| Supply | railways, supply hubs, ports; Railway (`R`), Hub (`H`) and Port (`N`) tools | levels, delete, automatic or laid railways and hubs, a port in each coastal state, **supply estimate** |
 
-**Varying detail.** "Generate by terrain" re-cuts the selected provinces with
-the density model of `make_provinces.py`: small provinces in built-up areas
-and on valley floors, larger ones on slopes, large ones above 2000 m (sizes in
-"Generation parameters"). The *detail* factor scales a run, so a valley can be
-cut finer and a mountain group coarser. The colour mode "province size vs.
-terrain target" shows where provinces are smaller (blue) or bigger (red) than
-the terrain asks for. Province bounding boxes always stay under 1/8 of the map
-(HOI4's limit), pieces under the minimum size join a neighbour, and points
-where four provinces meet are removed.
+**Varying detail.** "Generate by terrain" re-cuts the selected provinces
+with a province size for every pixel, set in "Generation parameters":
 
-**Properties** of the first selected entity are edited in the panel and applied
-as one undo step:
+- *Land by height and slope* is a list of rules. Each rule has a name, a
+  province size and optional limits: height from / below (m) and slope
+  from / below (degrees, mean over 9×9 px); a limit left at "any" does not
+  restrict. The first rule from the top that fits a pixel sets its size, and
+  *other land* covers what no rule fits. Each rule shows how much of the
+  land it covers, so a rule that rules above it already take shows up at 0 %.
+  The defaults are those of `make_provinces.py`: valley floors (below 1600 m
+  and 12°) 1.5 km², mountains (from 2000 m) 30 km², other land 8 km².
+  Settings saved before the rules existed become these rules with their
+  sizes.
+- *Built-up areas* get smaller provinces where they ask for smaller ones
+  than their rule.
+
+The *detail* factor scales a run, so a valley can be cut finer and a
+mountain group coarser. The colour mode "province size vs. terrain target"
+shows where provinces are smaller (blue) or bigger (red) than the terrain
+asks for. Province bounding boxes always stay under 1/8 of the map (HOI4's
+limit), pieces under the minimum size join a neighbour, and points where four
+provinces meet are removed.
+
+**Winding borders.** Generated and divided provinces are cut around centres
+spread over the area; each pixel goes to its nearest centre, which on its
+own draws straight borders (Voronoi cells). Instead each pixel looks for its
+centre from a slightly moved position: a smooth random displacement with
+bends at every scale from the cell size down, scaled to the local province
+size. The borders then wind like natural ones. States, nations and zones
+that are generated or divided are grouped the same way, so their outlines
+wind too. *Winding borders* in "Generation parameters" sets how much: 0 gives
+the straight borders, 1 (the default) natural bends, 2 or more strongly
+winding ones. A cut is the same each time it is repeated with the same
+settings.
+
+**Province from image.** "From image…" (Provinces level) makes one new
+province with the shape of a colour channel of an image: every map pixel
+where the red, green, blue, alpha or brightness value is at least (or below)
+a threshold. The image can be any BMP, TIFF, PNG or JPEG. It is laid on the
+map by its georeference when it has one (any resolution, reprojected if
+needed), pixel for pixel if it has the map's size, and stretched over the map
+otherwise. The window says which. A preview shows the shape on the map, with
+the pixel count and the provinces it covers (those entirely inside it go).
+The new province is land, sea or removed land ("lake"): by default the kind
+most of the shape lies on, and only over provinces of that kind, so a land
+shape leaves the sea alone. A land or sea province gets the state and air /
+sea zone of most of its area; one too large or in separate pieces shows up in
+the checks. Removed land works like "Remove from play": it takes land and
+removed provinces but never sea, every part keeps its air zone (one province
+per zone), and with "merge into as few provinces as possible" (the same
+setting as in the Inaccessible panel) each is cut to HOI4's size limits.
+Specks of the shape under 8 px stay as they are, what it leaves of a province
+under 8 px goes with it, and crossings along its edge are fixed. One undo
+step.
+
+**Properties** of the first selected entity are edited in the panel. A change
+goes into the map once it is done: a text field when you leave it (Enter, Tab
+or a click elsewhere), anything else when you let go of it. Each change is one
+undo step and changes only the fields you edited, so what other edits did to
+the entity meanwhile stays. A change still being typed is applied before
+anything that could lose it (selecting something else, another level, an
+action, undo, save, build) and counts as unsaved. The fields:
 
 - Province: name, terrain (else derived from the land cover).
 - State: name, owner, impassable, population (manpower), state category,
@@ -117,14 +169,106 @@ provinces in no state. This mode is **experimental** (not yet tried in the
 game), so check `error.log` after a build. Both modes can merge the selection
 into as few provinces as possible.
 
+**Rivers.** Rivers are lines through map points, each point with a width
+from 1 (narrowest) to 9; widths up to 4 count as small rivers in the game.
+A river runs from its source to its mouth. Its pixels in `rivers.bmp` are
+worked out from the lines, so the bitmap always follows the game's rules: one
+pixel wide, a source marker at the start, a marker where a river flows into
+another (or branches off one), no blocks of four or corner-only contacts.
+A river ends at the first sea pixel. Over removed land ("lake") it is cut
+into pieces, each with its own source. Wider rivers are drawn first. A
+narrower one that meets one flows into it and ends there, and one that
+starts on one branches off it. Where it cannot join cleanly (alongside
+another, or into a crowded spot), it ends just before. The panel shows the
+`rivers.bmp` pixel count and lists rivers that go on past the sea or past
+the river they flow into (the rest is left out) and rivers too short to
+draw; click one to go there.
+
+- Select tool: click a river to select it, drag its points, Shift+click on
+  the river to add a point, Ctrl+click on a point to remove it, Del deletes
+  it.
+- Draw tool (`D`): click from the source down to the mouth. Double-click,
+  right-click or Enter ends the river, Backspace takes back a point, Esc
+  cancels. New points get the width of the slider.
+- The selected river can be renamed, reversed (the other end becomes the
+  source), simplified, and given widths that grow evenly from one value at
+  the source to another at the mouth.
+- *From the heights* follows the water down `dem_section.tif` to the sea or
+  the map's edge, filling hollows on the way. A river starts where the water
+  of at least the set area gathers (*km² drained at least*: less makes more
+  and longer rivers), each junction keeps the river with the larger
+  catchment as the main one, and widths grow with the land drained. This
+  runs in the background. The new rivers either replace the current ones or
+  are added to them.
+- Zoomed in far enough, *show the rivers.bmp pixels* draws the pixels as the
+  build will write them: green is the source, red flows into another river,
+  yellow branches off one, and darker blue is wider.
+
+Rivers are shown on every level (the *rivers* checkbox at the top), and
+they are stored in `provinces.json` (`"rivers"`).
+
+**Supply.** This level edits what HOI4 builds its supply from, and shows an
+estimate of the supply each province gets (colour mode *supply (estimate)*,
+the default here).
+
+- *Railways* are lines through stop provinces, each with a level (1–5).
+  Each leg between two stops follows the shortest way over passable land,
+  around impassable borders and impassable states; straits and water links
+  count as 50 px (1.75 km) longer. The editor and the build route the same
+  way. As long as none are laid, the build joins neighbouring states with
+  level-1 railways (a minimum spanning tree between the main victory points
+  of the states), and the map shows them. "Make editable" (or the first
+  change) keeps those railways so you can change them. "Back to automatic"
+  drops the laid railways again. Railway tool
+  (`R`): click the stops; double-click, right-click or Enter ends the
+  railway, Backspace takes back a stop, Esc cancels. The way is previewed
+  while you draw. New railways get the level of the slider; the selected one
+  can change its level. Where two railways share a link, the higher level
+  counts.
+- *Supply hubs* are automatic too (the main victory point of each state)
+  until one is changed. Hub tool (`H`): click a province to add a hub, or to
+  remove the one there. Hubs with no railway or river to their capital show
+  red and are listed.
+- *Ports* (naval bases, level 1–10) go in coastal provinces. Port tool
+  (`N`): click a province on the sea to add one (with the slider's level),
+  or to remove the one there. "One per coastal state" puts one in the most
+  built-up coastal province of each state on the sea that has none.
+- The *estimate* follows the game's supply rules (`NSupply` in
+  `common/defines`). Supply starts at 5 in the capital, and at 2.8 in hubs
+  joined to it by railway or river (+0.34 per level of the weakest railway on
+  the way). Naval bases give 3.3 once one of them is joined to the capital.
+  On each province it travels, supply loses a penalty that grows with the
+  distance. The penalty is larger in rough terrain (forest, hills,
+  mountains, marsh) and over rivers, and smaller with infrastructure and in
+  cities. Supply from several sources adds up, and 1 or more fully supplies a
+  division. It is worked out for each nation from its own capital, or for
+  all the land as one country with the capital of a chosen nation. The
+  hover panel shows a province's supply, terrain, infrastructure, railway
+  level, hub, port and whether it lies on a river.
+  Motorization, damage, weather, air superiority and fleets are left out,
+  and terrain and infrastructure are taken as set in the editor, else as
+  the build derives them. Treat it as a guide to where supply is short.
+
+Railways, hubs and ports are stored as map points in `provinces.json`
+(`"railways"`, `"supply_hubs"`, `"ports"`), so they stay in place when
+provinces are re-cut or merged. The automatic railways and hubs are not
+stored: a map without them follows its provinces and states.
+
 **Checks** run in the background after every edit: province size and box
 limit, separate pieces, crossings, provinces without state or zone, zone
-type, contiguity of states and zones, capitals, tags, straits. Click an issue
+type, contiguity of states and zones, capitals, tags, straits, rivers cut
+short at the sea or another river (or too short to draw), railway stops off
+passable land or without a way between them, hubs off passable land, ports
+not on a coast. Click an issue
 to go there.
 
 **Saving and building.** Ctrl+S (or 💾) writes `provinces.bmp` and
-`provinces.json`. The previous files are copied to `backups/<time>/` first; the
-last 10 are kept. Ids are renumbered 1..n on save if anything was removed.
+`provinces.json`. The previous files are copied to `backups/<time>/` first
+(UTC time of the save); the last 10 are kept. Ids are renumbered 1..n on save
+if anything was removed. "Backups…" lists them with their age and province
+count; "Load" puts one in the editor as one edit (Undo goes back). Nothing is
+written until you save. The mod details and the map frame setting stay as they are.
+Reload and Open… ask before they drop unsaved changes.
 "Build mod" saves, builds the mod and checks it (see
 [Building the mod](#building-the-mod)), and opens the "Build mod and play"
 window with the log and the game launcher (also "▶ Play…").
@@ -152,7 +296,9 @@ a gap. Walls between provinces that no longer touch are dropped.
   kept with the editor settings, not in the map.
 
 "Apply" stores the details in `provinces.json` (`"mod"`) as one undo step.
-"Build mod" applies pending changes first. A preview shows the
+Closing the window, Save and "Build mod" apply pending changes too; while they
+are invalid (no name, a bad folder name) the window stays open until they are
+fixed or reverted. A preview shows the
 `descriptor.mod` that will be written. HOI4's descriptor has no author or
 description field, so these go to a `README.txt` in the mod (and are there to
 paste into the Workshop page).
@@ -164,8 +310,10 @@ beside it. The setting is stored as `"map_frame"` in `provinces.json`.
 
 | Input | Action |
 |---|---|
-| `1`–`7` | provinces / states / nations / air zones / sea zones / adjacencies / inaccessible |
+| `1`–`9` | provinces / states / nations / air zones / sea zones / adjacencies / inaccessible / rivers / supply |
 | `S` / `B` / `L` / `I` / `P` | select / paint / link / border / pan tool |
+| `D` / `R` / `H` / `N` | draw a river / railway / supply hub / port (naval base) tool (on the Rivers and Supply levels) |
+| Enter, Backspace | end a new river or railway; take back its last point |
 | click, Shift / Ctrl+click | select; add or remove |
 | drag (select tool) | select everything the brush touches |
 | Alt+click | pick what is under the cursor |
@@ -185,14 +333,16 @@ tree type and city look are sampled from the vanilla Alps around Innsbruck.
 
 It writes `<mods>/<folder>/` and `<mods>/<folder>.mod`:
 
-- **map:** heightmap, terrain, normals, rivers, trees, cities, colour maps,
-  `definition.csv`, buildings, unit / weather / supply positions, railways
-  (a minimum spanning tree over neighbouring states, around impassable
-  borders), adjacencies, strategic regions, and `ambient_object.txt` (the
+- **map:** heightmap, terrain, normals, `rivers.bmp` (the editor's
+  rivers), trees, cities, colour maps, `definition.csv`, buildings, unit /
+  weather / supply positions, `railways.txt` and `supply_nodes.txt` (as laid
+  in the editor, else a minimum spanning tree over neighbouring states
+  around impassable borders, and a hub in the main victory point of each
+  state), adjacencies, strategic regions, and `ambient_object.txt` (the
   frame only if the option is on, ocean sounds over this map's sea zones, no
   Great Wall);
-- **history:** states (category, manpower, buildings, victory points),
-  countries and their militia;
+- **history:** states (category, manpower, buildings, victory points, the
+  editor's naval bases), countries and their militia;
 - **countries:** one per nation, with tag, colour unlike its neighbours',
   procedural flag, and name lists by language;
 - **other:** the bookmark, localisation, a tutorial pointed at this map (the
@@ -206,8 +356,9 @@ good mod. A folder of that name is only replaced if mod-helper (or the old
 Then the mod is checked against the game's rules (also `--validate-mod
 MOD_DIR [GAME_DIR]`): bitmap sizes and formats, provinces against
 `definition.csv`, heightmap water, states and regions covering every province
-once, positions inside their provinces, adjacencies, railways, building slots,
-countries (tags, files, colours, flags, history, units, names, localisation),
+once, positions inside their provinces, adjacencies, railways (levels 1–5),
+naval bases (coastal, levels 1–10), `rivers.bmp` (one pixel wide, markers,
+no blocks), building slots, countries (tags, files, colours, flags, history, units, names, localisation),
 bookmark, tutorial ids and the `.mod` path.
 
 This replaces `make_map_mod.py` and `validate_mod.py`, which stay in
@@ -272,11 +423,14 @@ top, in metres.
 | `editor/model.rs` | map data (id tables, label bitmap, per-province statistics and borders), load / save with backups |
 | `editor/doc.rs` | open map with transactions and undo / redo (data snapshots + pixel change logs) |
 | `editor/ops.rs` | all edit operations: paint, merge, divide, generate, dissolve, states, nations, zones, adjacencies, inaccessible zones |
-| `editor/kmeans.rs`, `editor/density.rs` | weighted k-means with the box limit; the terrain density model |
+| `editor/kmeans.rs`, `editor/density.rs` | weighted k-means with the box limit and the border warp; the terrain rules and density model |
 | `editor/validate.rs` | HOI4 map checks, run on a snapshot in the background |
 | `editor/render.rs` | the overlay as a tile source (fill per province by colour mode, graded borders, selection) |
 | `editor/mod.rs`, `editor/build.rs` | editor UI; Mod details; Build mod on a worker thread |
 | `editor/launcher.rs` | the game launcher: mod list, `dlc_load.json`, starting the game |
+| `editor/from_image.rs` | "Province from image": colour channel of an image laid on the map, preview |
+| `editor/rivers.rs`, `editor/rivers_ui.rs` | rivers as lines → `rivers.bmp` pixels (junctions, lakes, sea), its checks, rivers from the heights; the Rivers level |
+| `editor/supply.rs`, `editor/supply_ui.rs` | the supply network: railway routing, automatic railways and hubs, ports, the supply estimate; the Supply level |
 | `modbuild/mod.rs` | the mod build: bitmaps, positions, railways, states, countries, bookmark, localisation, tutorial |
 | `modbuild/validate.rs` | checks of a built mod |
 | `modbuild/meta.rs` | mod metadata (stored in `provinces.json`), `descriptor.mod`, thumbnail |
@@ -292,6 +446,8 @@ the affected tiles.
 - The map editor edits one map project at a time and keeps it in memory
   (about 0.3 GB for the 4608 × 2816 map with undo).
 - "Remove from play" (lake provinces) is untested in the game.
+- The supply estimate leaves out motorization, damage, weather and fleets;
+  the game's numbers will differ somewhat.
 - Rasters are loaded fully into RAM in their native format. The 40000² CLC+
   map takes about 1.6 GB.
 - Band-separate (planar) multi-band TIFFs and RLE4 BMPs are not supported.
