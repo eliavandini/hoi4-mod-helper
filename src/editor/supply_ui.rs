@@ -32,8 +32,8 @@ pub struct SupplyUi {
     pub level: u8,
     pub port_level: u8,
     pub scope: Scope,
-    /// Built-up km² and HOI4 terrain per province, for a pixel version.
-    terrain: Option<TerrainCache>,
+    /// Built-up km² per province, for a pixel version.
+    urban: Option<UrbanCache>,
     pub view: Option<(u64, Arc<View>)>,
     pub est: Option<((u64, Scope), Arc<Estimate>)>,
     /// Counts estimates (for the map colours).
@@ -42,8 +42,8 @@ pub struct SupplyUi {
     preview: Option<RoutePreview>,
 }
 
-/// (pixel version, land cover loaded, built-up km², HOI4 terrain) per province.
-type TerrainCache = (u64, bool, Arc<Vec<f64>>, Arc<Vec<String>>);
+/// (pixel version, land cover loaded, built-up km² per province).
+type UrbanCache = (u64, bool, Arc<Vec<f64>>);
 /// ((stops, province under the cursor), provinces on the way).
 type RoutePreview = ((Vec<[f32; 2]>, Id), Vec<Id>);
 /// A change made after the panel is drawn.
@@ -51,7 +51,7 @@ type Deferred = Box<dyn FnOnce(&mut Editor)>;
 
 impl Default for SupplyUi {
     fn default() -> Self {
-        SupplyUi { sel: None, draft: None, level: 1, port_level: 1, scope: Scope::EachNation, terrain: None, view: None, est: None, est_gen: 0, preview: None }
+        SupplyUi { sel: None, draft: None, level: 1, port_level: 1, scope: Scope::EachNation, urban: None, view: None, est: None, est_gen: 0, preview: None }
     }
 }
 
@@ -69,26 +69,26 @@ pub fn supply_colour(f: f32) -> [u8; 3] {
 }
 
 impl Editor {
-    /// Railways, hubs, ports and the rest of what supply needs (cached per map version).
+    /// Railways, hubs, ports and the rest of what supply needs (cached per
+    /// map version and terrain rules).
     pub(super) fn supply_view(&mut self) -> Option<Arc<View>> {
+        let terrain = self.province_terrains();
         let doc = self.doc.as_ref()?;
         let has_t = doc.terrain.is_some();
-        if !self.su.terrain.as_ref().is_some_and(|t| t.0 == doc.pixel_version && t.1 == has_t) {
+        if !self.su.urban.as_ref().is_some_and(|t| t.0 == doc.pixel_version && t.1 == has_t) {
             let urban = doc.sealed_km2().unwrap_or_default();
-            let terr = match &doc.terrain {
-                Some(t) => supply::province_terrain(&doc.data, &doc.labels.read(), t),
-                None => Vec::new(),
-            };
-            self.su.terrain = Some((doc.pixel_version, has_t, Arc::new(urban), Arc::new(terr)));
+            self.su.urban = Some((doc.pixel_version, has_t, Arc::new(urban)));
         }
-        let key = version(doc) ^ ((has_t as u64) << 63);
+        let rev = terrain.as_ref().map_or(0, |t| t.rev);
+        let key = version(doc) ^ ((has_t as u64) << 63) ^ rev.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         if let Some((k, v)) = &self.su.view
             && *k == key
         {
             return Some(v.clone());
         }
-        let (_, _, urban, terr) = self.su.terrain.as_ref().unwrap();
-        let v = Arc::new(supply::view(&doc.data, &doc.stats, &doc.labels.read(), urban, terr.as_ref().clone()));
+        let urban = &self.su.urban.as_ref().unwrap().2;
+        let terr = terrain.map(|t| t.terrain.as_ref().clone()).unwrap_or_default();
+        let v = Arc::new(supply::view(&doc.data, &doc.stats, &doc.labels.read(), urban, terr));
         self.su.view = Some((key, v.clone()));
         Some(v)
     }
@@ -680,7 +680,7 @@ impl Editor {
     fn ports_per_state(&mut self) {
         let Some(v) = self.supply_view() else { return };
         let Some(doc) = self.doc.as_ref() else { return };
-        let urban = self.su.terrain.as_ref().map(|t| t.2.clone()).unwrap_or_default();
+        let urban = self.su.urban.as_ref().map(|t| t.2.clone()).unwrap_or_default();
         let d = &doc.data;
         let mut best: std::collections::BTreeMap<Id, (Id, f64, u32)> = Default::default();
         for (p, pr) in d.provinces.iter() {

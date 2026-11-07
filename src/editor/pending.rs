@@ -227,7 +227,7 @@ mod tests {
         }
         data.rivers.push(River { name: String::new(), points: vec![RiverPoint(0.0, 0.0, 1), RiverPoint(2.0, 0.0, 1)] });
         let geo = crate::geo::FileGeoInfo { transform: None, crs: None, nodata: None };
-        Doc::new(dir, Loaded { data, labels: Labels { w: 3, h: 1, px: vec![1, 2, 3] }, geo })
+        Doc::new(dir, Loaded { data, labels: Labels { w: 3, h: 1, px: vec![1, 2, 3] }, geo, extra: Default::default() })
     }
 
     fn state_draft(ed: &mut Editor) -> &mut State {

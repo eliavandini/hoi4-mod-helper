@@ -12,6 +12,7 @@ pub mod density;
 pub mod doc;
 pub mod from_image;
 pub mod kmeans;
+mod lasso;
 pub mod launcher;
 pub mod model;
 pub mod ops;
@@ -19,8 +20,11 @@ pub mod render;
 pub mod rivers;
 mod pending;
 mod rivers_ui;
+pub mod straits;
 pub mod supply;
 mod supply_ui;
+mod terrain_ui;
+mod texture_ui;
 pub mod validate;
 
 #[cfg(test)]
@@ -67,10 +71,12 @@ pub enum Level {
     Inaccessible,
     Rivers,
     Supply,
+    /// terrain.bmp (the ground textures) and the heightmap.
+    Terrain,
 }
 
 impl Level {
-    pub const ALL: [Level; 9] = [
+    pub const ALL: [Level; 10] = [
         Level::Provinces,
         Level::States,
         Level::Nations,
@@ -80,6 +86,7 @@ impl Level {
         Level::Inaccessible,
         Level::Rivers,
         Level::Supply,
+        Level::Terrain,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -92,6 +99,7 @@ impl Level {
             Level::Inaccessible => "Inaccessible",
             Level::Rivers => "Rivers",
             Level::Supply => "Supply",
+            Level::Terrain => "Terrain",
         }
     }
     /// Levels that edit lines and points rather than provinces.
@@ -100,7 +108,7 @@ impl Level {
     }
     fn noun(self) -> &'static str {
         match self {
-            Level::Provinces | Level::Inaccessible => "province",
+            Level::Provinces | Level::Inaccessible | Level::Terrain => "province",
             Level::States => "state",
             Level::Nations => "nation",
             Level::AirZones => "air zone",
@@ -126,10 +134,15 @@ pub enum MapMode {
     SizeVsTarget,
     Issues,
     Supply,
+    Terrain,
+    /// terrain.bmp per pixel.
+    Texture,
+    /// heightmap.bmp per pixel.
+    Heightmap,
 }
 
 impl MapMode {
-    const ALL: [MapMode; 11] = [
+    const ALL: [MapMode; 14] = [
         MapMode::Auto,
         MapMode::ProvinceColours,
         MapMode::Types,
@@ -141,12 +154,15 @@ impl MapMode {
         MapMode::SizeVsTarget,
         MapMode::Issues,
         MapMode::Supply,
+        MapMode::Terrain,
+        MapMode::Texture,
+        MapMode::Heightmap,
     ];
     fn name(self) -> &'static str {
         match self {
             MapMode::Auto => "by what is edited",
             MapMode::ProvinceColours => "province colours",
-            MapMode::Types => "land / sea / impassable / removed",
+            MapMode::Types => "land / sea / lake / impassable / removed",
             MapMode::States => "states",
             MapMode::Nations => "nations",
             MapMode::AirZones => "air zones",
@@ -155,6 +171,9 @@ impl MapMode {
             MapMode::SizeVsTarget => "province size vs. terrain target",
             MapMode::Issues => "validation issues",
             MapMode::Supply => "supply (estimate)",
+            MapMode::Terrain => "terrain type (as built)",
+            MapMode::Texture => "terrain.bmp (as built)",
+            MapMode::Heightmap => "heightmap.bmp (as built)",
         }
     }
     fn effective(self, level: Level) -> MapMode {
@@ -166,6 +185,7 @@ impl MapMode {
             (MapMode::Auto, Level::SeaZones) => MapMode::SeaZones,
             (MapMode::Auto, Level::Inaccessible | Level::Rivers) => MapMode::Types,
             (MapMode::Auto, Level::Supply) => MapMode::Supply,
+            (MapMode::Auto, Level::Terrain) => MapMode::Texture,
             (m, _) => m,
         }
     }
@@ -176,6 +196,8 @@ pub enum Tool {
     #[default]
     Select,
     Paint,
+    /// Provinces and States: drag a loop around an area (see `lasso`).
+    Lasso,
     Link,
     /// Click or drag across borders to make them impassable (or passable).
     Border,
@@ -197,6 +219,7 @@ impl Tool {
             Level::Rivers => &[Tool::Select, Tool::Draw, Tool::Pan],
             Level::Supply => &[Tool::Select, Tool::Rail, Tool::Hub, Tool::Port, Tool::Pan],
             Level::Adjacencies => &[Tool::Select, Tool::Link, Tool::Border, Tool::Pan],
+            Level::Provinces | Level::States => &[Tool::Select, Tool::Paint, Tool::Lasso, Tool::Border, Tool::Pan],
             _ => &[Tool::Select, Tool::Paint, Tool::Border, Tool::Pan],
         }
     }
@@ -215,6 +238,8 @@ pub struct Settings {
     /// Brush radius in map pixels.
     pub brush: f32,
     pub constraint: Constraint,
+    /// The lasso adds to the selected province or state (else makes a new one).
+    pub lasso_onto: bool,
     pub params: GenParams,
     pub opacity: f32,
     pub labels: bool,
@@ -240,6 +265,7 @@ impl Default for Settings {
             tool: Tool::Select,
             brush: 6.0,
             constraint: Constraint::default(),
+            lasso_onto: false,
             params: GenParams::default(),
             opacity: 0.7,
             labels: true,
@@ -283,6 +309,7 @@ enum Act {
     DissolveProvinces,
     SplitParts(bool),
     SetKind(Kind),
+    MakeLake,
     NewProvince,
     FromImage,
     NewStateFromSel,
@@ -311,6 +338,8 @@ enum Act {
     SetModMeta(Box<ModMeta>),
     Check,
     FixCrossings,
+    FixStraits,
+    Bitmap(texture_ui::BitmapAct),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -356,6 +385,8 @@ struct StyleKey {
     issues: u64,
     targets: Option<(u64, density::DensityParams)>,
     supply: u64,
+    terrain: u64,
+    bitmaps: (bool, u64),
 }
 
 /// Shares of the land per terrain rule, for (map pixels version, rules).
@@ -379,6 +410,8 @@ pub struct Editor {
     link_from: Option<Id>,
     new_province: bool,
     stroke: Option<Stroke2>,
+    /// The lasso's loop being drawn.
+    lasso: Option<lasso::Loop>,
     border_stroke: Option<BorderStroke>,
     hover_border: Option<(Id, Id)>,
     border_lines: (u64, BorderLines),
@@ -401,7 +434,8 @@ pub struct Editor {
     thumb: Option<(PathBuf, Result<egui::TextureHandle, String>)>,
     /// Game folder and its version ("1.19.*").
     game_version: Option<(PathBuf, String)>,
-    /// Open "Mod details" with the map ($MOD_HELPER_OPEN=details, for screenshots).
+    /// Open "Mod details" with the map ($MOD_HELPER_OPEN=details, or =terrain
+    /// at its terrain rules, for screenshots).
     meta_at_start: bool,
     /// Open "Backups" with the map ($MOD_HELPER_OPEN=backups, for screenshots).
     backups_at_start: bool,
@@ -430,6 +464,12 @@ pub struct Editor {
     /// The Rivers and Supply levels.
     rv: rivers_ui::RiverUi,
     su: supply_ui::SupplyUi,
+    /// The build's terrain of each province with the terrain rules.
+    tt: terrain_ui::TerrainCache,
+    /// The Terrain level: brush and caches.
+    tex: texture_ui::TextureUi,
+    /// Open the terrain rules when the "Mod details" window shows next.
+    meta_terrain: bool,
 }
 
 /// The "Mod details" window: the edited copy, the stored value it started
@@ -486,6 +526,7 @@ impl Editor {
             link_from: None,
             new_province: false,
             stroke: None,
+            lasso: None,
             border_stroke: None,
             hover_border: None,
             border_lines: (0, FxHashMap::default()),
@@ -505,7 +546,7 @@ impl Editor {
             meta: None,
             thumb: None,
             game_version: None,
-            meta_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "details"),
+            meta_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "details" || v == "terrain"),
             backups_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "backups"),
             generation_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "generation"),
             launcher: launcher::Launcher::default(),
@@ -525,6 +566,9 @@ impl Editor {
             rule_shares: None,
             rv: rivers_ui::RiverUi::default(),
             su: supply_ui::SupplyUi::default(),
+            tt: Default::default(),
+            tex: Default::default(),
+            meta_terrain: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "terrain"),
         }
     }
 
@@ -550,7 +594,7 @@ impl Editor {
     /// Cursor for the map.
     pub fn cursor(&self) -> egui::CursorIcon {
         match self.settings.tool {
-            Tool::Paint | Tool::Link | Tool::Border | Tool::Draw | Tool::Rail | Tool::Hub | Tool::Port => egui::CursorIcon::Crosshair,
+            Tool::Paint | Tool::Lasso | Tool::Link | Tool::Border | Tool::Draw | Tool::Rail | Tool::Hub | Tool::Port => egui::CursorIcon::Crosshair,
             Tool::Select => egui::CursorIcon::Default,
             Tool::Pan => egui::CursorIcon::Grab,
         }
@@ -760,7 +804,7 @@ impl Editor {
     fn entity_of(doc: &Doc, level: Level, p: Id) -> Option<Id> {
         let d = &doc.data;
         let r = match level {
-            Level::Provinces | Level::Inaccessible | Level::Adjacencies => p,
+            Level::Provinces | Level::Inaccessible | Level::Adjacencies | Level::Terrain => p,
             Level::States => d.state_of(p),
             Level::Nations => d.nation_of(p),
             Level::AirZones => {
@@ -787,7 +831,7 @@ impl Editor {
         let mut out = Vec::new();
         for &id in ids {
             match level {
-                Level::Provinces | Level::Inaccessible | Level::Adjacencies => out.push(id),
+                Level::Provinces | Level::Inaccessible | Level::Adjacencies | Level::Terrain => out.push(id),
                 Level::States => out.extend_from_slice(doc.index.provs_of_state(id)),
                 Level::Nations => {
                     for &s in doc.index.states_of_nation(id) {
@@ -830,6 +874,10 @@ impl Editor {
         if level == Level::Adjacencies && self.settings.tool == Tool::Paint {
             self.settings.tool = Tool::Link;
         }
+        if self.settings.tool == Tool::Lasso && !Tool::of(level).contains(&Tool::Lasso) {
+            self.settings.tool = Tool::Select;
+        }
+        self.lasso = None;
         self.link_from = None;
         self.new_province = false;
     }
@@ -856,7 +904,7 @@ impl Editor {
         let d = &doc.data;
         let level = self.settings.level;
         self.sel.retain(|&i| match level {
-            Level::Provinces | Level::Inaccessible | Level::Adjacencies => d.provinces.contains(i),
+            Level::Provinces | Level::Inaccessible | Level::Adjacencies | Level::Terrain => d.provinces.contains(i),
             Level::States => d.states.contains(i),
             Level::Nations => d.nations.contains(i),
             Level::AirZones | Level::SeaZones => d.regions.contains(i),
@@ -983,6 +1031,7 @@ impl Editor {
                 let ids: Vec<Id> = if all { self.doc.as_ref().map(|d| d.data.provinces.ids()).unwrap_or_default() } else { provs.clone() };
                 self.run("Split separate parts", |d, _| Ok(format!("{} new provinces from separate parts", d.split_disconnected(&ids))))
             }
+            Act::MakeLake if need(&provs) => self.run("Make lake", |d, _| Ok(format!("{} provinces are now lakes", d.make_lakes(&provs)?))),
             Act::SetKind(k) if need(&provs) => self.run(&format!("Make {}", k.name()), |d, _| Ok(format!("{} provinces are now {}", d.set_kind(&provs, k)?, k.name()))),
             Act::FromImage => self.from_image.open = true,
             Act::NewProvince => {
@@ -1018,7 +1067,7 @@ impl Editor {
                     let ents: Vec<Id> = provs.iter().filter_map(|&p| Self::entity_of(doc, l, p)).filter(|e| seen.insert(*e)).collect();
                     let grown = Self::provinces_of(doc, l, &ents);
                     self.sel = match self.settings.level {
-                        Level::Provinces | Level::Inaccessible => grown,
+                        Level::Provinces | Level::Inaccessible | Level::Terrain => grown,
                         lv => {
                             let mut seen = FxHashSet::default();
                             grown.into_iter().filter_map(|p| Self::entity_of(doc, lv, p)).filter(|e| seen.insert(*e)).collect()
@@ -1146,6 +1195,26 @@ impl Editor {
             }),
             Act::Check => self.start_check(ctx),
             Act::FixCrossings => self.run("Fix crossings", |d, _| Ok(format!("{} pixels changed", d.fix_crossings(None)))),
+            Act::Bitmap(b) => self.bitmap_act(b),
+            Act::FixStraits => {
+                let broken = self.doc.as_ref().map_or(0, |d| d.data.adjacencies.iter().filter(|a| a.kind == "sea" && !d.strait_ok(a)).count());
+                if broken == 0 {
+                    self.info("all straits are right: nothing to fix");
+                } else {
+                    let mut failed = Vec::new();
+                    self.run("Fix straits", |d, _| {
+                        let (fixed, bad) = d.fix_straits();
+                        for f in &fixed {
+                            log::info!("fixed strait {f}");
+                        }
+                        failed = bad;
+                        Ok(format!("{} of {broken} broken straits fixed", fixed.len().min(broken)))
+                    });
+                    if !failed.is_empty() {
+                        self.error(format!("not fixed: {}", failed.join("; ")));
+                    }
+                }
+            }
             other => self.error(format!("{other:?}: nothing (or not enough) selected")),
         }
     }
@@ -1199,9 +1268,9 @@ impl Editor {
         match self.settings.level {
             Level::Rivers => self.rivers_keys(ctx),
             Level::Supply => self.supply_keys(ctx),
-            _ => {}
+            _ => self.lasso_keys(ctx),
         }
-        let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+        let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9, Key::Num0];
         for (i, k) in keys.into_iter().enumerate() {
             if ctx.input(|inp| inp.key_pressed(k) && inp.modifiers.is_none()) {
                 self.set_level(Level::ALL[i]);
@@ -1214,7 +1283,7 @@ impl Editor {
         let level = self.settings.level;
         // P stays the pan tool (the viewer's key); a key used here is taken
         // so the viewer does not act on it too (H hides a layer there)
-        for (k, t) in [(Key::B, Tool::Paint), (Key::I, Tool::Border), (Key::D, Tool::Draw), (Key::R, Tool::Rail), (Key::H, Tool::Hub), (Key::N, Tool::Port)] {
+        for (k, t) in [(Key::B, Tool::Paint), (Key::O, Tool::Lasso), (Key::I, Tool::Border), (Key::D, Tool::Draw), (Key::R, Tool::Rail), (Key::H, Tool::Hub), (Key::N, Tool::Port)] {
             if Tool::of(level).contains(&t) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k)) {
                 self.settings.tool = t;
             }
@@ -1229,7 +1298,7 @@ impl Editor {
         if pressed(Key::CloseBracket) {
             self.settings.brush = (self.settings.brush * 1.25).min(400.0);
         }
-        if pressed(Key::Escape) {
+        if pressed(Key::Escape) && self.lasso.take().is_none() {
             self.sel.clear();
             self.sel_adj = None;
             self.link_from = None;
@@ -1242,7 +1311,7 @@ impl Editor {
                 Level::Nations => Some(Act::DissolveNations),
                 Level::AirZones | Level::SeaZones => Some(Act::DissolveRegions),
                 Level::Adjacencies => self.sel_adj.map(Act::DeleteAdjacency),
-                Level::Inaccessible | Level::Rivers | Level::Supply => None,
+                Level::Inaccessible | Level::Rivers | Level::Supply | Level::Terrain => None,
             };
             if let Some(a) = act {
                 self.apply(a, ctx);
@@ -1262,6 +1331,12 @@ impl Editor {
         if mode == MapMode::Supply {
             self.supply_estimate();
         }
+        let terrain = if mode == MapMode::Terrain { self.province_terrains().map_or(0, |r| r.rev) } else { 0 };
+        let bitmaps = match mode {
+            MapMode::Texture => (self.auto_texture().is_some(), self.doc.as_ref().map_or(0, |d| d.bitmap_version)),
+            MapMode::Heightmap => (self.heights_now().is_some(), self.doc.as_ref().map_or(0, |d| d.bitmap_version)),
+            _ => (false, 0),
+        };
         let Some(doc) = &self.doc else { return };
         let mut h: u64 = 1469598103934665603;
         for &i in &self.sel {
@@ -1278,6 +1353,8 @@ impl Editor {
             issues: self.issues_gen,
             targets: if mode == MapMode::SizeVsTarget { self.targets.as_ref().map(|t| t.0.clone()) } else { None },
             supply: if mode == MapMode::Supply { self.su.est_gen } else { 0 },
+            terrain,
+            bitmaps,
         };
         if self.style_key.as_ref() == Some(&key) {
             return;
@@ -1333,6 +1410,7 @@ impl Editor {
                 MapMode::ProvinceColours | MapMode::Auto => pr.rgb,
                 MapMode::Types => match pr.kind {
                     Kind::Sea => [50, 95, 160],
+                    Kind::Lake if pr.water => LAKE,
                     Kind::Lake => [150, 120, 190],
                     Kind::Land if pr.edge => [95, 88, 82],
                     Kind::Land if imp => [140, 110, 80],
@@ -1382,6 +1460,22 @@ impl Editor {
                         None => [90, 90, 90],
                     },
                 },
+                MapMode::Texture => {
+                    if pr.is_water() {
+                        [8, 31, 130]
+                    } else {
+                        [90, 90, 90]
+                    }
+                }
+                MapMode::Heightmap => [90, 90, 90],
+                MapMode::Terrain => match pr.kind {
+                    Kind::Sea => SEA,
+                    Kind::Lake => LAKE,
+                    Kind::Land => match &self.tt.result {
+                        Some((_, r)) => terrain_ui::terrain_colour(r.terrain.get(i).map_or("", |t| t.as_str())),
+                        None => [90, 90, 90],
+                    },
+                },
             };
             fill[i] = [c[0], c[1], c[2], 255];
             let (a, b) = match pr.kind {
@@ -1416,7 +1510,12 @@ impl Editor {
                 }
             }
         }
-        RenderStyle { fill, group_a: ga, group_b: gb, selected, borders: self.settings.borders }
+        let pixels = match mode {
+            MapMode::Texture => self.pixel_fill(doc, false),
+            MapMode::Heightmap => self.pixel_fill(doc, true),
+            _ => None,
+        };
+        RenderStyle { fill, group_a: ga, group_b: gb, selected, borders: self.settings.borders, pixels }
     }
 
     fn map_labels(&mut self) {
@@ -1447,7 +1546,7 @@ impl Editor {
                     }
                 }
             }
-            Level::Provinces | Level::Rivers | Level::Supply => {}
+            Level::Provinces | Level::Rivers | Level::Supply | Level::Terrain => {}
         }
         let labels = groups
             .into_iter()
@@ -1526,6 +1625,7 @@ impl Editor {
                 }
             }
         }
+        self.draw_lasso(dc, &pl);
         if let (Some(f), Some(h)) = (self.link_from, self.hover) {
             if let Some(doc) = &self.doc {
                 let c = doc.stats.get(f).centre();
@@ -1548,6 +1648,9 @@ impl Editor {
 
     fn handle_input(&mut self, dc: &DrawCtx, response: &egui::Response, pl: &Placement, px_scale: f64) -> bool {
         let tool = self.settings.tool;
+        if tool != Tool::Lasso {
+            self.lasso = None;
+        }
         if tool == Tool::Pan {
             return false;
         }
@@ -1614,13 +1717,26 @@ impl Editor {
             return true;
         }
 
-        // Alt+click: pick the entity under the cursor
+        // Alt+click: pick the terrain (Terrain level) or entity under the cursor
+        if mods.alt && response.clicked_by(PointerButton::Primary) && level == Level::Terrain {
+            if let Some(px) = pos {
+                self.pick_texture(px);
+            }
+            return true;
+        }
         if mods.alt && response.clicked_by(PointerButton::Primary) {
             if let (Some(px), Some(doc)) = (pos, &self.doc) {
                 if let Some(e) = self.province_at(px).and_then(|p| Self::entity_of(doc, level, p)) {
                     self.sel = vec![e];
                 }
             }
+            return true;
+        }
+
+        // Lasso: freehand while held, corners by clicks
+        if tool == Tool::Lasso && matches!(level, Level::Provinces | Level::States) {
+            let origin = dc.ctx.input(|i| i.pointer.press_origin()).and_then(to_px).or(pos);
+            self.lasso_input(dc.ctx, response, pos, origin, px_scale);
             return true;
         }
 
@@ -1770,6 +1886,10 @@ impl Editor {
             self.new_province = false;
             return true;
         }
+        if level == Level::Terrain {
+            doc.begin("Paint terrain.bmp");
+            return true;
+        }
         let Some(&target) = self.sel.first() else {
             self.error(format!("select (or Alt+click) the {} to paint with", level.noun()));
             return false;
@@ -1791,9 +1911,17 @@ impl Editor {
     fn paint_to(&mut self, p: [f64; 2], brush: f64) {
         let level = self.settings.level;
         let c = self.settings.constraint;
+        let tex = self.tex.brush;
         let Some(st) = &mut self.stroke else { return };
         let a = st.last;
         st.last = p;
+        if level == Level::Terrain {
+            if let Some(doc) = self.doc.as_mut() {
+                texture_ui::paint_stroke(doc, a, p, brush, tex);
+            }
+            self.last_edit = Instant::now();
+            return;
+        }
         let Some(&target) = self.sel.first() else { return };
         let Some(doc) = self.doc.as_mut() else { return };
         match level {
@@ -2024,6 +2152,11 @@ impl Editor {
             match self.settings.level {
                 Level::Rivers => self.rivers_panel(ui),
                 Level::Supply => self.supply_panel(ui),
+                Level::Terrain => {
+                    self.selection_ui(ui, &mut acts);
+                    self.texture_panel(ui, &mut acts);
+                    self.properties_ui(ui, &mut acts);
+                }
                 _ => {
                     self.selection_ui(ui, &mut acts);
                     self.actions_ui(ui, &mut acts);
@@ -2096,7 +2229,7 @@ impl Editor {
         ui.horizontal_wrapped(|ui| {
             ui.label("Edit:");
             for (i, l) in Level::ALL.into_iter().enumerate() {
-                if ui.selectable_label(self.settings.level == l, l.name()).on_hover_text(format!("key {}", i + 1)).clicked() {
+                if ui.selectable_label(self.settings.level == l, l.name()).on_hover_text(format!("key {}", (i + 1) % 10)).clicked() {
                     acts.push(Act::SetLevel(l));
                 }
             }
@@ -2111,7 +2244,10 @@ impl Editor {
                     (Tool::Select, _) => ("⬚ Select", "S · click: select, Shift: add/remove, Ctrl: remove, drag: select with the brush, Alt+click: pick"),
                     (Tool::Paint, Level::Provinces) => ("🖌 Paint", "B · paint the selected province over others (redraw borders)"),
                     (Tool::Paint, Level::Inaccessible) => ("🖌 Paint", "B · brush-select provinces to make inaccessible"),
+                    (Tool::Paint, Level::Terrain) => ("🖌 Paint", "B · paint terrain.bmp with the brush's terrain; Alt+click picks the terrain under the cursor"),
                     (Tool::Paint, _) => ("🖌 Paint", "B · paint: what the brush touches joins the selected entity"),
+                    (Tool::Lasso, Level::States) => ("➰ Lasso", "O · drag a loop around provinces: those more than half inside become a new state (or join the selected one)"),
+                    (Tool::Lasso, _) => ("➰ Lasso", "O · drag a loop around an area: it becomes a new province (or goes to the selected one)"),
                     (Tool::Link, _) => ("🔗 Link", "L · click two provinces to add an adjacency"),
                     (Tool::Border, _) => (
                         "⛔ Border",
@@ -2130,17 +2266,20 @@ impl Editor {
             ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut self.settings.brush, 0.5..=400.0).logarithmic(true).text("brush px ([ ])"));
             });
-            if self.settings.tool == Tool::Paint && self.settings.level == Level::Provinces {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("only over:");
-                    ui.checkbox(&mut self.settings.constraint.same_kind, "same type").on_hover_text("land paints only land, sea only sea (keeps the coastline)");
-                    ui.checkbox(&mut self.settings.constraint.same_state, "same state");
-                    ui.checkbox(&mut self.settings.constraint.same_nation, "same nation");
-                });
-                if self.new_province {
-                    ui.colored_label(WARN, "next stroke paints a NEW province");
-                }
+            if self.settings.tool == Tool::Paint && self.new_province && self.settings.level == Level::Provinces {
+                ui.colored_label(WARN, "next stroke paints a NEW province");
             }
+        }
+        if self.settings.tool == Tool::Lasso && Tool::of(self.settings.level).contains(&Tool::Lasso) {
+            self.lasso_panel(ui);
+        }
+        if matches!(self.settings.tool, Tool::Paint | Tool::Lasso) && self.settings.level == Level::Provinces {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("only over:");
+                ui.checkbox(&mut self.settings.constraint.same_kind, "same type").on_hover_text("land takes only land, sea only sea (keeps the coastline)");
+                ui.checkbox(&mut self.settings.constraint.same_state, "same state");
+                ui.checkbox(&mut self.settings.constraint.same_nation, "same nation");
+            });
         }
         ui.horizontal(|ui| {
             ui.label("Colour:");
@@ -2169,6 +2308,19 @@ impl Editor {
             if self.doc.as_ref().is_some_and(|d| d.terrain.is_none()) {
                 ui.colored_label(WARN, "needs the terrain (still loading?)");
             }
+        }
+        if self.settings.mode.effective(self.settings.level) == MapMode::Terrain && self.terrain_legend_ui(ui) {
+            self.open_meta();
+            self.meta_terrain = true;
+        }
+    }
+
+    /// Opens the "Mod details" window.
+    fn open_meta(&mut self) {
+        if self.meta.is_none()
+            && let Some(d) = &self.doc
+        {
+            self.meta = Some(MetaEdit::new(d.data.mod_meta()));
         }
     }
 
@@ -2381,12 +2533,14 @@ impl Editor {
         let version = self.game_version(&dirs.game);
         let picture = e.m.picture_path(&map_dir);
         let thumb = picture.as_ref().filter(|p| p.is_file()).map(|p| self.thumbnail(ctx, p));
+        let terrain = self.terrain_result(&e.m.terrain);
+        let show_terrain = std::mem::take(&mut self.meta_terrain);
         let mut open = true;
         let mut act: Option<Act> = None;
         let mut close = false;
         let (mut game_dir, mut mods_dir) = (self.settings.game_dir.clone(), self.settings.mods_dir.clone());
         let mut browse_picture = false;
-        egui::Window::new("Mod details").open(&mut open).default_width(560.0).default_height(640.0).show(ctx, |ui| {
+        egui::Window::new("Mod details").open(&mut open).default_width(620.0).default_height(640.0).show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ctx.content_rect().height() * 0.75).show(ui, |ui| {
                 let m = &mut e.m;
                 fn wide<'t>(t: &'t mut String, hint: &str) -> egui::TextEdit<'t> {
@@ -2493,6 +2647,14 @@ impl Editor {
                     ui.end_row();
                 });
                 ui.add_space(6.0);
+                let r = egui::CollapsingHeader::new(RichText::new("Terrain types").heading())
+                    .id_salt("meta_terrain")
+                    .open(show_terrain.then_some(true))
+                    .show(ui, |ui| terrain_ui::terrain_rules_ui(ui, &mut m.terrain, terrain.as_deref()));
+                if show_terrain {
+                    r.header_response.scroll_to_me(Some(egui::Align::Min));
+                }
+                ui.add_space(6.0);
                 ui.heading("Folders on this computer");
                 ui.label(RichText::new("kept with the editor settings, not in the map").small().weak());
                 egui::Grid::new("meta_dirs").num_columns(2).min_col_width(118.0).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -2588,7 +2750,7 @@ impl Editor {
         }
         let d = &doc.data;
         let name = |id: Id| match level {
-            Level::Provinces | Level::Inaccessible | Level::Adjacencies | Level::Rivers | Level::Supply => d.prov_name(id),
+            Level::Provinces | Level::Inaccessible | Level::Adjacencies | Level::Rivers | Level::Supply | Level::Terrain => d.prov_name(id),
             Level::States => d.state_name(id),
             Level::Nations => d.nation_name(id),
             Level::AirZones | Level::SeaZones => d.region_name(id),
@@ -2650,6 +2812,13 @@ impl Editor {
                     ui.horizontal_wrapped(|ui| {
                         btn(ui, has, "Make land", "turn into land (joins a neighbouring state)", Act::SetKind(Kind::Land));
                         btn(ui, has, "Make sea", "turn into sea (joins a neighbouring sea zone)", Act::SetKind(Kind::Sea));
+                        btn(
+                            ui,
+                            has,
+                            "Make lake",
+                            "turn into a lake of water: an HOI4 lake province (no owner, no state, no units) under the water plane like the sea; it keeps its air zone. Paint it over land to give it its shape.",
+                            Act::MakeLake,
+                        );
                         btn(ui, has, "Split separate parts", "give each separate piece of a province its own province", Act::SplitParts(false));
                     });
                     ui.horizontal_wrapped(|ui| {
@@ -2716,7 +2885,7 @@ impl Editor {
                     );
                 }
                 Level::Adjacencies => self.adjacency_list_ui(ui, acts),
-                Level::Rivers | Level::Supply => {}
+                Level::Rivers | Level::Supply | Level::Terrain => {}
                 Level::Inaccessible => {
                     ui.label(RichText::new(
                         "Select provinces (click, or drag the brush). Then:\n\
@@ -2732,7 +2901,7 @@ impl Editor {
                     });
                     if let Some(doc) = &self.doc {
                         let imp = doc.data.states.iter().filter(|(_, s)| s.impassable).count();
-                        let lakes = doc.data.provinces.iter().filter(|(_, p)| p.kind == Kind::Lake).count();
+                        let lakes = doc.data.provinces.iter().filter(|(_, p)| p.kind == Kind::Lake && !p.water).count();
                         ui.label(format!("{imp} impassable states, {lakes} removed provinces"));
                     }
                 }
@@ -2753,6 +2922,17 @@ impl Editor {
         });
         ui.label(RichText::new("Link tool (L): click the two provinces. A strait needs one sea province touching both.").small().weak());
         let Some(doc) = &self.doc else { return };
+        let broken = doc.data.adjacencies.iter().filter(|a| a.kind == "sea" && !doc.strait_ok(a)).count();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(broken > 0, egui::Button::new(format!("Fix straits ({broken})")))
+                .on_hover_text(STRAIT_FIX_TIP)
+                .on_disabled_hover_text("every strait has land on both shores of its sea province")
+                .clicked()
+            {
+                acts.push(Act::FixStraits);
+            }
+        });
         egui::ScrollArea::vertical().id_salt("adjlist").max_height(220.0).show(ui, |ui| {
             egui::Grid::new("adjgrid").striped(true).num_columns(3).show(ui, |ui| {
                 for (i, a) in doc.data.adjacencies.iter().enumerate() {
@@ -2779,7 +2959,7 @@ impl Editor {
         let current = match level {
             Level::Adjacencies => self.sel_adj.and_then(|i| d.adjacencies.get(i).map(|a| Draft::Adjacency(i, a.clone()))),
             _ => self.sel.first().and_then(|&id| match level {
-                Level::Provinces | Level::Inaccessible => d.provinces.get(id).map(|p| Draft::Province(id, p.clone())),
+                Level::Provinces | Level::Inaccessible | Level::Terrain => d.provinces.get(id).map(|p| Draft::Province(id, p.clone())),
                 Level::States => d.states.get(id).map(|s| Draft::State(id, s.clone())),
                 Level::Nations => d.nations.get(id).map(|n| Draft::Nation(id, n.clone())),
                 Level::AirZones | Level::SeaZones => d.regions.get(id).map(|r| Draft::Region(id, r.clone())),
@@ -3041,7 +3221,7 @@ impl Editor {
                 ui.monospace(format!("{} , {}", h[0] as u32, h[1] as u32));
                 ui.end_row();
                 ui.label("province");
-                ui.label(format!("{} ({p}) · {} · {:.2} km²", d.prov_name(p), pr.map(|x| x.kind.name()).unwrap_or("?"), s.px as f64 * d.km2_per_px()));
+                ui.label(format!("{} ({p}) · {} · {:.2} km²", d.prov_name(p), pr.map(|x| x.kind_name()).unwrap_or("?"), s.px as f64 * d.km2_per_px()));
                 ui.end_row();
                 let st = d.state_of(p);
                 if st != 0 {
@@ -3062,8 +3242,18 @@ impl Editor {
                         ui.end_row();
                     }
                 }
-                if self.settings.level == Level::Supply || self.settings.mode.effective(self.settings.level) == MapMode::Supply {
+                let mode = self.settings.mode.effective(self.settings.level);
+                if self.settings.level == Level::Supply || mode == MapMode::Supply {
                     self.supply_hover_rows(ui, p);
+                }
+                if mode == MapMode::Terrain {
+                    self.terrain_hover_rows(ui, p);
+                }
+                if self.settings.level == Level::Terrain || mode == MapMode::Texture {
+                    self.texture_hover_rows(ui, h, false);
+                }
+                if mode == MapMode::Heightmap {
+                    self.texture_hover_rows(ui, h, true);
                 }
             });
         });
@@ -3086,6 +3276,9 @@ impl Editor {
                 ui.checkbox(&mut self.settings.auto_check, "after each edit");
                 if ui.button("Fix crossings").on_hover_text("remove points where four provinces meet / diagonal contacts").clicked() {
                     acts.push(Act::FixCrossings);
+                }
+                if ui.button("Fix straits").on_hover_text(STRAIT_FIX_TIP).clicked() {
+                    acts.push(Act::FixStraits);
                 }
                 if ui.button("Split separate parts").on_hover_text("every separate piece of any province becomes its own province").clicked() {
                     acts.push(Act::SplitParts(true));
@@ -3234,7 +3427,7 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
 // ---------------------------------------------------------------- properties
 
 /// An optional limit of a terrain rule: a button "any" until one is set.
-fn limit(ui: &mut egui::Ui, v: &mut Option<f32>, default: f32, range: std::ops::RangeInclusive<f32>, speed: f64, suffix: &str) {
+fn limit<N: egui::emath::Numeric>(ui: &mut egui::Ui, v: &mut Option<N>, default: N, range: std::ops::RangeInclusive<N>, speed: f64, suffix: &str) {
     match v {
         None => {
             if ui.small_button("any").on_hover_text("no limit; click to set one").clicked() {
@@ -3255,7 +3448,8 @@ fn pct(f: f32) -> String {
     if f > 0.0 && f < 0.01 { "< 1 %".into() } else { format!("{:.0} %", f * 100.0) }
 }
 
-const LAND_TERRAIN: [&str; 8] = ["plains", "forest", "hills", "mountain", "marsh", "urban", "jungle", "desert"];
+const STRAIT_FIX_TIP: &str = "Straits whose land or sea no longer touches across the water (after re-cutting): each end goes to the land touching the sea nearest its crossing point, the sea to the one in the middle of the crossing. Edits that move pixels do this on their own for the straits they touch.";
+use crate::modbuild::terrain::LAND_TERRAIN;
 const CATEGORIES: [&str; 13] = [
     "wasteland",
     "enclave",
@@ -3301,7 +3495,7 @@ fn province_props(ui: &mut egui::Ui, id: Id, p: &mut Province, doc: &Doc, acts: 
         });
         ui.end_row();
         ui.label("type");
-        ui.label(format!("{}{}", p.kind.name(), if p.edge { " · map edge" } else { "" }));
+        ui.label(format!("{}{}", p.kind_name(), if p.edge { " · map edge" } else { "" }));
         ui.end_row();
         ui.label("size");
         ui.label(format!("{:.2} km² · {} px · box {} × {}", s.px as f64 * d.km2_per_px(), s.px, s.box_w(), s.box_h()));

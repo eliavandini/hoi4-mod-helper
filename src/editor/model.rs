@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::geo::FileGeoInfo;
+use crate::modbuild::bitmaps;
 use crate::raster::{self, Pixels};
 use crate::util::Progress;
 
@@ -30,8 +31,9 @@ pub enum Kind {
     #[default]
     Land,
     Sea,
-    /// Out of play (HOI4 "lake" province: no state, no units), see the
-    /// inaccessible-zone tools.
+    /// HOI4 "lake" province (no state, no units): a lake of water
+    /// ([`Province::water`]) or land taken out of play (the inaccessible-zone
+    /// tools).
     Lake,
 }
 
@@ -64,6 +66,10 @@ pub struct Province {
     /// HOI4 terrain to use instead of the one the mod build derives.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terrain: Option<String>,
+    /// A lake of water (`kind` lake): under the water plane like the sea.
+    /// Other lakes are land taken out of play, which keeps its land look.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub water: bool,
     #[serde(default)]
     pub km2: f64,
     #[serde(default)]
@@ -292,7 +298,22 @@ pub struct MapData {
     pub pixel_m: f64,
 }
 
+impl Province {
+    /// Sea, or a lake of water.
+    pub fn is_water(&self) -> bool {
+        self.kind == Kind::Sea || (self.kind == Kind::Lake && self.water)
+    }
+    /// "land", "sea", "lake" or "removed (lake)".
+    pub fn kind_name(&self) -> &'static str {
+        if self.kind == Kind::Lake && self.water { "lake" } else { self.kind.name() }
+    }
+}
+
 impl MapData {
+    /// Sea or a lake of water (under the water plane).
+    pub fn is_water(&self, p: Id) -> bool {
+        self.provinces.get(p).is_some_and(Province::is_water)
+    }
     pub fn km2_per_px(&self) -> f64 {
         self.pixel_m * self.pixel_m / 1e6
     }
@@ -554,6 +575,46 @@ pub struct Loaded {
     pub data: MapData,
     pub labels: Labels,
     pub geo: FileGeoInfo,
+    pub extra: Bitmaps,
+}
+
+/// What the map keeps besides its provinces, as bitmaps of its size:
+/// painted terrain.bmp ([`bitmaps::AUTO`] where the build decides) and an
+/// imported heightmap.
+#[derive(Clone, Default)]
+pub struct Bitmaps {
+    pub paint: Option<Vec<u8>>,
+    pub heights: Option<Vec<u8>>,
+}
+
+/// The bitmaps of the map in `dir`, if it has them.
+fn load_bitmaps(dir: &Path, w: u32, h: u32) -> Result<Bitmaps> {
+    let size = |f: &str, (bw, bh): (u32, u32)| -> Result<()> {
+        if (bw, bh) != (w, h) {
+            bail!("{f} is {bw}×{bh} px, provinces.bmp {w}×{h}");
+        }
+        Ok(())
+    };
+    let paint = match dir.join(bitmaps::PAINT_FILE) {
+        f if f.is_file() => {
+            let b = crate::modbuild::img::read_bmp(&f)?;
+            if b.bpp != 8 {
+                bail!("{} is not an 8-bit bitmap", bitmaps::PAINT_FILE);
+            }
+            size(bitmaps::PAINT_FILE, (b.w, b.h))?;
+            Some(b.data)
+        }
+        _ => None,
+    };
+    let heights = match dir.join(bitmaps::HEIGHTS_FILE) {
+        f if f.is_file() => {
+            let (bw, bh, v) = bitmaps::read_grey(&f)?;
+            size(bitmaps::HEIGHTS_FILE, (bw, bh))?;
+            Some(v)
+        }
+        _ => None,
+    };
+    Ok(Bitmaps { paint, heights })
 }
 
 fn rgb_code(c: [u8; 3]) -> u32 {
@@ -630,7 +691,8 @@ pub fn load(dir: &Path, progress: &Progress) -> Result<Loaded> {
             i / r.width as usize
         );
     }
-    Ok(Loaded { data, labels: Labels { w: r.width, h: r.height, px }, geo })
+    let extra = load_bitmaps(dir, r.width, r.height)?;
+    Ok(Loaded { data, labels: Labels { w: r.width, h: r.height, px }, geo, extra })
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +812,11 @@ fn backup(dir: &Path) -> Result<Option<PathBuf>> {
     for f in files {
         std::fs::copy(dir.join(f), dest.join(f)).with_context(|| format!("cannot back up {f}"))?;
     }
+    for f in [bitmaps::PAINT_FILE, bitmaps::HEIGHTS_FILE] {
+        if dir.join(f).is_file() {
+            std::fs::copy(dir.join(f), dest.join(f)).with_context(|| format!("cannot back up {f}"))?;
+        }
+    }
     std::fs::write(dest.join(".made_by_mod_helper"), "backup made by the mod-helper map editor before saving\n")?;
     let mut ours: Vec<PathBuf> = std::fs::read_dir(&root)?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -802,9 +869,23 @@ fn write_bmp24(path: &Path, w: u32, h: u32, row: impl Fn(u32, &mut Vec<u8>) + Sy
     Ok(())
 }
 
-/// Write provinces.bmp and provinces.json (ids renumbered to 1..n).
-pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats) -> Result<SaveReport> {
+/// Write provinces.bmp and provinces.json (ids renumbered to 1..n), and the
+/// painted terrain and imported heightmap (removed when there are none).
+pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &[u8], heights: Option<&[u8]>) -> Result<SaveReport> {
     let backup = backup(dir)?;
+    let (pf, hf) = (dir.join(bitmaps::PAINT_FILE), dir.join(bitmaps::HEIGHTS_FILE));
+    if paint.par_iter().any(|&v| v != bitmaps::AUTO) {
+        let mut pal = bitmaps::vanilla_palette();
+        pal.push([0, 0, 0]); // AUTO
+        crate::modbuild::img::write_bmp8(&pf, labels.w, labels.h, paint, &pal)?;
+    } else if pf.exists() {
+        std::fs::remove_file(&pf).with_context(|| format!("cannot remove {}", pf.display()))?;
+    }
+    match heights {
+        Some(v) => crate::modbuild::img::write_bmp_gray(&hf, labels.w, labels.h, v)?,
+        None if hf.exists() => std::fs::remove_file(&hf).with_context(|| format!("cannot remove {}", hf.display()))?,
+        None => {}
+    }
     let (pmap, g1) = compaction(&data.provinces);
     let (smap, g2) = compaction(&data.states);
     let (nmap, g3) = compaction(&data.nations);

@@ -25,18 +25,11 @@ pub struct Terrain {
     pub urban: Vec<u8>,
     /// Sealed (built-up) pixel.
     pub sealed: Vec<bool>,
-    /// What the mod build's terrain rule looks at, per pixel: [`FOREST`],
-    /// [`STEEP`], [`GENTLE`] and [`HIGH`] bits.
-    pub class: Vec<u8>,
+    /// What the mod build's terrain rules look at, per pixel: the land
+    /// cover class and the slope (degrees, not smoothed, as the build has it).
+    pub cover: Vec<u8>,
+    pub slope_px: Vec<f32>,
 }
-
-pub const FOREST: u8 = 1;
-/// Slope 25° or more (not smoothed).
-pub const STEEP: u8 = 2;
-/// Slope under 10°.
-pub const GENTLE: u8 = 4;
-/// 2200 m or more.
-pub const HIGH: u8 = 8;
 
 /// A province size for the land within a height and slope range. A missing
 /// limit means none.
@@ -153,6 +146,8 @@ pub fn load_terrain(dir: &Path, w: u32, h: u32, pixel_m: f64, progress: &Progres
         _ => bail!("landcover_smooth.bmp is not an 8-bit class map"),
     };
     progress.set_stage("slopes");
+    // the build's slope uses the map's pixel size as it is (f64)
+    let build_px_m = pixel_m;
     let pixel_m = pixel_m as f32;
     let (wu, hu) = (w as usize, h as usize);
     let dem_c: Vec<f32> = dem.iter().map(|&v| if v < -1000.0 { 0.0 } else { v }).collect();
@@ -170,18 +165,12 @@ pub fn load_terrain(dir: &Path, w: u32, h: u32, pixel_m: f64, progress: &Progres
             })
         })
         .collect();
-    let class: Vec<u8> = (0..wu * hu)
-        .into_par_iter()
-        .map(|i| {
-            let s = slope_deg[i];
-            (matches!(lc[i], 2..=4) as u8 * FOREST) | ((s >= 25.0) as u8 * STEEP) | ((s < 10.0) as u8 * GENTLE) | ((dem[i] >= 2200.0) as u8 * HIGH)
-        })
-        .collect();
+    let slope_px = crate::modbuild::slope_degrees(&dem, wu, hu, build_px_m);
     let slope = box_mean(&slope_deg, wu, hu, 4).into_iter().map(|v| v.round().clamp(0.0, 255.0) as u8).collect();
     let sealed: Vec<bool> = lc.iter().map(|&c| c == SEALED).collect();
     let sealed_f: Vec<f32> = sealed.iter().map(|&s| s as u8 as f32).collect();
     let urban = box_mean(&sealed_f, wu, hu, 7).into_iter().map(|v| (v * 255.0).round().clamp(0.0, 255.0) as u8).collect();
-    Ok(Terrain { w, h, dem, slope, urban, sealed, class })
+    Ok(Terrain { w, h, dem, slope, urban, sealed, cover: lc, slope_px })
 }
 
 /// Mean over a (2r+1)² window (shrunk at the borders).

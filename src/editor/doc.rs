@@ -14,6 +14,15 @@ use parking_lot::RwLock;
 use super::density::{self, DensityParams, Terrain};
 use super::model::{self, Id, Index, Kind, Labels, Loaded, MapData, PStat, SaveReport, Stats};
 use crate::geo::FileGeoInfo;
+use crate::modbuild::bitmaps;
+
+fn opt_ptr_eq<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
 
 const MAX_UNDO: usize = 80;
 
@@ -21,6 +30,9 @@ struct Txn {
     label: String,
     before: MapData,
     pixels: Vec<(u32, Id, Id)>,
+    /// Painted terrain.bmp: (pixel, old, new).
+    tex: Vec<(u32, u8, u8)>,
+    heights: Option<Arc<Vec<u8>>>,
     /// The whole map was replaced: its impassable borders are its own.
     whole: bool,
 }
@@ -32,6 +44,9 @@ struct Step {
     data: MapData,
     /// (pixel, old, new)
     pixels: Vec<(u32, Id, Id)>,
+    tex: Vec<(u32, u8, u8)>,
+    /// The imported heightmap on the other side of the step.
+    heights: Option<Arc<Vec<u8>>>,
 }
 
 pub struct Doc {
@@ -44,6 +59,12 @@ pub struct Doc {
     pub w: u32,
     pub h: u32,
     pub terrain: Option<Arc<Terrain>>,
+    /// terrain.bmp as painted ([`bitmaps::AUTO`]: as the build makes it).
+    pub paint: Arc<RwLock<Vec<u8>>>,
+    /// A heightmap used instead of the build's.
+    pub heights: Option<Arc<Vec<u8>>>,
+    /// Bumped when the painted terrain or the imported heightmap change.
+    pub bitmap_version: u64,
     density_cache: Option<(DensityParams, Arc<Vec<f32>>)>,
     /// Unsaved changes.
     pub dirty: bool,
@@ -81,6 +102,7 @@ impl Doc {
     pub fn new(dir: PathBuf, l: Loaded) -> Doc {
         let (w, h) = (l.labels.w, l.labels.h);
         let stats = model::compute_stats(&l.labels, l.data.provinces.cap());
+        let paint = l.extra.paint.unwrap_or_else(|| vec![bitmaps::AUTO; (w * h) as usize]);
         let index = Index::build(&l.data);
         let mut d = Doc {
             dir,
@@ -92,6 +114,9 @@ impl Doc {
             w,
             h,
             terrain: None,
+            paint: Arc::new(RwLock::new(paint)),
+            heights: l.extra.heights.map(Arc::new),
+            bitmap_version: 1,
             density_cache: None,
             dirty: false,
             meta_version: 1,
@@ -116,7 +141,7 @@ impl Doc {
         if self.txn.is_some() {
             self.commit();
         }
-        self.txn = Some(Txn { label: label.into(), before: self.data.clone(), pixels: Vec::new(), whole: false });
+        self.txn = Some(Txn { label: label.into(), before: self.data.clone(), pixels: Vec::new(), tex: Vec::new(), heights: self.heights.clone(), whole: false });
     }
 
     /// Finish the edit: refresh derived data, push an undo step.
@@ -124,11 +149,19 @@ impl Doc {
         let txn = self.txn.take()?;
         let px = !txn.pixels.is_empty();
         let touched_before = if px { std::mem::take(&mut self.stats.border) } else { Default::default() };
-        self.refresh(px);
+        if px {
+            self.restat_pixels();
+            // straits follow their re-cut provinces, before the clean-up
+            // would drop those whose end province is gone
+            if !txn.whole {
+                self.carry_straits(&txn.pixels);
+            }
+        }
+        self.refresh(false);
         if px && !txn.whole && self.carry_walls(&txn.before, &touched_before, &txn.pixels) {
             self.refresh(false);
         }
-        self.undo.push(Step { label: txn.label.clone(), data: txn.before, pixels: txn.pixels });
+        self.undo.push(Step { label: txn.label.clone(), data: txn.before, pixels: txn.pixels, tex: txn.tex, heights: txn.heights });
         if self.undo.len() > MAX_UNDO {
             self.undo.remove(0);
         }
@@ -148,6 +181,7 @@ impl Doc {
                 lab.px[i as usize] = old;
             }
         }
+        self.restore_bitmaps(&txn.tex, true, txn.heights);
         self.data = txn.before;
         self.refresh(px);
     }
@@ -171,6 +205,7 @@ impl Doc {
                 lab.px[i as usize] = old;
             }
         }
+        step.heights = self.restore_bitmaps(&step.tex, true, step.heights.take());
         std::mem::swap(&mut self.data, &mut step.data);
         self.refresh(!step.pixels.is_empty());
         let label = step.label.clone();
@@ -191,6 +226,7 @@ impl Doc {
                 lab.px[i as usize] = new;
             }
         }
+        step.heights = self.restore_bitmaps(&step.tex, false, step.heights.take());
         std::mem::swap(&mut self.data, &mut step.data);
         self.refresh(!step.pixels.is_empty());
         let label = step.label.clone();
@@ -248,6 +284,48 @@ impl Doc {
         changed
     }
 
+    /// Put the painted terrain back (`back`: as before the logged changes,
+    /// else as after them) and set the imported heightmap; returns the one it
+    /// replaced.
+    fn restore_bitmaps(&mut self, tex: &[(u32, u8, u8)], back: bool, heights: Option<Arc<Vec<u8>>>) -> Option<Arc<Vec<u8>>> {
+        if !tex.is_empty() {
+            let mut p = self.paint.write();
+            if back {
+                for &(i, old, _) in tex.iter().rev() {
+                    p[i as usize] = old;
+                }
+            } else {
+                for &(i, _, new) in tex {
+                    p[i as usize] = new;
+                }
+            }
+        }
+        let changed = !tex.is_empty() || !opt_ptr_eq(&heights, &self.heights);
+        if changed {
+            self.bitmap_version += 1;
+        }
+        std::mem::replace(&mut self.heights, heights)
+    }
+
+    /// Run `f` with write access to the painted terrain (inside a
+    /// transaction): `f` gets the pixels and a log to push (pixel, old, new)
+    /// to for every change it makes.
+    pub fn with_paint<R>(&mut self, f: impl FnOnce(&mut [u8], &mut Vec<(u32, u8, u8)>) -> R) -> R {
+        let paint = self.paint.clone();
+        let mut p = paint.write();
+        let txn = self.txn.as_mut().expect("terrain edit outside a transaction");
+        let r = f(&mut p, &mut txn.tex);
+        self.bitmap_version += 1;
+        r
+    }
+
+    /// Use `h` as the heightmap (None: the build's), inside a transaction.
+    pub fn set_heights(&mut self, h: Option<Arc<Vec<u8>>>) {
+        assert!(self.txn.is_some(), "heightmap edit outside a transaction");
+        self.heights = h;
+        self.bitmap_version += 1;
+    }
+
     /// Run `f` with write access to the pixels (inside a transaction).
     pub fn with_pixels<R>(&mut self, f: impl FnOnce(&mut PixelWriter, &MapData) -> R) -> R {
         let labels = self.labels.clone();
@@ -278,6 +356,17 @@ impl Doc {
         if let Some(t) = self.txn.as_mut() {
             t.whole = true;
         }
+        // its painted terrain and heightmap too
+        let paint = l.extra.paint.unwrap_or_else(|| vec![bitmaps::AUTO; (self.w * self.h) as usize]);
+        self.with_paint(|p, log| {
+            for (i, (cur, &new)) in p.iter_mut().zip(&paint).enumerate() {
+                if *cur != new {
+                    log.push((i as u32, *cur, new));
+                    *cur = new;
+                }
+            }
+        });
+        self.set_heights(l.extra.heights.map(Arc::new));
         Ok(n)
     }
 
@@ -292,11 +381,16 @@ impl Doc {
         }
     }
 
+    /// Statistics of the pixels after they changed.
+    fn restat_pixels(&mut self) {
+        self.stats = model::compute_stats(&self.labels.read(), self.data.provinces.cap());
+        self.pixel_version += 1;
+    }
+
     /// Statistics, clean-up and member lists after a change.
     pub fn refresh(&mut self, pixels_changed: bool) {
         if pixels_changed {
-            self.stats = model::compute_stats(&self.labels.read(), self.data.provinces.cap());
-            self.pixel_version += 1;
+            self.restat_pixels();
         }
         let cap = self.data.provinces.cap();
         if self.stats.prov.len() < cap {
@@ -386,7 +480,7 @@ impl Doc {
         if self.txn.is_some() {
             self.commit();
         }
-        let r = model::save(&self.dir, &self.data, &self.labels.read(), &self.stats)?;
+        let r = model::save(&self.dir, &self.data, &self.labels.read(), &self.stats, &self.paint.read(), self.heights.as_deref().map(|v| v.as_slice()))?;
         self.dirty = false;
         Ok(r)
     }

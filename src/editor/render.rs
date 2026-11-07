@@ -7,6 +7,7 @@ use eframe::egui::{Color32, ColorImage};
 use parking_lot::RwLock;
 
 use super::model::Labels;
+use crate::modbuild::bitmaps::AUTO;
 use crate::tiles::{self, TileJob, TileSource};
 
 pub struct RenderStyle {
@@ -18,11 +19,25 @@ pub struct RenderStyle {
     pub group_b: Vec<u32>,
     pub selected: Vec<bool>,
     pub borders: bool,
+    /// A colour per map pixel instead of the fill, in some provinces.
+    pub pixels: Option<PixelFill>,
+}
+
+/// Colours per map pixel (terrain.bmp, the heightmap).
+pub struct PixelFill {
+    /// A value per map pixel, shown as `colours[value]`.
+    pub base: Arc<Vec<u8>>,
+    /// Values shown instead where they are not [`AUTO`] (painted terrain).
+    pub over: Option<Arc<RwLock<Vec<u8>>>>,
+    /// 256 colours.
+    pub colours: Vec<[u8; 3]>,
+    /// Provinces that show the pixels (the others their fill).
+    pub on: Vec<bool>,
 }
 
 impl RenderStyle {
     pub fn empty() -> Self {
-        RenderStyle { fill: Vec::new(), group_a: Vec::new(), group_b: Vec::new(), selected: Vec::new(), borders: true }
+        RenderStyle { fill: Vec::new(), group_a: Vec::new(), group_b: Vec::new(), selected: Vec::new(), borders: true, pixels: None }
     }
 }
 
@@ -69,6 +84,20 @@ pub fn render(lab: &Labels, st: &RenderStyle, level: u8, r: [u32; 4]) -> ColorIm
     let gb = |p: u32| st.group_b.get(p as usize).copied().unwrap_or(0);
     let sel = |p: u32| st.selected.get(p as usize).copied().unwrap_or(false);
     let province_borders = level <= 1;
+    let over = st.pixels.as_ref().and_then(|p| p.over.as_ref()).map(|o| o.read());
+    let pixel = |a: u32, x: u32, y: u32| -> Option<[u8; 4]> {
+        let pf = st.pixels.as_ref()?;
+        if !pf.on.get(a as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        let k = y as usize * w as usize + x as usize;
+        let v = match &over {
+            Some(o) if o.get(k).is_some_and(|&v| v != AUTO) => o[k],
+            _ => *pf.base.get(k)?,
+        };
+        let c = pf.colours.get(v as usize).copied().unwrap_or([0, 0, 0]);
+        Some([c[0], c[1], c[2], 255])
+    };
     let mut out = vec![Color32::TRANSPARENT; tw * th];
     let mut up = row_of(ys[0]);
     let mut cur = row_of(ys[1]);
@@ -76,7 +105,7 @@ pub fn render(lab: &Labels, st: &RenderStyle, level: u8, r: [u32; 4]) -> ColorIm
         let down = row_of(ys[j + 2]);
         for i in 0..tw {
             let a = cur[i + 1];
-            let mut c = fill(a);
+            let mut c = pixel(a, xs[i + 1], ys[j + 1]).unwrap_or_else(|| fill(a));
             let sa = sel(a);
             if sa {
                 c = [((c[0] as u32 + 255) / 2) as u8, ((c[1] as u32 + 230) / 2) as u8, ((c[2] as u32 + 120) / 2) as u8, c[3].max(170)];

@@ -73,7 +73,7 @@ pub enum Retile {
 
 const NONE: u32 = u32::MAX;
 
-fn seg_dist2(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+pub(super) fn seg_dist2(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     let l2 = dx * dx + dy * dy;
     let t = if l2 > 0.0 { (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0.0, 1.0) } else { 0.0 };
@@ -319,7 +319,7 @@ impl Doc {
     /// A new province without pixels (paint it, or fill it in an operation).
     pub fn new_province(&mut self, kind: Kind, state: Id, region: Id, name: String, like: Option<Id>) -> Id {
         let rgb = self.data.fresh_colour(self.data.provinces.cap() as u64 * 31 + self.pixel_version);
-        let (edge, terrain) = like.and_then(|l| self.data.provinces.get(l)).map(|p| (p.edge, p.terrain.clone())).unwrap_or((false, None));
+        let (edge, terrain, water) = like.and_then(|l| self.data.provinces.get(l)).map(|p| (p.edge, p.terrain.clone(), p.water)).unwrap_or((false, None, false));
         let id = self.data.provinces.push(|id| Province {
             id,
             rgb,
@@ -328,6 +328,7 @@ impl Doc {
             coastal: false,
             name,
             terrain,
+            water: water && kind == Kind::Lake,
             km2: 0.0,
             nation: None,
             extra: Default::default(),
@@ -987,6 +988,7 @@ impl Doc {
                     };
                     let pr = self.data.provinces.get_mut(p).unwrap();
                     pr.kind = Kind::Sea;
+                    pr.water = false;
                     pr.state = 0;
                     pr.region = region;
                 }
@@ -1008,6 +1010,7 @@ impl Doc {
                     let (state, region) = (self.data.state_of(q), self.data.region_of(q));
                     let pr = self.data.provinces.get_mut(p).unwrap();
                     pr.kind = Kind::Land;
+                    pr.water = false;
                     pr.state = state;
                     pr.region = region;
                 }
@@ -1015,6 +1018,21 @@ impl Doc {
             n += 1;
         }
         Ok(n)
+    }
+
+    /// Make provinces lakes of water: HOI4 "lake" provinces (no state, no
+    /// units) under the water plane. Land and removed provinces keep their air
+    /// zone; sea ones join a neighbouring one. Returns how many changed.
+    pub fn make_lakes(&mut self, ids: &[Id]) -> Result<usize> {
+        let todo: Vec<Id> = ids.iter().copied().filter(|&p| self.data.provinces.get(p).is_some_and(|x| !(x.kind == Kind::Lake && x.water))).collect();
+        if todo.is_empty() {
+            bail!("select land, sea or removed provinces (the selected are lakes already)");
+        }
+        self.set_kind(&todo, Kind::Lake)?;
+        for &p in &todo {
+            self.data.provinces.get_mut(p).unwrap().water = true;
+        }
+        Ok(todo.len())
     }
 
     // ================================================================ graphs
@@ -1822,7 +1840,8 @@ impl Doc {
     /// Take land provinces out of play: HOI4 "lake" provinces with no state,
     /// no owner and no units (they keep their land look and their air zone).
     pub fn remove_from_play(&mut self, provs: &[Id], coarsen: bool, g: &GenParams) -> Result<usize> {
-        let land: Vec<Id> = provs.iter().copied().filter(|&p| self.data.kind(p) != Kind::Sea).collect();
+        // (lakes of water stay water)
+        let land: Vec<Id> = provs.iter().copied().filter(|&p| self.data.provinces.contains(p) && !self.data.is_water(p)).collect();
         if land.is_empty() {
             bail!("select land provinces");
         }
@@ -1846,7 +1865,8 @@ impl Doc {
     /// states become passable.
     pub fn restore_access(&mut self, provs: &[Id]) -> Result<usize> {
         let mut n = 0;
-        let lakes: Vec<Id> = provs.iter().copied().filter(|&p| self.data.kind(p) == Kind::Lake).collect();
+        // removed land (lakes of water stay; "Make land" turns them into land)
+        let lakes: Vec<Id> = provs.iter().copied().filter(|&p| self.data.kind(p) == Kind::Lake && !self.data.is_water(p)).collect();
         if !lakes.is_empty() {
             n += self.set_kind(&lakes, Kind::Land)?;
         }
@@ -2147,6 +2167,7 @@ mod tests {
                 coastal: false,
                 name: format!("p{id}"),
                 terrain: None,
+                water: false,
                 km2: 0.0,
                 nation: None,
                 extra: Default::default(),
@@ -2155,7 +2176,7 @@ mod tests {
             });
         }
         let geo = crate::geo::FileGeoInfo { transform: None, crs: None, nodata: None };
-        Doc::new(std::path::PathBuf::new(), Loaded { data, labels: Labels { w, h, px }, geo })
+        Doc::new(std::path::PathBuf::new(), Loaded { data, labels: Labels { w, h, px }, geo, extra: Default::default() })
     }
 
     /// 2×2 blocks with four provinces or a diagonal-only contact.
@@ -2198,6 +2219,77 @@ mod tests {
         for (i, &p) in px.iter().enumerate() {
             assert_eq!(p == 1 || p == 4, lab.px[i] == 1 || lab.px[i] == 4, "pixel {i}");
         }
+    }
+
+    #[test]
+    fn lakes_of_water() {
+        // land 1 | land 2 | sea 3, the land in one state and air zone
+        let px = vec![1, 1, 2, 2, 3, 3, 1, 1, 2, 2, 3, 3];
+        let mut doc = tiny_doc(6, 2, px, &[Kind::Land, Kind::Land, Kind::Sea]);
+        let blank = serde_json::Map::new;
+        let st = doc.data.states.push(|id| State {
+            id,
+            name: "A".into(),
+            nation: None,
+            impassable: false,
+            provinces: Vec::new(),
+            manpower: None,
+            category: None,
+            buildings: Default::default(),
+            resources: Default::default(),
+            victory_points: Vec::new(),
+            extra: blank(),
+        });
+        let mut zone = |name: &str, naval| doc.data.regions.push(|id| Region { id, name: name.into(), naval, provinces: Vec::new(), states: Vec::new(), extra: blank() });
+        let (air, sea) = (zone("air", false), zone("sea", true));
+        for (p, state, region) in [(1, st, air), (2, st, air), (3, 0, sea)] {
+            let pr = doc.data.provinces.get_mut(p).unwrap();
+            (pr.state, pr.region) = (state, region);
+        }
+        doc.index = Index::build(&doc.data);
+        let g = GenParams::default();
+        let step = |doc: &mut Doc, f: &dyn Fn(&mut Doc) -> Result<usize>| {
+            doc.begin("step");
+            let r = f(doc);
+            if r.is_ok() {
+                doc.commit();
+            } else {
+                doc.rollback();
+            }
+            r
+        };
+
+        // land: out of its state, into no other, keeping its air zone
+        assert_eq!(step(&mut doc, &|d| d.make_lakes(&[2])).unwrap(), 1);
+        let p2 = doc.data.provinces.get(2).unwrap().clone();
+        assert!(p2.kind == Kind::Lake && p2.water && p2.state == 0 && p2.region == air);
+        assert!(doc.data.is_water(2) && !doc.data.is_water(1));
+        assert_eq!(p2.kind_name(), "lake");
+        // no change for lakes already, nor from the inaccessible-zone tools
+        assert!(step(&mut doc, &|d| d.make_lakes(&[2])).is_err());
+        assert!(step(&mut doc, &|d| d.remove_from_play(&[2], false, &g)).is_err());
+        assert_eq!(step(&mut doc, &|d| d.restore_access(&[2])).unwrap(), 0);
+        assert!(doc.data.is_water(2));
+        // sea: into the land's air zone
+        assert_eq!(step(&mut doc, &|d| d.make_lakes(&[3])).unwrap(), 1);
+        let p3 = doc.data.provinces.get(3).unwrap();
+        assert!(p3.water && p3.region == air);
+        // stored only when set
+        let json = |p: Id| serde_json::to_string(doc.data.provinces.get(p).unwrap()).unwrap();
+        assert!(json(2).contains("\"water\":true") && !json(1).contains("water"));
+        let back: Province = serde_json::from_str(&json(2)).unwrap();
+        assert!(back.water);
+        // undone, and back to land (into the neighbour's state)
+        doc.undo();
+        assert!(doc.data.kind(3) == Kind::Sea && !doc.data.provinces.get(3).unwrap().water);
+        assert_eq!(step(&mut doc, &|d| d.set_kind(&[2], Kind::Land)).unwrap(), 1);
+        let p2 = doc.data.provinces.get(2).unwrap();
+        assert!(p2.kind == Kind::Land && !p2.water && p2.state == st);
+        // removed land made a lake of water, and a removed one stays removed
+        step(&mut doc, &|d| d.remove_from_play(&[1, 2], false, &g)).unwrap();
+        assert_eq!(step(&mut doc, &|d| d.make_lakes(&[1])).unwrap(), 1);
+        assert!(doc.data.is_water(1) && !doc.data.is_water(2) && doc.data.kind(2) == Kind::Lake);
+        assert_eq!(doc.data.provinces.get(1).unwrap().region, air);
     }
 
     #[test]

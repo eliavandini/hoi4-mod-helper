@@ -159,12 +159,22 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
     }
     let is = |p: u32, t: &str| typ.get(p as usize).is_some_and(|x| *x == t);
     let hm = img::read_bmp(&m.join("heightmap.bmp"))?;
-    let water_ok = hm.data.len() == pmap.len() && pmap.iter().zip(&hm.data).all(|(&p, &v)| if is(p, "sea") { v < 95 } else { v > 95 });
+    // lakes may lie under the water plane (vanilla's do) or above it (land taken out of play)
+    let water_ok = hm.data.len() == pmap.len() && pmap.iter().zip(&hm.data).all(|(&p, &v)| if is(p, "sea") { v < 95 } else { is(p, "lake") || v > 95 });
     c.check(water_ok, || "heightmap water does not match sea provinces".into());
+    // lakes under the water plane (most of their pixels) are lakes of water
+    let mut under = vec![(0u64, 0u64); n + 1];
+    for (&p, &v) in pmap.iter().zip(&hm.data) {
+        if is(p, "lake") {
+            let u = &mut under[p as usize];
+            *u = (u.0 + (v < 95) as u64, u.1 + 1);
+        }
+    }
+    let water_lakes = under.iter().filter(|&&(a, t)| t > 0 && 2 * a > t).count();
     log(&format!(
-        "definition.csv: {n} provinces, {} sea, {} lakes (out of play), terrain {terr:?}",
+        "definition.csv: {n} provinces, {} sea, {water_lakes} lakes of water, {} lakes out of play, terrain {terr:?}",
         typ.iter().filter(|t| **t == "sea").count(),
-        typ.iter().filter(|t| **t == "lake").count()
+        typ.iter().filter(|t| **t == "lake").count() - water_lakes
     ));
     let mut nb: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); n + 1];
     for y in 0..h {

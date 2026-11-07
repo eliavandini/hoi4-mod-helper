@@ -125,7 +125,7 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
             push(Severity::Error, format!("{name} ({p}) is in no strategic region"), Some(p));
         } else if let Some(r) = d.regions.get(pr.region) {
             if r.naval != (pr.kind == Kind::Sea) {
-                push(Severity::Error, format!("{name} ({p}) is {} but in the {} zone {}", pr.kind.name(), if r.naval { "sea" } else { "air (land)" }, r.name), Some(p));
+                push(Severity::Error, format!("{name} ({p}) is {} but in the {} zone {}", pr.kind_name(), if r.naval { "sea" } else { "air (land)" }, r.name), Some(p));
             }
         }
     }

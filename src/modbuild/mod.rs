@@ -19,10 +19,12 @@
 //! next to the old one and swapped in at the end; a folder of that name is
 //! only replaced if mod-helper (or make_map_mod.py) made it.
 
+pub mod bitmaps;
 pub mod countries;
 pub mod img;
 pub mod meta;
 pub mod rail;
+pub mod terrain;
 pub mod validate;
 pub mod vanilla;
 
@@ -46,28 +48,7 @@ use vanilla::WATER;
 pub const MARKER: &str = ".made_by_mod_helper";
 const OLD_MARKER: &str = ".made_by_make_map_mod";
 
-// land cover classes (CLC+ Backbone, as in landcover_smooth.bmp)
-const SEALED: u8 = 1;
-const NEEDLE: u8 = 2;
-const BROAD: u8 = 3;
-const BROAD_EVERGREEN: u8 = 4;
-const LOW_WOODY: u8 = 5;
-const GRASS: u8 = 6;
-const CROP: u8 = 7;
-const MOSS: u8 = 8;
-const ROCK: u8 = 9;
-const SNOW: u8 = 11;
-// vanilla terrain.bmp palette indices (common/terrain/00_terrain.txt)
-const T_PLAINS: u8 = 0;
-const T_FOREST: u8 = 1;
-const T_FOREST_B: u8 = 4;
-const T_FARM: u8 = 5;
-const T_MOUNTAIN: u8 = 6;
-const T_URBAN: u8 = 13;
-const T_OCEAN: u8 = 15;
-const T_SNOW: u8 = 16;
-const T_HILLS: u8 = 17;
-const T_ALPINE: u8 = 20;
+use bitmaps::{SEALED, T_FOREST, T_FOREST_B, T_OCEAN};
 
 /// Name lists (first names, surnames) are copied from these vanilla tags.
 fn names_from(language: &str) -> &'static str {
@@ -207,21 +188,11 @@ fn scaled(size: (u32, u32), vanilla_map: (u32, u32), map: (usize, usize)) -> (us
 }
 
 /// The first item with the largest key (Python's max()).
-/// HOI4 terrain of a land province from the shares (0..1) of its pixels that
-/// are built-up, steep (25° or more), high (2200 m or more), gentle (under
-/// 10°) and forest.
-pub fn land_terrain(sealed: f64, steep: f64, high: f64, gentle: f64, forest: f64) -> &'static str {
-    if sealed >= 0.2 {
-        "urban"
-    } else if steep + 0.5 * high >= 0.55 {
-        "mountain"
-    } else if gentle >= 0.35 {
-        "plains"
-    } else if forest >= 0.55 {
-        "forest"
-    } else {
-        "hills"
-    }
+/// Slope (degrees) of every pixel of a height map with `px_m` metres per
+/// pixel, as the build's terrain rules see it (numpy-style gradient).
+pub fn slope_degrees(dem: &[f32], w: usize, h: usize, px_m: f64) -> Vec<f32> {
+    let (gx, gy) = gradient(dem, w, h, px_m);
+    gx.par_iter().zip(&gy).map(|(a, b)| a.hypot(*b).atan().to_degrees()).collect()
 }
 
 /// Infrastructure of a state when none is set: 3 with 1.5 km² or more
@@ -302,16 +273,12 @@ fn ambient_objects(game: &Path, frame: bool, water: &[(f64, f64)]) -> Result<Str
 struct PStats {
     size: u64,
     sealed: u64,
-    forest: u64,
-    steep: u64,
-    high: u64,
-    gentle: u64,
     bbox: [usize; 4],
 }
 
 impl Default for PStats {
     fn default() -> Self {
-        PStats { size: 0, sealed: 0, forest: 0, steep: 0, high: 0, gentle: 0, bbox: [usize::MAX, usize::MAX, 0, 0] }
+        PStats { size: 0, sealed: 0, bbox: [usize::MAX, usize::MAX, 0, 0] }
     }
 }
 
@@ -412,7 +379,7 @@ pub fn build(map_dir: &Path, dirs: &Dirs, log: &dyn Fn(&str)) -> Result<PathBuf>
     let t0 = std::time::Instant::now();
     log("reading the map");
     let progress = Progress::default();
-    let model::Loaded { data: d, labels, .. } = model::load(map_dir, &progress)?;
+    let model::Loaded { data: d, labels, extra, .. } = model::load(map_dir, &progress)?;
     let meta = d.mod_meta();
     meta.check()?;
     let n = d.provinces.count();
@@ -441,7 +408,7 @@ pub fn build(map_dir: &Path, dirs: &Dirs, log: &dyn Fn(&str)) -> Result<PathBuf>
     if out.exists() {
         std::fs::remove_dir_all(&out).with_context(|| format!("cannot remove {}", out.display()))?;
     }
-    let result = build_into(&out, map_dir, dirs, &meta, &d, &labels, log);
+    let result = build_into(&out, map_dir, dirs, &meta, &d, &labels, &extra, log);
     let report = match result {
         Ok(r) => r,
         Err(e) => {
@@ -472,6 +439,7 @@ fn build_into(
     meta: &ModMeta,
     d: &model::MapData,
     labels: &model::Labels,
+    extra: &model::Bitmaps,
     log: &dyn Fn(&str),
 ) -> Result<Vec<String>> {
     let (pmap, w, h): (&[Id], usize, usize) = (&labels.px, labels.w as usize, labels.h as usize);
@@ -518,68 +486,47 @@ fn build_into(
     let is_lake = by_id(&|p| kind(p) == Kind::Lake);
     let is_land = by_id(&|p| kind(p) == Kind::Land);
     let is_edge = by_id(&|p| provs[p as usize - 1].edge);
-    let sea_px: Vec<bool> = pmap.par_iter().map(|&p| is_sea[p as usize]).collect();
+    // what is under the water plane: the sea and lakes of water
+    let is_water = by_id(&|p| provs[p as usize - 1].is_water());
+    let water_mask: Vec<bool> = pmap.par_iter().map(|&p| is_water[p as usize]).collect();
 
-    let (lo, hi) = dem
-        .par_iter()
-        .zip(&sea_px)
-        .filter(|(_, s)| !**s)
-        .map(|(&d, _)| (d, d))
-        .reduce(|| (f32::INFINITY, f32::NEG_INFINITY), |a, b| (a.0.min(b.0), a.1.max(b.1)));
-    let (lo32, span) = (lo, ((hi as f64 - lo as f64) as f32).max(1e-6));
-    // sea starts 4 below the water plane at the shore, so 3-7 px channels stay
-    // under water in the terrain mesh, and deepens to 10 below
-    let depth2 = img::edt_sq(&sea_px, w, h);
-    let height: Vec<u8> = (0..w * h)
-        .into_par_iter()
-        .map(|i| {
-            if sea_px[i] {
-                let depth = (depth2[i] as f64).sqrt();
-                (WATER as f64 - 4.0 - ((depth - 1.0) / 2.0).min(6.0)).round_ties_even() as u8
-            } else {
-                ((dem[i] - lo32) / span * (254 - WATER) as f32 + (WATER + 1) as f32).round_ties_even().clamp((WATER + 1) as f32, 255.0) as u8
+    // the heights: the build's, or the one imported in the editor made to fit the sea
+    let (built, lo, hi) = bitmaps::heightmap(&dem, &water_mask, w, h);
+    let mut warnings: Vec<String> = Vec::new();
+    // (the heightmap, and the build's own when another is used)
+    let (height, built): (Vec<u8>, Option<Vec<u8>>) = match &extra.heights {
+        None => (built, None),
+        Some(imp) => {
+            let (v, land, water) = bitmaps::fit_to_sea(imp, &built, &water_mask);
+            if land + water > 0 {
+                warnings.push(format!("imported heightmap: {land} land px raised above the water plane, {water} px of sea or lakes lowered under it"));
             }
-        })
-        .collect();
-    drop(depth2);
+            (v, Some(built))
+        }
+    };
     img::write_bmp_gray(&mapdir.join("heightmap.bmp"), w as u32, h as u32, &height)?;
 
-    let sea_f: Vec<f32> = sea_px.par_iter().map(|&s| s as u8 as f32).collect();
+    let sea_f: Vec<f32> = water_mask.par_iter().map(|&s| s as u8 as f32).collect();
     // downsampled sea: water if any sea falls in the pixel, so thin channels survive
     let any_sea = |sw: usize, sh: usize| -> Vec<bool> { img::resize_f32(&sea_f, w, h, sw, sh, Filter::Box).into_iter().map(|v| v > 0.0).collect() };
 
-    let (gx, gy) = gradient(&dem, w, h, px_m);
-    let slope: Vec<f32> = gx.par_iter().zip(&gy).map(|(a, b)| a.hypot(*b).atan().to_degrees()).collect();
-    drop((gx, gy));
-    let gentle = |i: usize| slope[i] < 10.0;
-    let steep = |i: usize| slope[i] >= 25.0;
-    let terr: Vec<u8> = (0..w * h)
-        .into_par_iter()
-        .map(|i| {
-            if sea_px[i] {
-                return T_OCEAN;
-            }
-            match lc[i] {
-                SEALED => T_URBAN,
-                SNOW => T_SNOW,
-                ROCK | MOSS => T_MOUNTAIN,
-                BROAD | BROAD_EVERGREEN => T_FOREST_B,
-                NEEDLE => T_FOREST,
-                LOW_WOODY if steep(i) => T_ALPINE,
-                LOW_WOODY => T_HILLS,
-                CROP if !gentle(i) => T_HILLS,
-                CROP => T_FARM,
-                GRASS if steep(i) => T_ALPINE,
-                GRASS if !gentle(i) => T_HILLS,
-                _ => T_PLAINS,
-            }
-        })
-        .collect();
+    let slope = slope_degrees(&dem, w, h, px_m);
+    let terr = bitmaps::final_texture(&lc, &slope, &water_mask, extra.paint.as_deref());
     img::write_bmp8(&mapdir.join("terrain.bmp"), w as u32, h as u32, &terr, &v.terrain.palette)?;
 
     let (nw, nh) = scaled(v.normal_size, v.map_size, (w, h));
     {
-        let small = img::resize_f32(&dem, w, h, nw, nh, Filter::Bilinear);
+        // the shading follows the heights: what an imported heightmap changed
+        // goes on top of the measured ones
+        let relief_m: std::borrow::Cow<[f32]> = match built {
+            None => (&dem[..]).into(),
+            Some(built) => {
+                let step = bitmaps::metres_per_step(lo, hi);
+                dem.par_iter().zip(&height).zip(&built).map(|((&d, &a), &b)| d + (a as f32 - b as f32) * step).collect::<Vec<f32>>().into()
+            }
+        };
+        let small = img::resize_f32(&relief_m, w, h, nw, nh, Filter::Bilinear);
+        drop(relief_m);
         let (sx, sy) = gradient(&small, nw, nh, px_m * w as f64 / nw as f64);
         let relief = meta.relief as f32;
         let rgb: Vec<u8> = (0..nw * nh)
@@ -604,12 +551,12 @@ fn build_into(
         }
     };
     let river_px = rivers::rasterize(&d.rivers, w, h, ground);
-    let mut warnings: Vec<String> = river_px.problems.iter().map(|p| format!("rivers: {} (at {}, {})", p.msg, p.at[0], p.at[1])).collect();
-    img::write_bmp8(&mapdir.join("rivers.bmp"), w as u32, h as u32, &river_px.image(w, h, |i| sea_px[i]), &v.rivers.palette)?;
-    let is_forest = |c: u8| matches!(c, NEEDLE | BROAD | BROAD_EVERGREEN);
+    warnings.extend(river_px.problems.iter().map(|p| format!("rivers: {} (at {}, {})", p.msg, p.at[0], p.at[1])));
+    img::write_bmp8(&mapdir.join("rivers.bmp"), w as u32, h as u32, &river_px.image(w, h, |i| water_mask[i]), &v.rivers.palette)?;
+    // trees where terrain.bmp has forest (the land cover's forest, or painted)
     let (tw, th) = scaled(v.trees.size, v.map_size, (w, h));
     {
-        let forest: Vec<f32> = lc.par_iter().map(|&c| is_forest(c) as u8 as f32).collect();
+        let forest: Vec<f32> = terr.par_iter().map(|&t| matches!(t, T_FOREST | T_FOREST_B) as u8 as f32).collect();
         let share = img::resize_f32(&forest, w, h, tw, th, Filter::Box);
         let sea_t = any_sea(tw, th);
         let trees: Vec<u8> = share.iter().zip(&sea_t).map(|(&s, &sea)| if s > 0.4 && !sea { v.tree_index } else { v.trees.bg }).collect();
@@ -666,10 +613,6 @@ fn build_into(
                     let s = &mut acc[p as usize];
                     s.size += 1;
                     s.sealed += (lc[i] == SEALED) as u64;
-                    s.forest += is_forest(lc[i]) as u64;
-                    s.steep += steep(i) as u64;
-                    s.high += (dem[i] >= 2200.0) as u64;
-                    s.gentle += gentle(i) as u64;
                     s.bbox = [s.bbox[0].min(x), s.bbox[1].min(y), s.bbox[2].max(x), s.bbox[3].max(y)];
                 }
                 acc
@@ -681,18 +624,17 @@ fn build_into(
                 for (x, y) in a.iter_mut().zip(&b) {
                     x.size += y.size;
                     x.sealed += y.sealed;
-                    x.forest += y.forest;
-                    x.steep += y.steep;
-                    x.high += y.high;
-                    x.gentle += y.gentle;
                     x.bbox = [x.bbox[0].min(y.bbox[0]), x.bbox[1].min(y.bbox[1]), x.bbox[2].max(y.bbox[2]), x.bbox[3].max(y.bbox[3])];
                 }
                 a
             },
         );
+    // the kinds of land of the terrain rules, per province
+    let kinds = meta.terrain.kinds();
+    let nk = kinds.len();
+    let land_counts = terrain::TerrainTypes::count(&kinds, pmap, &lc, &dem, &slope, n + 1);
     drop(slope);
     let size = |p: Id| stats[p as usize].size;
-    let share = |p: Id, c: u64| c as f64 / stats[p as usize].size.max(1) as f64;
     let gameplay_terrain = |i: Id| -> String {
         let s = &stats[i as usize];
         let pr = provs[i as usize - 1];
@@ -705,7 +647,8 @@ fn build_into(
         } else if is_edge[i as usize] {
             "mountain".into()
         } else {
-            land_terrain(share(i, s.sealed), share(i, s.steep), share(i, s.high), share(i, s.gentle), share(i, s.forest)).into()
+            let c = if nk == 0 { &[][..] } else { &land_counts[i as usize * nk..(i as usize + 1) * nk] };
+            meta.terrain.terrain_of(c, s.size).into()
         }
     };
     let terrain_of: Vec<String> = std::iter::once(String::new()).chain((1..=n as Id).map(gameplay_terrain)).collect();
@@ -1384,10 +1327,11 @@ set_popularities = {{
         v.iter().map(|(k, c)| format!("{k} {c}")).collect::<Vec<_>>().join(", ")
     };
     let cat_counts: BTreeMap<&str, usize> = categories.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    let water_px: Vec<u8> = height.iter().zip(&sea_px).filter(|(_, s)| **s).map(|(h, _)| *h).collect();
+    let water_px: Vec<u8> = height.iter().zip(&water_mask).filter(|(_, s)| **s).map(|(h, _)| *h).collect();
+    let water_lakes = provs.iter().filter(|p| p.kind == Kind::Lake && p.water).count();
     let mut report = vec![
         format!(
-            "\"{}\" {}, {w} x {h}, {n} provinces, {} states, {} strategic regions, {} building positions, {} adjacencies ({} straits), {} provinces out of play",
+            "\"{}\" {}, {w} x {h}, {n} provinces, {} states, {} strategic regions, {} building positions, {} adjacencies ({} straits), {} lakes, {} provinces out of play",
             meta.name,
             meta.version,
             states.len(),
@@ -1395,7 +1339,8 @@ set_popularities = {{
             blines.len(),
             adjs.len(),
             adjs.iter().filter(|a| a.kind == "sea").count(),
-            is_lake.iter().filter(|&&l| l).count()
+            water_lakes,
+            is_lake.iter().filter(|&&l| l).count() - water_lakes
         ),
         format!("gameplay terrain: {}", sorted_desc(&tcount)),
         format!("{} countries; factories {} civilian, {} military", by_rank.len(), factories[0], factories[1]),
@@ -1417,7 +1362,8 @@ set_popularities = {{
             shown.iter().map(|x| format!("{} {}", tag_of[&x.id], short_name(&x.name))).collect::<Vec<_>>().join(", ")
         ),
         format!(
-            "heightmap: land {}..255 for {lo:.0}..{hi:.0} m, sea {}..{}",
+            "heightmap{}: land {}..255 for {lo:.0}..{hi:.0} m, sea and lakes {}..{}",
+            if extra.heights.is_some() { " (imported)" } else { "" },
             WATER + 1,
             water_px.iter().min().copied().unwrap_or(0),
             water_px.iter().max().copied().unwrap_or(0)
@@ -1426,6 +1372,10 @@ set_popularities = {{
         format!("map frame {}", if d.map_frame() { "on" } else { "off" }),
         tutorial_note,
     ];
+    if let Some(p) = &extra.paint {
+        let n = p.par_iter().zip(&water_mask).filter(|(v, s)| **v != bitmaps::AUTO && !**s).count();
+        report.push(format!("terrain.bmp: {n} px as painted in the editor"));
+    }
     report.extend(warnings);
     report.extend(notes);
     Ok(report)

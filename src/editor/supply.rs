@@ -21,6 +21,7 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use super::model::{Id, Kind, Labels, MapData, PStat, Port, Railway, Stats};
+use crate::modbuild::terrain::{LandKind, TerrainTypes};
 use super::rivers::Raster;
 use crate::modbuild::rail;
 
@@ -549,61 +550,37 @@ pub fn ground(d: &MapData, labels: &Labels) -> impl Fn(usize) -> super::rivers::
     }
 }
 
-/// HOI4 terrain of each province as the build sets it (by id).
-pub fn province_terrain(d: &MapData, labels: &Labels, t: &super::density::Terrain) -> Vec<String> {
-    use super::density::{FOREST, GENTLE, HIGH, STEEP};
+/// Pixels of each kind of land of terrain rules per province (see
+/// [`TerrainTypes::count`]), as the build counts them.
+pub fn land_counts(labels: &Labels, t: &super::density::Terrain, kinds: &[LandKind], cap: usize) -> Vec<u64> {
+    TerrainTypes::count(kinds, &labels.px, &t.cover, &t.dem, &t.slope_px, cap)
+}
+
+/// HOI4 terrain of each province as the build sets it (by id), and the rule
+/// that set it (None: set on the province, sea, lake, map edge, or no rule
+/// fits). `counts`: [`land_counts`] with the kinds of `types`.
+pub fn province_terrain(d: &MapData, stats: &Stats, types: &TerrainTypes, counts: &[u64]) -> (Vec<String>, Vec<Option<usize>>) {
     let cap = d.provinces.cap();
-    let w = labels.w as usize;
-    // pixels, sealed, forest, steep, high, gentle
-    let counts: Vec<[u32; 6]> = labels
-        .px
-        .par_chunks(w)
-        .enumerate()
-        .fold(
-            || vec![[0u32; 6]; cap],
-            |mut acc, (y, row)| {
-                for (x, &p) in row.iter().enumerate() {
-                    let i = y * w + x;
-                    if let Some(c) = acc.get_mut(p as usize) {
-                        let k = t.class[i];
-                        c[0] += 1;
-                        c[1] += t.sealed[i] as u32;
-                        c[2] += (k & FOREST != 0) as u32;
-                        c[3] += (k & STEEP != 0) as u32;
-                        c[4] += (k & HIGH != 0) as u32;
-                        c[5] += (k & GENTLE != 0) as u32;
-                    }
+    let k = types.kinds().len();
+    let mut terrain = vec![String::new(); cap];
+    let mut rule = vec![None; cap];
+    for (p, pr) in d.provinces.iter() {
+        let i = p as usize;
+        terrain[i] = match pr.kind {
+            Kind::Sea => "ocean".into(),
+            Kind::Lake => "lakes".into(),
+            Kind::Land => match pr.terrain.as_ref().filter(|t| !t.is_empty()) {
+                Some(t) => t.clone(),
+                None if pr.edge => "mountain".into(),
+                None => {
+                    let c = counts.get(i * k..(i + 1) * k).unwrap_or(&[]);
+                    rule[i] = types.rule_of(c, stats.get(p).px as u64);
+                    rule[i].map_or(types.other.as_str(), |r| types.rules[r].terrain.as_str()).to_string()
                 }
-                acc
             },
-        )
-        .reduce(
-            || vec![[0u32; 6]; cap],
-            |mut a, b| {
-                for (x, y) in a.iter_mut().zip(&b) {
-                    for k in 0..6 {
-                        x[k] += y[k];
-                    }
-                }
-                a
-            },
-        );
-    (0..cap as Id)
-        .map(|p| {
-            let Some(pr) = d.provinces.get(p) else { return String::new() };
-            let c = counts[p as usize];
-            let sh = |k: usize| c[k] as f64 / c[0].max(1) as f64;
-            match pr.kind {
-                Kind::Sea => "ocean".into(),
-                Kind::Lake => "lakes".into(),
-                Kind::Land => match pr.terrain.as_ref().filter(|t| !t.is_empty()) {
-                    Some(t) => t.clone(),
-                    None if pr.edge => "mountain".into(),
-                    None => crate::modbuild::land_terrain(sh(1), sh(3), sh(4), sh(5), sh(2)).into(),
-                },
-            }
-        })
-        .collect()
+        };
+    }
+    (terrain, rule)
 }
 
 /// What the editor shows about rivers and supply.

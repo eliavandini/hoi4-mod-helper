@@ -60,6 +60,8 @@ pub struct ModMeta {
     pub relief: f64,
     /// Seed of the random choices (colours, flags, building positions).
     pub seed: u64,
+    /// Terrain types of land provinces without one set.
+    pub terrain: super::terrain::TerrainTypes,
 }
 
 impl Default for ModMeta {
@@ -80,6 +82,7 @@ impl Default for ModMeta {
             manpower_urban: 50_000.0,
             relief: 0.5,
             seed: 1,
+            terrain: Default::default(),
         }
     }
 }
@@ -101,7 +104,7 @@ impl ModMeta {
         if !self.remote_file_id.is_empty() && !self.remote_file_id.chars().all(|c| c.is_ascii_digit()) {
             bail!("Steam Workshop id {:?}: digits only", self.remote_file_id);
         }
-        Ok(())
+        self.terrain.check()
     }
 
     pub fn picture_path(&self, map_dir: &Path) -> Option<PathBuf> {

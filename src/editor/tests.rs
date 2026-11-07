@@ -651,7 +651,9 @@ fn real_map_rivers_and_supply() {
         d.data.ports.clear();
         Ok(String::new())
     });
-    let terr = supply::province_terrain(&doc.data, &doc.labels.read(), &t);
+    let types = doc.data.mod_meta().terrain;
+    let counts = supply::land_counts(&doc.labels.read(), &t, &types.kinds(), doc.data.provinces.cap());
+    let (terr, _) = supply::province_terrain(&doc.data, &doc.stats, &types, &counts);
     let t0 = std::time::Instant::now();
     let v = supply::view(&doc.data, &doc.stats, &doc.labels.read(), &urban, terr.clone());
     println!("supply view in {:.2}s: {} railways ({} links), {} hubs", t0.elapsed().as_secs_f32(), v.plan.auto_links.len(), v.plan.lines.level.len(), v.plan.hubs.len());
@@ -700,7 +702,35 @@ fn real_map_rivers_and_supply() {
 
     let dirs = crate::modbuild::Dirs { game: crate::modbuild::default_game_dir(), mods: out_dir("rivers-supply-mods") };
     if dirs.game.join("map/provinces.bmp").exists() {
-        let mod_dir = crate::modbuild::build(&dir, &dirs, &|l| println!("{l}")).expect("build");
+        let log = std::sync::Mutex::new(Vec::<String>::new());
+        let mod_dir = crate::modbuild::build(&dir, &dirs, &|l| {
+            println!("{l}");
+            log.lock().unwrap().push(l.to_string());
+        })
+        .expect("build");
+        // the editor's "terrain type" colours are the build's terrain
+        let built: std::collections::BTreeMap<String, usize> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|l| l.lines())
+            .find_map(|l| l.trim().strip_prefix("gameplay terrain: ").map(str::to_string))
+            .expect("no terrain in the build summary")
+            .split(", ")
+            .map(|kv| {
+                let (k, v) = kv.rsplit_once(' ').unwrap();
+                (k.to_string(), v.parse().unwrap())
+            })
+            .collect();
+        let types = doc.data.mod_meta().terrain;
+        let counts = supply::land_counts(&doc.labels.read(), &t, &types.kinds(), doc.data.provinces.cap());
+        let (shown, _) = supply::province_terrain(&doc.data, &doc.stats, &types, &counts);
+        let mut editor: std::collections::BTreeMap<String, usize> = Default::default();
+        for (p, _) in doc.data.provinces.iter() {
+            *editor.entry(shown[p as usize].clone()).or_default() += 1;
+        }
+        assert_eq!(editor, built, "the editor's terrain is not the build's");
+        println!("the editor shows the build's terrain: {editor:?}");
         let errors = crate::modbuild::validate::validate(&mod_dir, &dirs.game, &|l| println!("{l}")).unwrap();
         assert!(errors.is_empty(), "the built mod fails checks: {errors:#?}");
         let rails = std::fs::read_to_string(mod_dir.join("map/railways.txt")).unwrap();
@@ -710,4 +740,292 @@ fn real_map_rivers_and_supply() {
     } else {
         println!("HOI4 not found at {}: build not tested", dirs.game.display());
     }
+}
+
+#[test]
+#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+fn real_map_recut_keeps_straits() {
+    let dir = out_dir("straits");
+    copy_map(&dir);
+    let mut doc = open(&dir, true);
+    let g = GenParams::default();
+    let straits = |doc: &Doc| doc.data.adjacencies.iter().filter(|a| a.kind == "sea").cloned().collect::<Vec<_>>();
+    let broken = |doc: &Doc| straits(doc).iter().filter(|a| !doc.strait_ok(a)).map(|a| a.name.clone()).collect::<Vec<_>>();
+    let n0 = straits(&doc).len();
+    let bad0 = broken(&doc);
+    println!("{n0} straits, {} broken at the start: {bad0:?}", bad0.len());
+
+    // re-cut all the land, then all the sea ("Generate by terrain" on the whole map)
+    for kind in [Kind::Land, Kind::Sea] {
+        let ids: Vec<Id> = doc.data.provinces.iter().filter(|(_, p)| p.kind == kind).map(|(i, _)| i).collect();
+        step(&mut doc, &format!("generate {kind:?} by terrain"), |d| {
+            let (a, b) = d.retile(&ids, Retile::Density, &g)?;
+            Ok(format!("{a} -> {b}"))
+        });
+        let bad = broken(&doc);
+        println!("after re-cutting the {kind:?}: {} straits, broken {bad:?}", straits(&doc).len());
+        assert!(bad.len() <= bad0.len(), "re-cutting the {kind:?} broke straits: {bad:?}");
+        assert_eq!(straits(&doc).len(), n0, "straits lost");
+    }
+    // each strait still crosses where it did (its ends near the old crossing points)
+    let dist = |a: [i64; 2], b: [i64; 2]| (((a[0] - b[0]).pow(2) + (a[1] - b[1]).pow(2)) as f64).sqrt();
+    let before: Vec<_> = {
+        let l = model::load(&dir, &Progress::default()).unwrap();
+        l.data.adjacencies.into_iter().filter(|a| a.kind == "sea").collect()
+    };
+    for (a, b) in before.iter().zip(straits(&doc)) {
+        if let (Some(s0), Some(s1)) = (a.start, b.start) {
+            assert!(dist(s0, s1) < 40.0, "{} moved from {s0:?} to {s1:?}", b.name);
+        }
+    }
+
+    // the tool: every strait broken by hand (an end moved to land away from
+    // the water, as re-cutting did before), then fixed
+    let mut moved = 0;
+    for i in 0..doc.data.adjacencies.len() {
+        let a = doc.data.adjacencies[i].clone();
+        if a.kind != "sea" {
+            continue;
+        }
+        let inland = doc.stats.neighbours(a.from).iter().copied().find(|&q| doc.data.kind(q) == Kind::Land && q != a.to && a.through.is_some_and(|t| doc.stats.border_len(q, t) == 0));
+        if let Some(q) = inland {
+            doc.data.adjacencies[i].from = q;
+            moved += 1;
+        }
+    }
+    println!("{moved} straits broken by hand: {} broken", broken(&doc).len());
+    assert!(moved > 10);
+    let (fixed, failed) = doc.fix_straits();
+    println!("fixed {}: {:?}; not fixed: {failed:?}", fixed.len(), &fixed[..fixed.len().min(3)]);
+    assert!(failed.is_empty());
+    assert!(broken(&doc).is_empty(), "still broken: {:?}", broken(&doc));
+    assert_eq!(straits(&doc).len(), n0);
+}
+
+#[test]
+#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+fn real_map_terrain_bitmaps() {
+    use super::{Editor, Settings};
+    use crate::modbuild::{self, bitmaps, img};
+    let dir = out_dir("bitmaps");
+    copy_map(&dir);
+    let dirs = modbuild::Dirs { game: modbuild::default_game_dir(), mods: out_dir("bitmaps-mods") };
+    if !dirs.game.join("map/provinces.bmp").exists() {
+        println!("HOI4 not found at {}: not tested", dirs.game.display());
+        return;
+    }
+    let build = |what: &str| {
+        let m = modbuild::build(&dir, &dirs, &|l| {
+            if l.contains("heightmap") || l.contains("terrain.bmp") {
+                println!("{what}: {l}")
+            }
+        })
+        .expect("build");
+        let errors = modbuild::validate::validate(&m, &dirs.game, &|_| {}).unwrap();
+        assert!(errors.is_empty(), "{what}: the built mod fails checks: {errors:#?}");
+        let read = |f: &str| std::fs::read(m.join("map").join(f)).unwrap();
+        (read("terrain.bmp"), read("heightmap.bmp"), read("world_normal.bmp"))
+    };
+    let (t0, h0, n0) = build("as made");
+
+    let mut ed = Editor::new(Settings::default());
+    ed.doc = Some(open(&dir, true));
+    let (w, h) = (ed.doc.as_ref().unwrap().w as usize, ed.doc.as_ref().unwrap().h as usize);
+    // exported: the build's own files
+    let (tf, hf) = (dir.join("export_terrain.bmp"), dir.join("export_heightmap.bmp"));
+    ed.export_texture(&tf).unwrap();
+    ed.export_heights(&hf).unwrap();
+    assert!(std::fs::read(&tf).unwrap() == t0, "exported terrain.bmp is not the build's");
+    assert!(std::fs::read(&hf).unwrap() == h0, "exported heightmap.bmp is not the build's");
+    // imported back: nothing painted, the build's heights
+    ed.import_texture(&tf);
+    assert_eq!(ed.painted_count(), 0);
+    ed.import_heights(&hf);
+    assert!(ed.doc.as_ref().unwrap().heights.is_some());
+    ed.doc.as_mut().unwrap().save().unwrap();
+    let (t1, h1, n1) = build("imported back");
+    assert!(t1 == t0 && h1 == h0 && n1 == n0, "a round trip changed the build");
+
+    // a marsh stroke across the middle of the map
+    let doc = ed.doc.as_mut().unwrap();
+    doc.begin("Paint terrain.bmp");
+    let painted = super::texture_ui::paint_stroke(doc, [w as f64 * 0.3, h as f64 * 0.5], [w as f64 * 0.7, h as f64 * 0.5], 20.0, 9);
+    doc.commit();
+    println!("{painted} px painted marsh");
+    assert!(painted > 1000);
+    // an image editor lowered a box of land by 20 and pushed a land pixel under water
+    let mut heights = img::read_bmp(&hf).unwrap().data;
+    let (bx, by) = (w / 2, h / 3);
+    for y in by..by + 100 {
+        for x in bx..bx + 100 {
+            heights[y * w + x] = heights[y * w + x].saturating_sub(20);
+        }
+    }
+    let land = (0..w * h).find(|&i| heights[i] > 150).unwrap();
+    heights[land] = 40;
+    img::write_bmp_gray(&hf, w as u32, h as u32, &heights).unwrap();
+    ed.import_heights(&hf);
+    ed.doc.as_mut().unwrap().save().unwrap();
+    let (t2, h2, n2) = build("painted and edited");
+    let tex = |b: &[u8]| img::read_bmp_bytes(b).unwrap().data;
+    let (a, b) = (tex(&t0), tex(&t2));
+    let paint = ed.doc.as_ref().unwrap().paint.read().clone();
+    let sea: Vec<bool> = ed.doc.as_ref().unwrap().labels.read().px.iter().map(|&p| ed.doc.as_ref().unwrap().data.kind(p) == Kind::Sea).collect();
+    for i in 0..w * h {
+        let want = if paint[i] != bitmaps::AUTO && !sea[i] { 9 } else { a[i] };
+        assert_eq!(b[i], want, "terrain.bmp at {i}");
+    }
+    let (hb, ha) = (tex(&h2), tex(&h0));
+    assert_eq!(hb[land], crate::modbuild::vanilla::WATER + 1, "land under water was raised");
+    let changed = (0..w * h).filter(|&i| hb[i] != ha[i]).count();
+    assert!(changed > 5000, "{changed} heights changed");
+    assert!(n2 != n0, "the shading does not follow the heights");
+}
+
+#[test]
+#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+fn real_map_lakes_of_water() {
+    use crate::modbuild::{self, bitmaps, img, vanilla::WATER};
+    let dir = out_dir("lakes");
+    copy_map(&dir);
+    let dirs = modbuild::Dirs { game: modbuild::default_game_dir(), mods: out_dir("lakes-mods") };
+    if !dirs.game.join("map/provinces.bmp").exists() {
+        println!("HOI4 not found at {}: not tested", dirs.game.display());
+        return;
+    }
+    let mut doc = open(&dir, false);
+    let errors_before = errors(&doc);
+    // an inland land province of a state with others, in no adjacency, without
+    // a victory point, not in a capital state
+    let d = &doc.data;
+    let capitals: Vec<Id> = d.nations.iter().map(|(_, n)| n.capital_state).collect();
+    let mut cands: Vec<Id> = d
+        .provinces
+        .iter()
+        .filter(|&(p, pr)| {
+            pr.kind == Kind::Land
+                && !pr.edge
+                && !capitals.contains(&pr.state)
+                && doc.index.provs_of_state(pr.state).len() >= 3
+                && d.states.get(pr.state).is_some_and(|s| !s.impassable && s.victory_points.iter().all(|v| v[0] != p))
+                && !d.adjacencies.iter().any(|a| a.from == p || a.to == p || a.through == Some(p))
+                && doc.stats.neighbours(p).iter().all(|&q| q != 0 && d.kind(q) == Kind::Land)
+        })
+        .map(|(p, _)| p)
+        .collect();
+    cands.sort_by_key(|&p| std::cmp::Reverse(doc.stats.get(p).px));
+    let lake = cands[cands.len() / 2];
+    println!("lake: {} ({lake}), {} px, {} candidates", d.prov_name(lake), doc.stats.get(lake).px, cands.len());
+    let removed: Vec<Id> = d.provinces.iter().filter(|(_, pr)| pr.kind == Kind::Lake && !pr.water).map(|(p, _)| p).collect();
+    let lakes = d.provinces.iter().filter(|(_, pr)| pr.kind == Kind::Lake && pr.water).count();
+
+    doc.begin("Make lake");
+    assert_eq!(doc.make_lakes(&[lake]).unwrap(), 1);
+    doc.commit();
+    let new_errors: Vec<String> = errors(&doc).into_iter().filter(|e| !errors_before.contains(e)).collect();
+    assert!(new_errors.is_empty(), "a lake made new errors: {new_errors:?}");
+    // the pixels of the lake, and of land taken out of play
+    let px: Vec<usize> = doc.labels.read().px.iter().enumerate().filter(|&(_, &p)| p == lake).map(|(i, _)| i).collect();
+    let removed_px: Vec<usize> = doc.labels.read().px.iter().enumerate().filter(|&(_, &p)| removed.contains(&p)).map(|(i, _)| i).collect();
+    doc.save().unwrap();
+
+    // read back: still a lake of water
+    let back = open(&dir, false);
+    let p = back.labels.read().px[px[0]];
+    assert!(back.data.kind(p) == Kind::Lake && back.data.is_water(p), "the lake was not saved");
+
+    let lines = std::sync::Mutex::new(Vec::<String>::new());
+    let m = modbuild::build(&dir, &dirs, &|l| lines.lock().unwrap().push(l.to_string())).expect("build");
+    let errors = modbuild::validate::validate(&m, &dirs.game, &|l| lines.lock().unwrap().push(l.to_string())).unwrap();
+    assert!(errors.is_empty(), "the built mod fails checks: {errors:#?}");
+    let lines = lines.into_inner().unwrap();
+    for l in lines.iter().filter(|l| l.contains("lakes")) {
+        println!("{l}");
+    }
+    let want = format!(" {} lakes of water", lakes + 1);
+    assert!(lines.iter().any(|l| l.contains(&want)), "the check does not see the lake under water");
+
+    let map = m.join("map");
+    let bmp = |f: &str| img::read_bmp(&map.join(f)).unwrap();
+    let (height, rivers, terrain, provinces) = (bmp("heightmap.bmp"), bmp("rivers.bmp"), bmp("terrain.bmp"), bmp("provinces.bmp"));
+    for &i in &px {
+        assert!(height.data[i] < WATER, "the lake is not under water at {i}: {}", height.data[i]);
+        assert_eq!(rivers.data[i], 254, "rivers.bmp at {i}");
+        assert_eq!(terrain.data[i], bitmaps::T_OCEAN, "terrain.bmp at {i}");
+    }
+    // deeper inside than at the shore
+    assert!(px.iter().map(|&i| height.data[i]).min() < px.iter().map(|&i| height.data[i]).max(), "the lake is flat");
+    for &i in &removed_px {
+        assert!(height.data[i] > WATER, "land out of play under water at {i}");
+    }
+    // definition.csv: a lake province
+    let rgb = &provinces.data[px[0] * 3..px[0] * 3 + 3];
+    let def = std::fs::read_to_string(map.join("definition.csv")).unwrap();
+    let row: Vec<&str> = def.lines().map(|l| l.split(';').collect::<Vec<_>>()).find(|r| r.len() > 7 && r[1..4] == [rgb[0], rgb[1], rgb[2]].map(|c| c.to_string())).expect("lake not in definition.csv");
+    assert_eq!(row[4..8], ["lake", "false", "lakes", "0"], "{row:?}");
+}
+
+#[test]
+#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+fn real_map_lasso() {
+    use super::{Editor, Level, Settings, Tool};
+    let dir = out_dir("lasso");
+    copy_map(&dir);
+    let mut ed = Editor::new(Settings { tool: Tool::Lasso, ..Settings::default() });
+    ed.doc = Some(open(&dir, false));
+    let before = errors(ed.doc.as_ref().unwrap());
+    let new_errors = |ed: &Editor| -> Vec<String> { errors(ed.doc.as_ref().unwrap()).into_iter().filter(|e| !before.contains(e)).collect() };
+    // the biggest inland land province of a state of several
+    let (p, c, r) = {
+        let doc = ed.doc.as_ref().unwrap();
+        let d = &doc.data;
+        let p = d
+            .provinces
+            .iter()
+            .filter(|&(p, pr)| pr.kind == Kind::Land && !pr.edge && doc.index.provs_of_state(pr.state).len() >= 4 && doc.stats.neighbours(p).iter().all(|&q| q != 0 && d.kind(q) == Kind::Land))
+            .map(|(p, _)| p)
+            .max_by_key(|&p| doc.stats.get(p).px)
+            .unwrap();
+        (p, doc.stats.get(p).centre(), (doc.stats.get(p).px as f64 / std::f64::consts::PI).sqrt())
+    };
+    let circle = |r: f64| -> Vec<[f64; 2]> { (0..64).map(|k| k as f64 * std::f64::consts::TAU / 64.0).map(|a| [c[0] + r * a.cos(), c[1] + r * a.sin()]).collect() };
+    let name = ed.doc.as_ref().unwrap().data.prov_name(p);
+    println!("lasso around {name} ({p}), radius {r:.0} px");
+
+    // a new province over the middle of it and some of its neighbours
+    ed.finish_lasso(&circle(r));
+    let made = ed.sel[0];
+    let doc = ed.doc.as_ref().unwrap();
+    println!("{:?}: {} px", ed.message(), doc.stats.get(made).px);
+    assert!(made != p && doc.data.kind(made) == Kind::Land && doc.stats.get(made).px as f64 > 2.5 * r * r);
+    assert!(new_errors(&ed).is_empty(), "{:?}", new_errors(&ed));
+    // then the old province takes back the middle of it
+    ed.settings.lasso_onto = true;
+    ed.sel = vec![p];
+    let px = ed.doc.as_ref().unwrap().stats.get(p).px;
+    ed.finish_lasso(&circle(r / 2.0));
+    let doc = ed.doc.as_ref().unwrap();
+    println!("{:?}", ed.message());
+    assert!(doc.stats.get(p).px > px);
+    assert!(new_errors(&ed).is_empty(), "{:?}", new_errors(&ed));
+
+    // a new state of the provinces mostly inside a wider loop, then more of it
+    ed.settings.level = Level::States;
+    ed.settings.lasso_onto = false;
+    ed.finish_lasso(&circle(3.0 * r));
+    let s = ed.sel[0];
+    let doc = ed.doc.as_ref().unwrap();
+    println!("{:?}", ed.message());
+    assert!(doc.data.state_of(made) == s && doc.index.provs_of_state(s).len() > 2);
+    ed.settings.lasso_onto = true;
+    let n = doc.index.provs_of_state(s).len();
+    ed.finish_lasso(&circle(5.0 * r));
+    println!("{:?}", ed.message());
+    assert!(ed.doc.as_ref().unwrap().index.provs_of_state(s).len() > n);
+    assert!(new_errors(&ed).is_empty(), "{:?}", new_errors(&ed));
+    // each one undo step
+    for _ in 0..4 {
+        ed.doc.as_mut().unwrap().undo();
+    }
+    assert!(errors(ed.doc.as_ref().unwrap()) == before && ed.doc.as_ref().unwrap().can_undo().is_none());
 }

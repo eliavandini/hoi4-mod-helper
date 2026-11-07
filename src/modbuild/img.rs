@@ -58,29 +58,39 @@ pub struct Bmp {
 
 pub fn read_bmp(path: &Path) -> Result<Bmp> {
     let b = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    parse_bmp(&b, &path.display().to_string())
+}
+
+/// A BMP file's contents, as [`read_bmp`] reads it.
+#[cfg(test)]
+pub fn read_bmp_bytes(b: &[u8]) -> Result<Bmp> {
+    parse_bmp(b, "the bitmap")
+}
+
+fn parse_bmp(b: &[u8], name: &str) -> Result<Bmp> {
     if b.len() < 54 || &b[0..2] != b"BM" {
-        bail!("{} is not a BMP file", path.display());
+        bail!("{name} is not a BMP file");
     }
-    let off = u32le(&b, 10) as usize;
-    let hdr = u32le(&b, 14) as usize;
-    let w = i32le(&b, 18).unsigned_abs() as usize;
-    let h_raw = i32le(&b, 22);
+    let off = u32le(b, 10) as usize;
+    let hdr = u32le(b, 14) as usize;
+    let w = i32le(b, 18).unsigned_abs() as usize;
+    let h_raw = i32le(b, 22);
     let h = h_raw.unsigned_abs() as usize;
-    let bpp = u16le(&b, 28);
-    if u32le(&b, 30) != 0 {
-        bail!("{}: compressed bitmaps are not supported", path.display());
+    let bpp = u16le(b, 28);
+    if u32le(b, 30) != 0 {
+        bail!("{}: compressed bitmaps are not supported", name);
     }
     if bpp != 8 && bpp != 24 {
-        bail!("{}: {bpp}-bit bitmaps are not supported", path.display());
+        bail!("{}: {bpp}-bit bitmaps are not supported", name);
     }
     let palette: Vec<[u8; 3]> = if bpp == 8 {
-        let n = match u32le(&b, 46) {
+        let n = match u32le(b, 46) {
             0 => 256,
             k => k as usize,
         };
         let p0 = 14 + hdr;
         if b.len() < p0 + 4 * n {
-            bail!("{}: truncated palette", path.display());
+            bail!("{}: truncated palette", name);
         }
         (0..n).map(|i| [b[p0 + 4 * i + 2], b[p0 + 4 * i + 1], b[p0 + 4 * i]]).collect()
     } else {
@@ -89,7 +99,7 @@ pub fn read_bmp(path: &Path) -> Result<Bmp> {
     let bb = bpp as usize / 8;
     let stride = (w * bpp as usize).div_ceil(32) * 4;
     if b.len() < off + stride * h {
-        bail!("{}: truncated pixel data", path.display());
+        bail!("{}: truncated pixel data", name);
     }
     let mut data = vec![0u8; w * h * bb];
     data.par_chunks_mut(w * bb).enumerate().for_each(|(y, d)| {
