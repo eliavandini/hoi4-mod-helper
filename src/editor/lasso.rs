@@ -191,7 +191,7 @@ impl Shape {
     }
 }
 
-fn most<K: Copy + Ord>(counts: impl Iterator<Item = (K, u64)>) -> Option<K> {
+pub(super) fn most<K: Copy + Ord>(counts: impl Iterator<Item = (K, u64)>) -> Option<K> {
     let mut m = std::collections::BTreeMap::new();
     for (k, n) in counts {
         *m.entry(k).or_insert(0) += n;

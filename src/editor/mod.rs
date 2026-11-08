@@ -9,6 +9,7 @@
 
 pub mod build;
 mod content_link;
+mod cut;
 pub mod density;
 pub mod doc;
 pub mod from_image;
@@ -200,6 +201,8 @@ pub enum Tool {
     Paint,
     /// Provinces and States: drag a loop around an area (see `lasso`).
     Lasso,
+    /// Provinces and States: draw a line across to cut (see `cut`).
+    Cut,
     Link,
     /// Click or drag across borders to make them impassable (or passable).
     Border,
@@ -221,7 +224,7 @@ impl Tool {
             Level::Rivers => &[Tool::Select, Tool::Draw, Tool::Pan],
             Level::Supply => &[Tool::Select, Tool::Rail, Tool::Hub, Tool::Port, Tool::Pan],
             Level::Adjacencies => &[Tool::Select, Tool::Link, Tool::Border, Tool::Pan],
-            Level::Provinces | Level::States => &[Tool::Select, Tool::Paint, Tool::Lasso, Tool::Border, Tool::Pan],
+            Level::Provinces | Level::States => &[Tool::Select, Tool::Paint, Tool::Lasso, Tool::Cut, Tool::Border, Tool::Pan],
             _ => &[Tool::Select, Tool::Paint, Tool::Border, Tool::Pan],
         }
     }
@@ -242,6 +245,8 @@ pub struct Settings {
     pub constraint: Constraint,
     /// The lasso adds to the selected province or state (else makes a new one).
     pub lasso_onto: bool,
+    /// The Cut tool on the States level also cuts the provinces it crosses.
+    pub cut_provinces: bool,
     pub params: GenParams,
     pub opacity: f32,
     pub labels: bool,
@@ -268,6 +273,7 @@ impl Default for Settings {
             brush: 6.0,
             constraint: Constraint::default(),
             lasso_onto: false,
+            cut_provinces: false,
             params: GenParams::default(),
             opacity: 0.7,
             labels: true,
@@ -414,6 +420,8 @@ pub struct Editor {
     stroke: Option<Stroke2>,
     /// The lasso's loop being drawn.
     lasso: Option<lasso::Loop>,
+    /// The Cut tool's line being drawn (map pixels).
+    cut: Option<Vec<[f64; 2]>>,
     border_stroke: Option<BorderStroke>,
     hover_border: Option<(Id, Id)>,
     border_lines: (u64, BorderLines),
@@ -531,6 +539,7 @@ impl Editor {
             new_province: false,
             stroke: None,
             lasso: None,
+            cut: None,
             border_stroke: None,
             hover_border: None,
             border_lines: (0, FxHashMap::default()),
@@ -599,7 +608,7 @@ impl Editor {
     /// Cursor for the map.
     pub fn cursor(&self) -> egui::CursorIcon {
         match self.settings.tool {
-            Tool::Paint | Tool::Lasso | Tool::Link | Tool::Border | Tool::Draw | Tool::Rail | Tool::Hub | Tool::Port => egui::CursorIcon::Crosshair,
+            Tool::Paint | Tool::Lasso | Tool::Cut | Tool::Link | Tool::Border | Tool::Draw | Tool::Rail | Tool::Hub | Tool::Port => egui::CursorIcon::Crosshair,
             Tool::Select => egui::CursorIcon::Default,
             Tool::Pan => egui::CursorIcon::Grab,
         }
@@ -892,10 +901,11 @@ impl Editor {
         if level == Level::Adjacencies && self.settings.tool == Tool::Paint {
             self.settings.tool = Tool::Link;
         }
-        if self.settings.tool == Tool::Lasso && !Tool::of(level).contains(&Tool::Lasso) {
+        if matches!(self.settings.tool, Tool::Lasso | Tool::Cut) && !Tool::of(level).contains(&self.settings.tool) {
             self.settings.tool = Tool::Select;
         }
         self.lasso = None;
+        self.cut = None;
         self.link_from = None;
         self.new_province = false;
     }
@@ -1300,7 +1310,7 @@ impl Editor {
         let level = self.settings.level;
         // P stays the pan tool (the viewer's key); a key used here is taken
         // so the viewer does not act on it too (H hides a layer there)
-        for (k, t) in [(Key::B, Tool::Paint), (Key::O, Tool::Lasso), (Key::I, Tool::Border), (Key::D, Tool::Draw), (Key::R, Tool::Rail), (Key::H, Tool::Hub), (Key::N, Tool::Port)] {
+        for (k, t) in [(Key::B, Tool::Paint), (Key::O, Tool::Lasso), (Key::K, Tool::Cut), (Key::I, Tool::Border), (Key::D, Tool::Draw), (Key::R, Tool::Rail), (Key::H, Tool::Hub), (Key::N, Tool::Port)] {
             if Tool::of(level).contains(&t) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k)) {
                 self.settings.tool = t;
             }
@@ -1315,7 +1325,7 @@ impl Editor {
         if pressed(Key::CloseBracket) {
             self.settings.brush = (self.settings.brush * 1.25).min(400.0);
         }
-        if pressed(Key::Escape) && self.lasso.take().is_none() {
+        if pressed(Key::Escape) && self.lasso.take().is_none() && self.cut.take().is_none() {
             self.sel.clear();
             self.sel_adj = None;
             self.link_from = None;
@@ -1643,6 +1653,7 @@ impl Editor {
             }
         }
         self.draw_lasso(dc, &pl);
+        self.draw_cut(dc, &pl);
         if let (Some(f), Some(h)) = (self.link_from, self.hover) {
             if let Some(doc) = &self.doc {
                 let c = doc.stats.get(f).centre();
@@ -1667,6 +1678,9 @@ impl Editor {
         let tool = self.settings.tool;
         if tool != Tool::Lasso {
             self.lasso = None;
+        }
+        if tool != Tool::Cut {
+            self.cut = None;
         }
         if tool == Tool::Pan {
             return false;
@@ -1754,6 +1768,13 @@ impl Editor {
         if tool == Tool::Lasso && matches!(level, Level::Provinces | Level::States) {
             let origin = dc.ctx.input(|i| i.pointer.press_origin()).and_then(to_px).or(pos);
             self.lasso_input(dc.ctx, response, pos, origin, px_scale);
+            return true;
+        }
+
+        // Cut: a line drawn across, cut on letting go
+        if tool == Tool::Cut && matches!(level, Level::Provinces | Level::States) {
+            let origin = dc.ctx.input(|i| i.pointer.press_origin()).and_then(to_px).or(pos);
+            self.cut_input(dc.ctx, response, pos, origin, px_scale);
             return true;
         }
 
@@ -2265,6 +2286,8 @@ impl Editor {
                     (Tool::Paint, _) => ("🖌 Paint", "B · paint: what the brush touches joins the selected entity"),
                     (Tool::Lasso, Level::States) => ("➰ Lasso", "O · drag a loop around provinces: those more than half inside become a new state (or join the selected one)"),
                     (Tool::Lasso, _) => ("➰ Lasso", "O · drag a loop around an area: it becomes a new province (or goes to the selected one)"),
+                    (Tool::Cut, Level::States) => ("✂ Cut", "K · draw a line across a state, from border to border: the provinces on the other side become a new state"),
+                    (Tool::Cut, _) => ("✂ Cut", "K · draw a line across a province, from border to border: it is cut in two along it"),
                     (Tool::Link, _) => ("🔗 Link", "L · click two provinces to add an adjacency"),
                     (Tool::Border, _) => (
                         "⛔ Border",
@@ -2289,6 +2312,9 @@ impl Editor {
         }
         if self.settings.tool == Tool::Lasso && Tool::of(self.settings.level).contains(&Tool::Lasso) {
             self.lasso_panel(ui);
+        }
+        if self.settings.tool == Tool::Cut && Tool::of(self.settings.level).contains(&Tool::Cut) {
+            self.cut_panel(ui);
         }
         if matches!(self.settings.tool, Tool::Paint | Tool::Lasso) && self.settings.level == Level::Provinces {
             ui.horizontal_wrapped(|ui| {

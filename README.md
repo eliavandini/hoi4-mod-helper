@@ -77,8 +77,8 @@ layers stay underneath ("Background layers" at the bottom of the panel).
 
 | Level | Select / paint | Actions |
 |---|---|---|
-| Provinces | provinces; the paint brush redraws borders with the first selected province (only over the same type by default, optionally only within the same state / nation); the **lasso** (`O`) draws a new province, or more of the selected one | merge, divide into *n*, **generate by terrain**, dissolve, new (paint), new from an image, make land / sea / **lake**, split separate parts, new state / air zone / sea zone from the selection |
-| States | states; paint moves provinces into the first selected state; the **lasso** (`O`) makes a new state of the provinces mostly inside it, or adds them to the selected one | merge, divide, dissolve, generate states, new nation, impassable on / off |
+| Provinces | provinces; the paint brush redraws borders with the first selected province (only over the same type by default, optionally only within the same state / nation); the **lasso** (`O`) draws a new province, or more of the selected one; **cut** (`K`) cuts one along a line | merge, divide into *n*, **generate by terrain**, dissolve, new (paint), new from an image, make land / sea / **lake**, split separate parts, new state / air zone / sea zone from the selection |
+| States | states; paint moves provinces into the first selected state; the **lasso** (`O`) makes a new state of the provinces mostly inside it, or adds them to the selected one; **cut** (`K`) divides one along a line | merge, divide, dissolve, generate states, new nation, impassable on / off |
 | Nations | nations; paint moves whole states | merge, divide, dissolve, share out land (each state to the nearest capital), generate states |
 | Air zones / Sea zones | land / naval strategic regions | merge, divide, dissolve, generate |
 | Adjacencies | straits (`sea`), `impassable` borders, links (empty type, optionally with an `adjacency_rule_name`); Link tool (`L`): click the two provinces | edit, recompute the crossing points, delete, **fix broken straits** |
@@ -185,6 +185,26 @@ state and more of the selected one; Alt+click picks the one to draw onto.
   state (named after the biggest, owned by the nation that holds most of
   them), or join the selected state. To give a state an exact border,
   draw its provinces first.
+
+**Cut.** The Cut tool (`K`, Provinces and States levels) divides along a
+line: hold the mouse button and draw it across, from border to border; it
+cuts when you let go, as one undo step (Esc while drawing drops the line).
+The line is the pixels it passes through, side by side, so nothing stays
+joined across it. An end that stops a little short (up to 20 screen points)
+of the border of what the line mostly runs through is carried on to it; an
+end inside something else stays, so a line can start in a neighbour.
+
+- Provinces: every province the line divides is cut. Its biggest piece
+  keeps the province; each other piece becomes a new province like it (same
+  type, state, zone and terrain). The line's own pixels go to the pieces
+  beside them, bits under 8 px are not cut off, and crossings are fixed.
+- States: every state the line divides is cut. Each province goes whole to
+  the side most of it lies on; with "cut the provinces it crosses", those
+  are cut first, so the new border follows the line. The biggest side keeps
+  the state; each other side becomes a new state of the same nation, named
+  like the divided ones ("Tirol II"). Victory points go with their
+  provinces, and a manpower set by hand is shared out by size (as Divide
+  does too now).
 
 **Impassable borders.** The Border tool (`I`, on every level) blocks the
 border between two provinces, as vanilla does along some mountain ridges
@@ -429,7 +449,7 @@ beside it. The setting is stored as `"map_frame"` in `provinces.json`.
 | Input | Action |
 |---|---|
 | `1`–`9`, `0` | provinces / states / nations / air zones / sea zones / adjacencies / inaccessible / rivers / supply / terrain |
-| `S` / `B` / `O` / `L` / `I` / `P` | select / paint / lasso / link / border / pan tool |
+| `S` / `B` / `O` / `K` / `L` / `I` / `P` | select / paint / lasso / cut / link / border / pan tool |
 | `D` / `R` / `H` / `N` | draw a river / railway / supply hub / port (naval base) tool (on the Rivers and Supply levels) |
 | Enter, Backspace | end a new river or railway; take back its last point |
 | click, Shift / Ctrl+click | select; add or remove |
@@ -438,7 +458,7 @@ beside it. The setting is stored as `"map_frame"` in `provinces.json`.
 | `[` / `]` | brush size |
 | Delete | dissolve the selection |
 | Ctrl+Z, Ctrl+Shift+Z / Ctrl+Y | undo, redo (80 steps) |
-| Esc | clear the selection (while drawing a lasso loop: drop the loop) |
+| Esc | clear the selection (while drawing a lasso loop or a cut: drop it) |
 | lasso: hold / click; Enter or double-click; Backspace | draw freehand / add a corner; close the loop; take back its last part |
 
 ## Nation content
@@ -691,6 +711,7 @@ top, in metres.
 | `editor/launcher.rs` | the game launcher: mod list, `dlc_load.json`, starting the game |
 | `editor/from_image.rs` | "Province from image": colour channel of an image laid on the map, preview |
 | `editor/lasso.rs` | the Lasso tool: the pixels inside a loop, new provinces and states from it, drawing it |
+| `editor/cut.rs` | the Cut tool: the pixels of a line, what it divides, cutting provinces and states along it |
 | `editor/rivers.rs`, `editor/rivers_ui.rs` | rivers as lines → `rivers.bmp` pixels (junctions, lakes, sea), its checks, rivers from the heights; the Rivers level |
 | `editor/supply.rs`, `editor/supply_ui.rs` | the supply network: railway routing, automatic railways and hubs, ports, the supply estimate; the Supply level |
 | `modbuild/mod.rs` | the mod build: bitmaps, positions, railways, states, countries, bookmark, localisation, tutorial |

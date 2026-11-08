@@ -163,7 +163,7 @@ fn direction(a: [f64; 2], b: [f64; 2]) -> &'static str {
 }
 
 /// Connected parts (4-neighbourhood) of a pixel set; returns part index per pixel.
-fn pixel_parts(px: &[usize], w: usize) -> (Vec<u32>, usize) {
+pub(super) fn pixel_parts(px: &[usize], w: usize) -> (Vec<u32>, usize) {
     let pos: FxHashMap<usize, usize> = px.iter().enumerate().map(|(k, &i)| (i, k)).collect();
     let mut part = vec![NONE; px.len()];
     let mut n = 0;
@@ -1203,32 +1203,50 @@ impl Doc {
         }
         let items: Vec<Vec<Id>> = provs.iter().map(|&p| vec![p]).collect();
         let lbl = self.partition_items(&items, k.min(provs.len()), s as u64, organic);
-        Ok(self.apply_state_groups(s, &provs, &lbl))
+        let px: Vec<u64> = provs.iter().map(|&p| self.stats.get(p).px as u64).collect();
+        Ok(self.apply_state_groups(s, &provs, &lbl, &px))
     }
 
-    /// Group 0..k of `lbl` (by province): the largest group keeps `s`, the
-    /// others become new states of the same nation.
-    fn apply_state_groups(&mut self, s: Id, provs: &[Id], lbl: &[u32]) -> Vec<Id> {
+    /// Group 0..k of `lbl` (by province; `px`: their sizes): the largest group
+    /// keeps `s`, the others become new states of the same nation. Victory
+    /// points go with their provinces; a manpower set by hand is shared out
+    /// by size.
+    pub(super) fn apply_state_groups(&mut self, s: Id, provs: &[Id], lbl: &[u32], px: &[u64]) -> Vec<Id> {
         let st = self.data.states.get(s).cloned().unwrap();
         let mut size: BTreeMap<u32, u64> = BTreeMap::new();
         for (i, &l) in lbl.iter().enumerate() {
-            *size.entry(l).or_insert(0) += self.stats.get(provs[i]).px as u64;
+            *size.entry(l).or_insert(0) += px[i];
         }
         let keep = size.iter().max_by_key(|(l, n)| (**n, std::cmp::Reverse(**l))).map(|(l, _)| *l).unwrap_or(0);
+        let total: u64 = size.values().sum::<u64>().max(1);
         let mut ids = vec![s];
         let mut n = 1;
         let mut map: FxHashMap<u32, Id> = FxHashMap::default();
         map.insert(keep, s);
-        for &l in size.keys() {
+        let mut given = 0;
+        for (&l, &sz) in &size {
             if l != keep {
                 n += 1;
                 let id = self.new_state(format!("{} {}", st.name, roman(n)), st.nation, st.impassable);
+                if let Some(m) = st.manpower {
+                    let share = (m as f64 * sz as f64 / total as f64).round() as u64;
+                    self.data.states.get_mut(id).unwrap().manpower = Some(share);
+                    given += share;
+                }
                 map.insert(l, id);
                 ids.push(id);
             }
         }
         for (i, &l) in lbl.iter().enumerate() {
             self.data.provinces.get_mut(provs[i]).unwrap().state = map[&l];
+        }
+        let vps = std::mem::take(&mut self.data.states.get_mut(s).unwrap().victory_points);
+        for v in vps {
+            let to = self.data.provinces.get(v[0]).map(|p| p.state).filter(|t| ids.contains(t)).unwrap_or(s);
+            self.data.states.get_mut(to).unwrap().victory_points.push(v);
+        }
+        if let Some(m) = st.manpower {
+            self.data.states.get_mut(s).unwrap().manpower = Some(m.saturating_sub(given));
         }
         ids
     }

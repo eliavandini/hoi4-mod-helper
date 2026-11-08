@@ -1029,3 +1029,74 @@ fn real_map_lasso() {
     }
     assert!(errors(ed.doc.as_ref().unwrap()) == before && ed.doc.as_ref().unwrap().can_undo().is_none());
 }
+
+#[test]
+#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+fn real_map_cut() {
+    use super::{Editor, Level, Settings, Tool};
+    let dir = out_dir("cut");
+    copy_map(&dir);
+    let mut ed = Editor::new(Settings { tool: Tool::Cut, ..Settings::default() });
+    ed.doc = Some(open(&dir, false));
+    let before = errors(ed.doc.as_ref().unwrap());
+    let new_errors = |ed: &Editor| -> Vec<String> { errors(ed.doc.as_ref().unwrap()).into_iter().filter(|e| !before.contains(e)).collect() };
+    // the biggest inland land province of a state of several
+    let (p, s, c, b) = {
+        let doc = ed.doc.as_ref().unwrap();
+        let d = &doc.data;
+        let p = d
+            .provinces
+            .iter()
+            .filter(|&(p, pr)| pr.kind == Kind::Land && !pr.edge && doc.index.provs_of_state(pr.state).len() >= 6 && doc.stats.neighbours(p).iter().all(|&q| q != 0 && d.kind(q) == Kind::Land))
+            .map(|(p, _)| p)
+            .max_by_key(|&p| doc.stats.get(p).px)
+            .unwrap();
+        let st = doc.stats.get(p);
+        (p, d.state_of(p), st.centre(), [st.x0 as f64, st.y0 as f64, st.x1 as f64 + 1.0, st.y1 as f64 + 1.0])
+    };
+    let name = ed.doc.as_ref().unwrap().data.prov_name(p);
+    let px = ed.doc.as_ref().unwrap().stats.get(p).px;
+    println!("cutting {name} ({p}, {px} px) of state {s}");
+
+    // across it, a little wavy, from 3 px outside its box to 3 px outside
+    let line: Vec<[f64; 2]> = (0..=40).map(|k| b[0] - 3.0 + (b[2] - b[0] + 6.0) * k as f64 / 40.0).map(|x| [x, c[1] + 2.0 * (x / 7.0).sin()]).collect();
+    ed.finish_cut(&line, 3.0);
+    let doc = ed.doc.as_ref().unwrap();
+    println!("{:?}", ed.message());
+    assert_eq!(doc.can_undo(), Some("Cut provinces"), "{:?}", ed.message());
+    let q = *ed.sel.iter().find(|&&x| x != p).unwrap();
+    let (a, n) = (doc.stats.get(p).px, doc.stats.get(q).px);
+    assert!(doc.data.state_of(q) == s && doc.data.kind(q) == Kind::Land && a >= n && n > px / 8, "{a} + {n} of {px}");
+    assert!(new_errors(&ed).is_empty(), "{:?}", new_errors(&ed));
+    ed.doc.as_mut().unwrap().undo();
+
+    // the state, down through the province: each province whole, then cut along
+    let (sb, nvp, vps) = {
+        let doc = ed.doc.as_ref().unwrap();
+        let provs = doc.index.provs_of_state(s);
+        let sb = provs.iter().map(|&p| doc.stats.get(p)).fold([f64::MAX, f64::MAX, 0.0f64, 0.0f64], |b, st| [b[0].min(st.x0 as f64), b[1].min(st.y0 as f64), b[2].max(st.x1 as f64 + 1.0), b[3].max(st.y1 as f64 + 1.0)]);
+        let total_vps: usize = doc.data.states.iter().map(|(_, st)| st.victory_points.len()).sum();
+        (sb, provs.len(), total_vps)
+    };
+    ed.settings.level = Level::States;
+    let down: Vec<[f64; 2]> = (0..=40).map(|k| sb[1] - 3.0 + (sb[3] - sb[1] + 6.0) * k as f64 / 40.0).map(|y| [c[0] + 2.0 * (y / 9.0).sin(), y]).collect();
+    ed.finish_cut(&down, 3.0);
+    let doc = ed.doc.as_ref().unwrap();
+    println!("{:?}", ed.message());
+    assert_eq!(doc.can_undo(), Some("Cut states"), "{:?}", ed.message());
+    let t = *ed.sel.iter().find(|&&x| x != s).unwrap();
+    let (ns, nt) = (doc.index.provs_of_state(s).len(), doc.index.provs_of_state(t).len());
+    assert!(ns + nt == nvp && nt > 0 && doc.data.states.get(t).unwrap().nation == doc.data.states.get(s).unwrap().nation, "{ns} + {nt} of {nvp}");
+    assert_eq!(doc.data.states.iter().map(|(_, st)| st.victory_points.len()).sum::<usize>(), vps, "victory points stay");
+    assert!(new_errors(&ed).is_empty(), "{:?}", new_errors(&ed));
+    ed.doc.as_mut().unwrap().undo();
+
+    ed.settings.cut_provinces = true;
+    ed.finish_cut(&down, 3.0);
+    let doc = ed.doc.as_ref().unwrap();
+    println!("{:?}", ed.message());
+    assert!(doc.index.provs_of_state(s).len() + doc.index.provs_of_state(*ed.sel.iter().find(|&&x| x != s).unwrap()).len() > nvp, "provinces were cut too");
+    assert!(new_errors(&ed).is_empty(), "{:?}", new_errors(&ed));
+    ed.doc.as_mut().unwrap().undo();
+    assert!(errors(ed.doc.as_ref().unwrap()) == before && ed.doc.as_ref().unwrap().can_undo().is_none());
+}
