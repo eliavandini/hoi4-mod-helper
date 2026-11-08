@@ -772,29 +772,7 @@ fn build_into(
             .then(b.km2.total_cmp(&a.km2))
             .then(a.id.cmp(&b.id))
     });
-    let mut taken = vanilla::tags(&dirs.game)?;
-    taken.extend(countries::RESERVED_TAGS.iter().map(|s| s.to_string()));
-    let tag_re = Regex::new(r"^[A-Z][A-Z0-9]{2}$").unwrap();
-    let fixed: BTreeMap<Id, String> = nations.values().filter_map(|x| x.tag.as_ref().filter(|t| !t.is_empty()).map(|t| (x.id, t.clone()))).collect();
-    for (nid, t) in &fixed {
-        if !tag_re.is_match(t) {
-            bail!("tag {t:?} of {}: three capitals or digits, starting with a letter", nations[nid].name);
-        }
-        if taken.contains(t) {
-            bail!("tag {t} of {} is a vanilla tag or a reserved word", nations[nid].name);
-        }
-    }
-    let mut seen = BTreeSet::new();
-    let dups: BTreeSet<&String> = fixed.values().filter(|t| !seen.insert(*t)).collect();
-    if !dups.is_empty() {
-        bail!("two nations have the same tag: {}", dups.into_iter().cloned().collect::<Vec<_>>().join(", "));
-    }
-    let inputs: Vec<countries::TagInput> =
-        by_rank.iter().filter(|x| !fixed.contains_key(&x.id)).map(|x| countries::TagInput { id: x.id, name: &x.name, place: &x.place, km2: x.km2 }).collect();
-    let mut taken2 = taken.clone();
-    taken2.extend(fixed.values().cloned());
-    let mut tag_of = countries::make_tags(&inputs, &taken2);
-    tag_of.extend(fixed.clone());
+    let tag_of = countries::nation_tags(&nations.values().copied().collect::<Vec<_>>(), &vanilla::tags(&dirs.game)?)?;
     let country_of_state = |sid: Id| tag_of[&nation_of_state[&sid]].clone();
     let mut nat_adj: BTreeMap<Id, BTreeSet<Id>> = nations.keys().map(|&k| (k, BTreeSet::new())).collect();
     let mut land_links: Vec<(Id, Id)> = Vec::new();
@@ -1081,6 +1059,8 @@ fn build_into(
     let mut name_lines = Vec::new();
     let mut used_flags = HashSet::new();
     let fname_re = Regex::new(r"[^A-Za-z0-9 ]").unwrap();
+    // tag → the history file written for it (the content's goes after it)
+    let mut history_of: BTreeMap<String, String> = BTreeMap::new();
     for nat in &by_rank {
         let t = &tag_of[&nat.id];
         tag_lines.push(format!("{t} = \"countries/Suedtirol_{t}.txt\""));
@@ -1105,6 +1085,7 @@ fn build_into(
         let fname = fname_re.replace_all(&ascii_name(short_name(&nat.name)), "").trim().to_string();
         let fname = if fname.is_empty() { t.clone() } else { fname };
         let oob = if nat.no_units { String::new() } else { format!("oob = \"{t}_1936\"\n") };
+        history_of.insert(t.clone(), format!("history/countries/{t} - {fname}.txt"));
         write(
             &out.join("history/countries").join(format!("{t} - {fname}.txt")),
             &format!(
@@ -1316,6 +1297,10 @@ set_popularities = {{
         write(&out.join("README.txt"), &r)?;
     }
 
+    // ------------------------------------------------------------- content
+    log("nation content");
+    let content_lines = crate::content::build::copy_into(out, map_dir, &history_of)?;
+
     // ------------------------------------------------------------- summary
     let mut tcount: BTreeMap<&str, usize> = BTreeMap::new();
     for t in &terrain_of[1..] {
@@ -1376,6 +1361,7 @@ set_popularities = {{
         let n = p.par_iter().zip(&water_mask).filter(|(v, s)| **v != bitmaps::AUTO && !**s).count();
         report.push(format!("terrain.bmp: {n} px as painted in the editor"));
     }
+    report.extend(content_lines);
     report.extend(warnings);
     report.extend(notes);
     Ok(report)

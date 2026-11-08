@@ -81,6 +81,40 @@ pub struct TagInput<'a> {
     pub km2: f64,
 }
 
+/// The tag of every nation at the build: its own (checked), else one made
+/// from its name ([`make_tags`]) that no vanilla tag (`vanilla`), reserved
+/// word or other nation has.
+pub fn nation_tags(nations: &[&crate::editor::model::Nation], vanilla: &BTreeSet<String>) -> Result<BTreeMap<u32, String>> {
+    let mut taken = vanilla.clone();
+    taken.extend(RESERVED_TAGS.iter().map(|s| s.to_string()));
+    let fixed: BTreeMap<u32, String> = nations.iter().filter_map(|x| x.tag.as_ref().filter(|t| !t.is_empty()).map(|t| (x.id, t.clone()))).collect();
+    let name = |id: u32| nations.iter().find(|n| n.id == id).map(|n| n.name.clone()).unwrap_or_default();
+    for (nid, t) in &fixed {
+        if !tag_ok(t) {
+            anyhow::bail!("tag {t:?} of {}: three capitals or digits, starting with a letter", name(*nid));
+        }
+        if taken.contains(t) {
+            anyhow::bail!("tag {t} of {} is a vanilla tag or a reserved word", name(*nid));
+        }
+    }
+    let mut seen = BTreeSet::new();
+    let dups: BTreeSet<&String> = fixed.values().filter(|t| !seen.insert(*t)).collect();
+    if !dups.is_empty() {
+        anyhow::bail!("two nations have the same tag: {}", dups.into_iter().cloned().collect::<Vec<_>>().join(", "));
+    }
+    let inputs: Vec<TagInput> = nations.iter().filter(|x| !fixed.contains_key(&x.id)).map(|x| TagInput { id: x.id, name: &x.name, place: &x.place, km2: x.km2 }).collect();
+    taken.extend(fixed.values().cloned());
+    let mut out = make_tags(&inputs, &taken);
+    out.extend(fixed);
+    Ok(out)
+}
+
+/// Three capitals or digits, starting with a letter.
+pub fn tag_ok(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() == 3 && b[0].is_ascii_uppercase() && b[1..].iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
 /// A 3-letter tag per nation from the letters of its name in order (Bolzano:
 /// BOL, else BLZ, BOZ, ...), cities and towns first; never one of `taken`.
 pub fn make_tags(nations: &[TagInput], taken: &BTreeSet<String>) -> BTreeMap<u32, String> {

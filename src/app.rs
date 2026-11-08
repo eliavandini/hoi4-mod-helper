@@ -58,6 +58,23 @@ struct Screenshot {
     idle_frames: u32,
 }
 
+/// What the app opens with.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// As the project was left.
+    Project,
+    Editor,
+    Content,
+}
+
+/// The three tools; one is shown at a time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Viewer,
+    Editor,
+    Content,
+}
+
 pub struct App {
     project_path: PathBuf,
     crs: Crs,
@@ -84,10 +101,12 @@ pub struct App {
     screenshot: Option<Screenshot>,
     /// Tool #2, the map editor (when `editor.settings.active`).
     editor: Editor,
+    /// Tool #3, the content of the nations (when `content.settings.active`).
+    content: crate::content::ui::Screen,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, project_arg: Option<PathBuf>, start_editor: bool) -> Self {
+    pub fn new(cc: &eframe::CreationContext, project_arg: Option<PathBuf>, start: Start) -> Self {
         let (jobs_tx, jobs_rx) = crossbeam_channel::unbounded();
         let project_path = project_arg.unwrap_or_else(project::default_project_path);
         let mut app = App {
@@ -117,6 +136,7 @@ impl App {
                 idle_frames: 0,
             }),
             editor: Editor::new(editor::Settings::default()),
+            content: crate::content::ui::Screen::new(Default::default()),
         };
         let pf = if project_path.exists() {
             match ProjectFile::load(&project_path) {
@@ -131,10 +151,17 @@ impl App {
             project::default_project(project::find_maps_dir().as_deref())
         };
         app.apply_project(pf, &cc.egui_ctx);
-        if start_editor {
-            app.editor.settings.active = true;
+        match start {
+            Start::Project => {}
+            Start::Editor => app.set_mode(Mode::Editor, &cc.egui_ctx),
+            Start::Content => app.set_mode(Mode::Content, &cc.egui_ctx),
         }
-        if app.editor.settings.active {
+        // for screenshots: MOD_HELPER_CONTENT=TAG[/page[/what]] opens the content screen there
+        if let Ok(spec) = std::env::var("MOD_HELPER_CONTENT") {
+            app.set_mode(Mode::Content, &cc.egui_ctx);
+            app.content.start_at(&spec);
+        }
+        if app.editor.settings.active || app.content.settings.active {
             app.editor.ensure_open(&cc.egui_ctx);
         }
         if let Some(v) = std::env::var("MOD_HELPER_VIEW").ok() {
@@ -183,14 +210,27 @@ impl App {
             settings.active |= self.editor.settings.active;
         }
         self.editor.settings = settings;
-        if self.editor.settings.active {
+        let content = pf.content.unwrap_or_default();
+        self.content.settings = crate::content::ui::Settings { active: content.active && !self.editor.settings.active, ..content };
+        if self.editor.settings.active || self.content.settings.active {
             self.editor.ensure_open(ctx);
         }
     }
 
-    fn set_editor_active(&mut self, on: bool, ctx: &egui::Context) {
-        self.editor.settings.active = on;
-        if on {
+    fn mode(&self) -> Mode {
+        if self.content.settings.active {
+            Mode::Content
+        } else if self.editor.settings.active {
+            Mode::Editor
+        } else {
+            Mode::Viewer
+        }
+    }
+
+    fn set_mode(&mut self, m: Mode, ctx: &egui::Context) {
+        self.editor.settings.active = m == Mode::Editor;
+        self.content.settings.active = m == Mode::Content;
+        if m != Mode::Viewer {
             self.tool = Tool::Pan;
             self.editor.ensure_open(ctx);
         }
@@ -203,6 +243,7 @@ impl App {
             layers: self.layers.iter().map(|l| l.cfg.clone()).collect(),
             view: Some(self.cam),
             editor: Some(self.editor.settings.clone()),
+            content: Some(self.content.settings.clone()),
         }
     }
 
@@ -448,6 +489,15 @@ impl App {
     // ---------------------------------------------------------------- input
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.content.settings.active {
+            // the content screen has its own keys (Ctrl+S saves the content and the map)
+            let saving = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::S));
+            self.content.shortcuts(ctx, &mut self.editor);
+            if saving {
+                self.save_project();
+            }
+            return;
+        }
         let shortcut = |m, k| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
         if shortcut(Modifiers::COMMAND, Key::S) {
             if self.editor.settings.active && self.editor.is_dirty() {
@@ -583,18 +633,32 @@ impl App {
                 }
             });
             ui.separator();
-            let editing = self.editor.settings.active;
-            if ui.selectable_label(!editing, "🗺 Viewer").on_hover_text("Tool #1: layers of maps and boundaries").clicked() {
-                self.set_editor_active(false, &ctx);
+            let mode = self.mode();
+            let editing = mode == Mode::Editor;
+            if ui.selectable_label(mode == Mode::Viewer, "🗺 Viewer").on_hover_text("Tool #1: layers of maps and boundaries").clicked() {
+                self.set_mode(Mode::Viewer, &ctx);
             }
             if ui.selectable_label(editing, "✏ Map editor")
                 .on_hover_text("Tool #2: provinces, states, nations, air and sea zones, adjacencies of the mod")
                 .clicked()
             {
-                self.set_editor_active(true, &ctx);
+                self.set_mode(Mode::Editor, &ctx);
+            }
+            if ui.selectable_label(mode == Mode::Content, "📜 Nation content")
+                .on_hover_text("Tool #3: focus trees, events, decisions, ideas, characters... of the nations, with checks, imports and a test play")
+                .clicked()
+            {
+                self.set_mode(Mode::Content, &ctx);
             }
             ui.separator();
-            if !editing {
+            if mode == Mode::Content {
+                if self.content.is_dirty() {
+                    ui.label(RichText::new("● unsaved content (Ctrl+S)").color(Color32::from_rgb(255, 190, 90)));
+                }
+                if self.editor.is_dirty() {
+                    ui.label(RichText::new("● unsaved map changes").color(Color32::from_rgb(255, 190, 90)));
+                }
+            } else if !editing {
                 ui.selectable_value(&mut self.tool, Tool::Pan, "✋ Pan").on_hover_text("Drag to pan the map (P / Esc)");
                 ui.selectable_value(&mut self.tool, Tool::MoveLayer, "✥ Move layer")
                     .on_hover_text("Drag to move the selected layer; arrow keys nudge by one pixel, Shift ×10 (M)");
@@ -629,7 +693,13 @@ impl App {
                 ui.spinner();
                 ui.label(format!("loading {loading} layer(s)"));
             }
-            let editor_msg = if self.editor.settings.active { self.editor.message() } else { None };
+            let editor_msg = if self.content.settings.active {
+                self.content.message().or(self.editor.message())
+            } else if self.editor.settings.active {
+                self.editor.message()
+            } else {
+                None
+            };
             if let Some((msg, err)) = editor_msg {
                 ui.separator();
                 let color = if err { Color32::from_rgb(255, 110, 110) } else { ui.visuals().text_color() };
@@ -960,7 +1030,8 @@ impl App {
         let Some(s) = &mut self.screenshot else { return };
         let busy = self.layers.iter().any(|l| l.is_loading())
             || self.tiles.stats().2 > 0
-            || (self.editor.settings.active && self.editor.is_busy());
+            || ((self.editor.settings.active || self.content.settings.active) && self.editor.is_busy())
+            || (self.content.settings.active && self.content.is_busy());
         s.idle_frames = if busy { 0 } else { s.idle_frames + 1 };
         if !s.requested && s.idle_frames > 15 {
             s.requested = true;
@@ -1199,7 +1270,7 @@ impl eframe::App for App {
         self.poll_jobs();
         self.sync_styles();
         self.resolve_missing_georefs();
-        if self.editor.settings.active {
+        if self.editor.settings.active || self.content.settings.active {
             self.editor.poll(&ctx);
         }
         let mut live: FxHashMap<u64, u64> = self.layers.iter().filter_map(|l| l.raster().map(|r| (l.id, r.generation))).collect();
@@ -1210,7 +1281,11 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().close_requested()) && self.editor.is_dirty() && !self.editor.close_ok && self.screenshot.is_none() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.editor.ask_close = true;
-            self.editor.settings.active = true;
+            self.set_mode(Mode::Editor, &ctx);
+        } else if ctx.input(|i| i.viewport().close_requested()) && self.content.is_dirty() && !self.content.close_ok && self.screenshot.is_none() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.content.ask_close = true;
+            self.set_mode(Mode::Content, &ctx);
         }
         self.tiles.begin_frame(&ctx, &live);
         if self.screenshot.is_none() {
@@ -1220,15 +1295,30 @@ impl eframe::App for App {
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
-        if self.editor.settings.active {
-            let (editor, layers) = (&mut self.editor, &mut self.layers);
-            egui::Panel::right("editor_side").default_size(440.0).show(ui, |ui| editor.side_panel(ui, layers));
-        } else {
-            egui::Panel::right("side").default_size(380.0).show(ui, |ui| self.side_panel(ui));
+        match self.mode() {
+            Mode::Content => {
+                let (content, editor) = (&mut self.content, &mut self.editor);
+                egui::CentralPanel::default().show(ui, |ui| content.ui(ui, editor));
+            }
+            Mode::Editor => {
+                let (editor, layers) = (&mut self.editor, &mut self.layers);
+                egui::Panel::right("editor_side").default_size(440.0).show(ui, |ui| editor.side_panel(ui, layers));
+                egui::CentralPanel::no_frame().show(ui, |ui| self.map_view(ui));
+            }
+            Mode::Viewer => {
+                egui::Panel::right("side").default_size(380.0).show(ui, |ui| self.side_panel(ui));
+                egui::CentralPanel::no_frame().show(ui, |ui| self.map_view(ui));
+            }
         }
-        egui::CentralPanel::no_frame().show(ui, |ui| self.map_view(ui));
         self.help_window(&ctx);
         self.editor.windows(&ctx);
+        // the build copies the nation content from disk: what is not saved goes in first
+        if self.editor.take_build_wanted() {
+            if self.content.is_dirty() {
+                self.content.save(&mut self.editor);
+            }
+            self.editor.start_build(&ctx);
+        }
 
         self.tiles.end_frame();
         if self.layers.iter().any(|l| l.is_loading()) {

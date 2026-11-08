@@ -26,6 +26,9 @@ pub struct ProjectFile {
     /// Map editor settings (and whether it was open).
     #[serde(default)]
     pub editor: Option<crate::editor::Settings>,
+    /// Nation content screen settings (and whether it was open).
+    #[serde(default)]
+    pub content: Option<crate::content::ui::Settings>,
 }
 
 impl ProjectFile {
@@ -52,7 +55,7 @@ impl ProjectFile {
                 l
             })
             .collect();
-        let out = ProjectFile { version: VERSION, crs: self.crs, layers, view: self.view, editor: self.editor.clone() };
+        let out = ProjectFile { version: VERSION, crs: self.crs, layers, view: self.view, editor: self.editor.clone(), content: self.content.clone() };
         let json = serde_json::to_string_pretty(&out)?;
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, json).with_context(|| format!("cannot write {}", tmp.display()))?;
@@ -138,5 +141,5 @@ pub fn default_project(maps_dir: Option<&Path>) -> ProjectFile {
         pbfs.sort();
         layers.extend(pbfs.into_iter().map(LayerConfig::new));
     }
-    ProjectFile { version: VERSION, crs: Crs::LAEA_EUROPE, layers, view: None, editor: None }
+    ProjectFile { version: VERSION, crs: Crs::LAEA_EUROPE, layers, view: None, editor: None, content: None }
 }

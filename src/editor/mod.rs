@@ -8,6 +8,7 @@
 //! name, version, tags... from "Mod details".
 
 pub mod build;
+mod content_link;
 pub mod density;
 pub mod doc;
 pub mod from_image;
@@ -47,6 +48,7 @@ use crate::util::Progress;
 use crate::view::{self, DrawCtx};
 
 use density::{Terrain, TerrainRule};
+pub use content_link::{MapFacts, NationInfo};
 use doc::Doc;
 use model::{Adjacency, Id, Kind, Nation, Province, Region, State};
 use ops::{Constraint, GenParams, Retile};
@@ -427,6 +429,8 @@ pub struct Editor {
     hover: Option<[f64; 2]>,
     msg: Option<(String, bool, Instant)>,
     build: Option<build::BuildJob>,
+    /// A build was asked for: the app saves the nation content, then starts it.
+    build_wanted: bool,
     show_build: bool,
     /// The open "Mod details" window.
     meta: Option<MetaEdit>,
@@ -542,6 +546,7 @@ impl Editor {
             hover: None,
             msg: None,
             build: None,
+            build_wanted: false,
             show_build: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "play"),
             meta: None,
             thumb: None,
@@ -601,6 +606,19 @@ impl Editor {
     }
 
     /// Unsaved changes, including edits not yet applied in the panels.
+    /// A build asked for since the last call (the app starts it with [`Editor::start_build`]).
+    pub fn take_build_wanted(&mut self) -> bool {
+        std::mem::take(&mut self.build_wanted)
+    }
+
+    /// Start building the mod from the saved map (and its saved nation content).
+    pub fn start_build(&mut self, ctx: &egui::Context) {
+        if let Some(doc) = &self.doc {
+            self.build = Some(build::start(&doc.dir, self.dirs(), ctx));
+            self.show_build = true;
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.doc.as_ref().is_some_and(|d| d.dirty) || (self.doc.is_some() && self.edits_pending())
     }
@@ -961,10 +979,9 @@ impl Editor {
                 if self.is_dirty() {
                     self.save();
                 }
-                if let Some(doc) = &self.doc {
-                    self.build = Some(build::start(&doc.dir, self.dirs(), ctx));
-                    self.show_build = true;
-                }
+                self.build_wanted = self.doc.is_some();
+                self.show_build |= self.build_wanted;
+                ctx.request_repaint();
             }
             Act::Undo => {
                 if let Some(l) = self.doc.as_mut().and_then(|d| d.undo()) {

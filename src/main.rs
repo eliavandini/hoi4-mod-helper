@@ -2,6 +2,7 @@
 //! Trentino. The first tool is a layer viewer for rasters and OSM boundaries.
 
 mod app;
+mod content;
 mod editor;
 mod geo;
 mod modbuild;
@@ -22,6 +23,7 @@ const USAGE: &str = "\
 usage:
   mod-helper [PROJECT.project.json]     open the map viewer (default project next to the crate)
   mod-helper --editor [PROJECT]         open with the map editor (maps/processed maps/suedtirol)
+  mod-helper --content [PROJECT]        open with the nation content screen (focus trees, events...)
   mod-helper --info FILE...             print size, format and georeference of rasters
   mod-helper --extract-osm FILE.pbf...  extract (and cache) admin boundaries from OSM extracts
   mod-helper --export-geojson IN OUT.geojson [LON0,LAT0,LON1,LAT1]
@@ -50,13 +52,14 @@ fn main() -> anyhow::Result<()> {
         Some("--export-geojson") => cli_export_geojson(&args[1..]),
         Some("--build-mod") => cli_build_mod(&args[1..]),
         Some("--validate-mod") => cli_validate_mod(&args[1..]),
-        Some("--editor") => run_gui(args.get(1).map(PathBuf::from), true),
+        Some("--editor") => run_gui(args.get(1).map(PathBuf::from), app::Start::Editor),
+        Some("--content") => run_gui(args.get(1).map(PathBuf::from), app::Start::Content),
         Some(a) if a.starts_with("--") => anyhow::bail!("unknown option {a}\n{USAGE}"),
-        other => run_gui(other.map(PathBuf::from), false),
+        other => run_gui(other.map(PathBuf::from), app::Start::Project),
     }
 }
 
-fn run_gui(project: Option<PathBuf>, editor: bool) -> anyhow::Result<()> {
+fn run_gui(project: Option<PathBuf>, start: app::Start) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("mod-helper · map viewer")
@@ -64,7 +67,7 @@ fn run_gui(project: Option<PathBuf>, editor: bool) -> anyhow::Result<()> {
             .with_inner_size([1600.0, 1000.0]),
         ..Default::default()
     };
-    eframe::run_native("mod-helper", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, project, editor)))))
+    eframe::run_native("mod-helper", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, project, start)))))
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
 

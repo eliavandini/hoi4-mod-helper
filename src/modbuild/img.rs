@@ -178,6 +178,11 @@ pub fn write_bmp24(path: &Path, w: u32, h: u32, rgb: &[u8]) -> Result<()> {
 
 /// Uncompressed 32-bit DDS (B8G8R8A8, no mipmaps) from RGBA pixels.
 pub fn write_dds_rgba(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
+    write_file(path, &dds_rgba_bytes(w, h, rgba))
+}
+
+/// The bytes of an uncompressed 32-bit DDS (B8G8R8A8, no mipmaps) from RGBA pixels.
+pub fn dds_rgba_bytes(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     let mut b = Vec::with_capacity(128 + rgba.len());
     b.extend_from_slice(b"DDS ");
     for v in [124u32, 0x100f, h, w, w * 4, 0, 0] {
@@ -192,7 +197,7 @@ pub fn write_dds_rgba(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
     b[128..].par_chunks_mut(4).zip(rgba.par_chunks(4)).for_each(|(o, i)| {
         o.copy_from_slice(&[i[2], i[1], i[0], i[3]]);
     });
-    write_file(path, &b)
+    b
 }
 
 /// Size of a DDS file and whether it is uncompressed 32-bit with alpha.
@@ -224,22 +229,56 @@ pub fn dds_info(path: &Path) -> Result<(u32, u32, &'static str)> {
 /// The top level of a DDS file as RGBA: uncompressed 24/32-bit, DXT1, DXT3, DXT5.
 pub fn read_dds(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     let b = std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    read_dds_bytes(&b, &path.display().to_string())
+}
+
+/// [`read_dds`] of a file's bytes (`name` for messages). DX10 headers with
+/// B8G8R8A8, R8G8B8A8 and BC1-3 are read too.
+pub fn read_dds_bytes(b: &[u8], name: &str) -> Result<(u32, u32, Vec<u8>)> {
     if b.len() < 128 || &b[0..4] != b"DDS " {
-        bail!("{} is not a DDS file", path.display());
+        bail!("{name} is not a DDS file");
     }
-    let (h, w) = (u32le(&b, 12) as usize, u32le(&b, 16) as usize);
-    let pf = u32le(&b, 80);
-    let data = &b[128..];
+    let (h, w) = (u32le(b, 12) as usize, u32le(b, 16) as usize);
+    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+        bail!("{name}: DDS of {w}x{h}");
+    }
+    let pf = u32le(b, 80);
+    let mut data = &b[128..];
     let mut out = vec![0u8; w * h * 4];
+    let mut four: [u8; 4] = b[84..88].try_into().unwrap();
+    let mut dx10_rgba = None;
+    if pf & 0x4 != 0 && &four == b"DX10" {
+        if b.len() < 148 {
+            bail!("{name}: truncated DDS");
+        }
+        data = &b[148..];
+        match u32le(b, 128) {
+            71 | 72 => four = *b"DXT1",
+            74 | 75 => four = *b"DXT3",
+            77 | 78 => four = *b"DXT5",
+            87 | 91 => dx10_rgba = Some(true),
+            28 | 29 => dx10_rgba = Some(false),
+            f => bail!("{name}: unsupported DDS format (DXGI {f})"),
+        }
+    }
+    if let Some(bgra) = dx10_rgba {
+        if data.len() < w * h * 4 {
+            bail!("{name}: truncated DDS");
+        }
+        out.par_chunks_mut(4).zip(data.par_chunks(4)).for_each(|(o, i)| {
+            if bgra { o.copy_from_slice(&[i[2], i[1], i[0], i[3]]) } else { o.copy_from_slice(i) }
+        });
+        return Ok((w as u32, h as u32, out));
+    }
     if pf & 0x4 != 0 {
-        let four = &b[84..88];
+        let four = &four[..];
         let block = if four == b"DXT1" { 8 } else { 16 };
         if four != b"DXT1" && four != b"DXT3" && four != b"DXT5" {
-            bail!("{}: unsupported DDS compression {:?}", path.display(), String::from_utf8_lossy(four));
+            bail!("{name}: unsupported DDS compression {:?}", String::from_utf8_lossy(four));
         }
         let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
         if data.len() < bw * bh * block {
-            bail!("{}: truncated DDS", path.display());
+            bail!("{name}: truncated DDS");
         }
         out.par_chunks_mut(w * 4 * 4).enumerate().for_each(|(by, rows)| {
             for bx in 0..bw {
@@ -267,14 +306,14 @@ pub fn read_dds(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
             }
         });
     } else {
-        let bits = u32le(&b, 88) as usize;
+        let bits = u32le(b, 88) as usize;
         if bits != 32 && bits != 24 {
-            bail!("{}: unsupported {bits}-bit DDS", path.display());
+            bail!("{name}: unsupported {bits}-bit DDS");
         }
-        let masks = [u32le(&b, 92), u32le(&b, 96), u32le(&b, 100), if pf & 0x1 != 0 { u32le(&b, 104) } else { 0 }];
+        let masks = [u32le(b, 92), u32le(b, 96), u32le(b, 100), if pf & 0x1 != 0 { u32le(b, 104) } else { 0 }];
         let bb = bits / 8;
         if data.len() < w * h * bb {
-            bail!("{}: truncated DDS", path.display());
+            bail!("{name}: truncated DDS");
         }
         let chan = |v: u32, m: u32| -> u8 {
             if m == 0 {
@@ -366,6 +405,60 @@ pub fn write_tga_rgba(path: &Path, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
     b.extend_from_slice(&[0; 8]);
     b.extend_from_slice(b"TRUEVISION-XFILE.\0");
     write_file(path, &b)
+}
+
+/// A TGA file as RGBA: true colour (24/32-bit) or grey, plain or RLE, rows
+/// either way up.
+pub fn read_tga_bytes(b: &[u8], name: &str) -> Result<(u32, u32, Vec<u8>)> {
+    if b.len() < 18 {
+        bail!("{name}: not a TGA file");
+    }
+    let (idlen, cmap, kind) = (b[0] as usize, b[1], b[2]);
+    let (w, h, bpp, desc) = (u16le(b, 12) as usize, u16le(b, 14) as usize, b[16] as usize, b[17]);
+    if cmap != 0 || !matches!(kind, 2 | 3 | 10 | 11) || !matches!(bpp, 8 | 24 | 32) || w == 0 || h == 0 {
+        bail!("{name}: unsupported TGA (type {kind}, {bpp} bits)");
+    }
+    let bb = bpp / 8;
+    let mut px = Vec::with_capacity(w * h * bb);
+    let mut i = 18 + idlen;
+    if kind >= 9 {
+        while px.len() < w * h * bb && i < b.len() {
+            let c = b[i] as usize;
+            i += 1;
+            let n = (c & 127) + 1;
+            if c & 128 != 0 {
+                let p = b.get(i..i + bb).with_context(|| format!("{name}: truncated TGA"))?;
+                for _ in 0..n {
+                    px.extend_from_slice(p);
+                }
+                i += bb;
+            } else {
+                px.extend_from_slice(b.get(i..i + n * bb).with_context(|| format!("{name}: truncated TGA"))?);
+                i += n * bb;
+            }
+        }
+    } else {
+        px.extend_from_slice(b.get(i..i + w * h * bb).with_context(|| format!("{name}: truncated TGA"))?);
+    }
+    px.truncate(w * h * bb);
+    if px.len() < w * h * bb {
+        bail!("{name}: truncated TGA");
+    }
+    let top_down = desc & 0x20 != 0;
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let sy = if top_down { y } else { h - 1 - y };
+        for x in 0..w {
+            let s = &px[(sy * w + x) * bb..][..bb];
+            let o = &mut out[(y * w + x) * 4..][..4];
+            match bb {
+                1 => o.copy_from_slice(&[s[0], s[0], s[0], 255]),
+                3 => o.copy_from_slice(&[s[2], s[1], s[0], 255]),
+                _ => o.copy_from_slice(&[s[2], s[1], s[0], s[3]]),
+            }
+        }
+    }
+    Ok((w as u32, h as u32, out))
 }
 
 /// Width, height and bits per pixel of a TGA file.

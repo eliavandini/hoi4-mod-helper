@@ -8,8 +8,13 @@ Map tools for the Tyrol / Trentino HOI4 total conversion:
 2. a **map editor** for the mod's map: provinces, states, nations, air and sea
    zones, adjacencies, state and nation properties, and inaccessible zones
    (see [Map editor](#map-editor));
-3. the **mod builder**: makes the HOI4 mod from the edited map and checks it
-   (see [Building the mod](#building-the-mod)). No Python needed.
+3. a **nation content** editor: focus trees (visual), events, decisions,
+   ideas, characters and the rest of what nations have, with checks, imports
+   from the base game and other mods, and exports (see
+   [Nation content](#nation-content));
+4. the **mod builder**: makes the HOI4 mod from the edited map and its
+   content and checks it (see [Building the mod](#building-the-mod)). No
+   Python needed.
 
 ## Running
 
@@ -17,6 +22,7 @@ Map tools for the Tyrol / Trentino HOI4 total conversion:
 cargo run --release                     # opens mod-helper.project.json (created on first run)
 cargo run --release -- other.project.json
 cargo run --release -- --editor         # start in the map editor
+cargo run --release -- --content        # start in the nation content screen
 cargo run --release -- --info "../maps/processed maps/provinces.bmp"   # headless file info
 cargo run --release -- --extract-osm "../maps/osm regions/austria-latest.osm.pbf"
 cargo run --release -- --build-mod      # build the mod from the editor's map, then check it
@@ -435,6 +441,133 @@ beside it. The setting is stored as `"map_frame"` in `provinces.json`.
 | Esc | clear the selection (while drawing a lasso loop: drop the loop) |
 | lasso: hold / click; Enter or double-click; Backspace | draw freehand / add a corner; close the loop; take back its last part |
 
+## Nation content
+
+📜 **Nation content** (or `--content`) edits what the nations of the map
+have in the game beyond the map: focus trees, events, decisions, ideas,
+characters, country history, division templates and some 30 more kinds. It
+does what the Python `hoi4-modmaker` does.
+
+Content lives in the map folder, `<map>/content/<package>/`. There is one
+package per nation (its tag) and `shared` for the whole mod's own. Each is
+laid out like a mod (`common/`, `events/`, `history/`, `localisation/`,
+`gfx/`, `interface/`). It is read into memory when the screen opens, edited
+there with its own undo / redo, and written by Save (Ctrl+S, which also
+saves the map). A file that is overwritten or deleted goes to
+`content/.backups/<time>/` first. Packages are named by tag, so a nation
+with content gets the tag the build gives it fixed in the map. The map then
+has unsaved changes.
+
+The nations are down the left. For the one picked:
+
+- **Overview:** its tag, capital and states, how much content of each kind
+  it has, new definitions, and its import, export and check.
+- **Focus trees:** the tree as the game draws it: icons on the 96 × 130 grid,
+  prerequisite lines (dashed where one of several is enough), red links
+  between focuses that exclude each other, and the continuous focus box.
+  - Modes: **S**elect (click, Shift/Ctrl-click, drag a box; drag focuses to
+    move them on the grid), **L**ink (click a focus, then the one that needs
+    it; Shift: one of several), **E**xclusive (click two focuses), **A**dd
+    (click an empty cell), **P**an.
+  - Keys: wheel zooms, the middle button pans, Delete removes the selection
+    and what names it, Ctrl+D duplicates, arrows nudge (Shift: 5 cells),
+    F fits.
+  - Also: the inspector of the selected focus (every field, with a game-like
+    preview), right-click menu, find, outline, minimap, DLC filter, hidden
+    focuses, tidy (an automatic layout that leaves no overlaps), copy or
+    shift a branch, new trees, and the tree's checks.
+  - **Play** mode: click focuses to complete them and see what is available
+    next, what still waits for its prerequisites, and what a mutually
+    exclusive choice shut off.
+  - Export: a PNG of the whole tree. Import: a tree from a draw.io diagram.
+- **Kinds:** a list with filter and groups, then one definition as a form
+  (fields with help, sprite pictures and a sprite picker, links to what the
+  ids name, a preview of events, ideas and decisions) or as code
+  (highlighted, with errors marked).
+  New, duplicate, rename, delete, copy to another nation.
+- **Wizards** (🪄 next to a script field, and "Insert…" on the code tab):
+  build script without writing it by hand. What they add goes into the
+  field where the cursor was (or replaces it, for fields that are a list),
+  as one undo step.
+  - Effects, conditions and modifiers: the common ones by topic with a form
+    for their values (nations, states, ids of the content and the base game
+    to pick from), and every effect, trigger and modifier of the game's own
+    documentation, filtered by scope or category, with its description and
+    example. Conditions can be negated.
+  - Wrappers for what was built: `if` (its condition built the same way),
+    `hidden_effect`, for a country, a state, every owned state, with a
+    chance; OR / NOT / AND for conditions.
+  - Fields with their own page: AI weights and mean time to happen (a base,
+    then factors or additions when conditions hold), the focus tree's
+    `country`, prerequisites and mutually exclusive focuses (tick them),
+    a country's politics, popularities (sliders), technologies, ideas,
+    research bonus, search filters, and the battalions of a division
+    template (placed in the free slots, with a grid preview).
+- **Sprite picker:** every focus icon, idea and event picture, portrait and
+  decision icon, of the content and the base game. Filter by words of the
+  name or the file, by kind, by whose; a sidebar with the folders of the
+  pictures (with counts) narrows it to one folder; thumbnails can be made
+  bigger or smaller.
+- **Localisation:** every key with its text in two languages, what needs
+  one and what uses it. Filter missing, untranslated or unused keys; fill
+  from the other language or from the ids.
+- **Files:** the package's files as they are, with a text editor; add and
+  delete files.
+
+For the whole project:
+
+- **Check:** the content against itself, the map and the base game.
+  - Ids that are named but defined nowhere, or defined twice.
+  - Focus trees: cycles, overlaps, unreachable focuses, mutually exclusive
+    focuses that need each other.
+  - Events nothing fires or that cannot be closed; decisions with no
+    category.
+  - Tags no nation or base-game country has; states and provinces the map
+    does not have.
+  - Missing localisation, icons, pictures and texture files; script that
+    does not parse.
+
+  Errors, warnings and notes can be filtered by kind and package and copied
+  as text. Every row opens the file at its line, or the definition.
+- **Import:** from the base game, a mod of the game's mod folder (folders
+  and `.zip`), any folder, a bundle, or another nation.
+  - Browse by kind, filter, and pick definitions (or all of a tag's) with a
+    preview.
+  - The plan then follows what they use (events, ideas, characters,
+    scripted effects, traits, ...). It renames the source's tag to the
+    nation's and ids that would clash. It brings their localisation, and
+    the sprites and pictures of a mod; the base game's stay in the game.
+  - Country history loses what is about the source's map (capital, states,
+    armies).
+  - Everything is shown before it is applied, as one undo step.
+- **Export and copy:** a nation's content as a bundle (`.zip`, imported
+  again elsewhere), as plain files in a folder (existing files are never
+  overwritten), or into another nation (a plan, as in Import).
+- **Test play and errors:**
+  1. Check.
+  2. Save and build the mod.
+  3. Play from the build window.
+  4. Read the game's `error.log`. It is read again when it changes, shows
+     the lines about the content (or all of them), and each line links to
+     the file it names.
+- **Tools:**
+  - Find & replace (words or regex, over all text).
+  - Rename or delete an id everywhere, and see where it is named.
+  - Change a nation's tag throughout.
+  - The graph of event chains.
+  - A gallery of focus icons, idea and event pictures and portraits, the
+    base game's too.
+  - The sprite check: named but undefined, defined without a picture,
+    unused.
+  - Statistics.
+  - What changed since the last save, with snapshots to restore.
+  - What a mod has in common with the content (ids, files, tags).
+  - An icon maker (focus, idea, event, portrait) that writes the DDS and its
+    sprite.
+
+The base game is read in the background when the screen opens (about 1 s).
+Until then, checks and imports that need it wait.
+
 ## Building the mod
 
 "Build mod" in the editor (or `--build-mod [MAP_DIR] [--game DIR] [--mods
@@ -459,7 +592,17 @@ It writes `<mods>/<folder>/` and `<mods>/<folder>.mod`:
 - **countries:** one per nation, with tag, colour unlike its neighbours',
   procedural flag, and name lists by language;
 - **other:** the bookmark, localisation, a tutorial pointed at this map (the
-  vanilla one crashes on a new map), `descriptor.mod`, thumbnail, README.
+  vanilla one crashes on a new map), `descriptor.mod`, thumbnail, README;
+- **content:** the files of `<map>/content/`, `shared` first, then each
+  nation's.
+  - A nation's `history/countries/` file goes after the history the build
+    writes for it, so what it says wins.
+  - A script or localisation file with the name of a built one is written
+    under another name (`x_TYR.txt`), so both are read.
+  - Any other file replaces the built one (a flag of your own), with a line
+    in the build log.
+  - Content for a tag no nation has stops the build.
+  - Unsaved content is saved first.
 
 Values set in the editor win over derived ones. The new folder is built next
 to the old one and swapped in at the end, so a failed build keeps the last
@@ -557,6 +700,16 @@ top, in metres.
 | `modbuild/bitmaps.rs` | `terrain.bmp` and `heightmap.bmp` as the build makes them, painted terrain and imported heightmaps, vanilla's terrain indices and palette |
 | `modbuild/img.rs` | BMP / DDS / TGA I/O, Pillow-equivalent resampling, distance transform |
 | `modbuild/vanilla.rs`, `countries.rs`, `rail.rs` | samples from the game; tags, colours, flags; railway graph |
+| `content/script.rs`, `loc.rs` | the game's script (lossless parse, spans for edits) and localisation files |
+| `content/kinds.rs` | the kinds of content: where they live, how definitions are found, their fields, templates |
+| `content/store.rs` | the content packages in memory: files, definitions, undo / redo, save with backups |
+| `content/source.rs`, `import.rs` | the base game, mods, folders and bundles as sources; import plans (follow, rename, localisation, sprites) |
+| `content/focus.rs`, `drawio.rs` | focus trees: layout, checks, play, edits; trees from draw.io |
+| `content/docs.rs`, `wizard.rs` | the game's documentation of effects, triggers and modifiers; the wizards' catalog, roles of fields, and how built script is merged in |
+| `content/validate.rs`, `errlog.rs` | the content checks; the game's `error.log` |
+| `content/refactor.rs`, `gfx.rs`, `zip.rs`, `build.rs` | renames, deletes, find & replace; sprites and pictures; bundles; the content in the built mod |
+| `content/ui/` | the screen: nations, forms and code editor, wizards and the sprite picker, the focus tree canvas, check, import / export, test play, tools |
+| `editor/content_link.rs` | what the content screen asks of the map: nations, tags, states, the build |
 
 Rasters sit behind `Arc<RwLock<Raster>>` and tiles are keyed by
 `(layer, level, x, y)`, so editing tools can change pixels and invalidate only
