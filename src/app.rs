@@ -172,6 +172,10 @@ impl App {
                 app.keep_view = true;
             }
         }
+        // for screenshots: MOD_HELPER_LAYER=NAME selects that layer (its properties show)
+        if let Ok(name) = std::env::var("MOD_HELPER_LAYER") {
+            app.selected = app.layers.iter().find(|l| l.cfg.name == name).map(|l| l.id);
+        }
         app
     }
 
@@ -305,6 +309,9 @@ impl App {
                 Ok(JobOutput::Vector(v)) => {
                     for &lvl in v.level_counts.keys() {
                         layer.cfg.vector_style.level(lvl);
+                    }
+                    for &w in v.water_counts.keys() {
+                        layer.cfg.vector_style.water_mut(w);
                     }
                     layer.state = LayerState::Ready(LayerData::Vector(v));
                 }
@@ -1076,7 +1083,7 @@ fn layer_properties(ui: &mut egui::Ui, layer: &mut Layer, others: &[(String, Geo
             ui.label(format!("{} × {} px · {} · {}", r.width, r.height, r.format, util::fmt_bytes(r.bytes)));
         }
         LayerState::Ready(LayerData::Vector(v)) => {
-            ui.label(format!("{} boundary ways · {} points · {} named areas", v.ways.len(), v.n_points, v.areas.len()));
+            ui.label(format!("{} boundary ways · {} water lines · {} points · {} named areas", v.ways.len(), v.water.len(), v.n_points, v.areas.len()));
         }
     }
 
@@ -1166,6 +1173,21 @@ fn layer_properties(ui: &mut egui::Ui, layer: &mut Layer, others: &[(String, Geo
                         ui.end_row();
                     }
                 });
+                if !v.water_counts.is_empty() {
+                    ui.label(RichText::new("Water (drawn under the boundaries):").small());
+                    egui::Grid::new("water").num_columns(2).striped(true).show(ui, |ui| {
+                        for w in osm::Water::ALL {
+                            let Some(&count) = v.water_counts.get(&w) else { continue };
+                            let ls = style.water_mut(w);
+                            ui.checkbox(&mut ls.visible, format!("{} ({count})", w.label()));
+                            let mut c = Color32::from_rgba_unmultiplied(ls.color[0], ls.color[1], ls.color[2], ls.color[3]);
+                            if ui.color_edit_button_srgba(&mut c).changed() {
+                                ls.color = c.to_srgba_unmultiplied();
+                            }
+                            ui.end_row();
+                        }
+                    });
+                }
             });
         }
         _ => {}

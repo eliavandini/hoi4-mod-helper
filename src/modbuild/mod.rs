@@ -19,6 +19,7 @@
 //! next to the old one and swapped in at the end; a folder of that name is
 //! only replaced if mod-helper (or make_map_mod.py) made it.
 
+pub mod ambient;
 pub mod bitmaps;
 pub mod countries;
 pub mod img;
@@ -904,7 +905,31 @@ fn build_into(
             (cc as f64 + 0.5, h as f64 - rr as f64 - 0.5)
         })
         .collect();
-    write(&mapdir.join("ambient_object.txt"), &ambient_objects(&dirs.game, d.map_frame(), &water)?)?;
+    let mut ambient_txt = ambient_objects(&dirs.game, d.map_frame(), &water)?;
+    // the 3D objects placed in the editor, on the ground (or the water) as built
+    let mut ambient_line = None;
+    if !d.ambient.is_empty() {
+        log("ambient objects: reading the game's models");
+        let cat = crate::models::catalog::Catalog::load(crate::models::catalog::Catalog::roots(&dirs.game, Some(&map_dir.join("content"))));
+        let ground = |x: f32, y: f32| {
+            let (c, r) = ((x.max(0.0) as usize).min(w - 1), (y.max(0.0) as usize).min(h - 1));
+            let i = r * w + c;
+            if water_mask[i] { WATER as f64 / 10.0 } else { height[i].max(WATER) as f64 / 10.0 }
+        };
+        let b = ambient::objects(&d.ambient, h, &ground, Some(&cat));
+        ambient_txt += &b.blocks;
+        if let Some(a) = &b.asset {
+            write(&out.join("gfx/entities/mod_helper_ambient.asset"), a)?;
+        }
+        warnings.extend(b.warnings);
+        ambient_line = Some(format!(
+            "{} ambient objects in {} types{}",
+            d.ambient.len(),
+            b.types,
+            if b.asset.is_some() { " (entities made in gfx/entities/mod_helper_ambient.asset)" } else { "" }
+        ));
+    }
+    write(&mapdir.join("ambient_object.txt"), &ambient_txt)?;
 
     // railways: as laid in the editor, else a minimum spanning tree over
     // neighbouring passable states (any owner), each link the shortest land
@@ -1361,6 +1386,7 @@ set_popularities = {{
         let n = p.par_iter().zip(&water_mask).filter(|(v, s)| **v != bitmaps::AUTO && !**s).count();
         report.push(format!("terrain.bmp: {n} px as painted in the editor"));
     }
+    report.extend(ambient_line);
     report.extend(content_lines);
     report.extend(warnings);
     report.extend(notes);

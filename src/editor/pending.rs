@@ -130,7 +130,7 @@ impl Editor {
     /// Edits in the panels or the Mod details window that are not in the
     /// map yet (they count as unsaved).
     pub(super) fn edits_pending(&self) -> bool {
-        self.draft_pending() || self.river_name_pending() || self.meta.as_ref().is_some_and(|e| e.m != e.orig)
+        self.draft_pending() || self.river_name_pending() || self.object_edits_pending() || self.meta.as_ref().is_some_and(|e| e.m != e.orig)
     }
 
     /// Put the properties panel's edits into the map (one undo step).
@@ -159,6 +159,7 @@ impl Editor {
         }
         self.flush_draft();
         self.flush_river_name();
+        self.flush_object_name();
     }
 
     /// Mod details changed in their window but not applied: apply them if

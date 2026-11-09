@@ -1,5 +1,5 @@
-//! Display-ready vector data: boundaries projected into the project CRS with
-//! precomputed level-of-detail simplifications.
+//! Display-ready vector data: boundaries, rivers and lake outlines projected
+//! into the project CRS with precomputed level-of-detail simplifications.
 
 use std::collections::BTreeMap;
 
@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::geo::Crs;
-use crate::osm::OsmBoundaries;
+use crate::osm::{OsmBoundaries, Water};
 
 /// Simplification tolerances (world units, i.e. metres) of the LOD levels.
 pub const LOD_TOL: [f32; 7] = [1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0];
@@ -17,8 +17,12 @@ pub struct VectorData {
     pub origin: [f64; 2],
     pub ways: Vec<VWay>,
     pub areas: Vec<VArea>,
+    /// Rivers, canals and the outlines of rivers and lakes (lakes first).
+    pub water: Vec<VWater>,
     /// Number of ways per admin level.
     pub level_counts: BTreeMap<u8, usize>,
+    /// Number of water lines per kind.
+    pub water_counts: BTreeMap<Water, usize>,
     /// World bounds: min x, min y, max x, max y.
     pub bounds: [f64; 4],
     pub n_points: usize,
@@ -30,6 +34,27 @@ pub struct VWay {
     pub bbox: [f32; 4],
     /// `lods[i]` is simplified with tolerance `LOD_TOL[i]`.
     pub lods: Vec<Vec<[f32; 2]>>,
+}
+
+pub struct VWater {
+    pub kind: Water,
+    /// Relative to `origin`: min x, min y, max x, max y.
+    pub bbox: [f32; 4],
+    /// `lods[i]` is simplified with tolerance `LOD_TOL[i]`.
+    pub lods: Vec<Vec<[f32; 2]>>,
+}
+
+/// The simplifications of a line, `LOD_TOL[i]` for the i-th.
+fn lods_of(pts: &[[f32; 2]]) -> Vec<Vec<[f32; 2]>> {
+    let mut lods = Vec::with_capacity(LOD_TOL.len());
+    let mut cur = simplify(pts, LOD_TOL[0]);
+    for &tol in &LOD_TOL[1..] {
+        let next = simplify(&cur, tol);
+        lods.push(cur);
+        cur = next;
+    }
+    lods.push(cur);
+    lods
 }
 
 pub struct VArea {
@@ -46,7 +71,7 @@ impl VectorData {
             Some([x, y])
         };
         // Local origin: first projectable point (keeps f32 coordinates precise).
-        let origin = b.ways.iter().flat_map(|w| w.coords.first()).find_map(|&c| project(c)).unwrap_or([0.0, 0.0]);
+        let origin = b.ways.iter().flat_map(|w| w.coords.first()).chain(b.water.iter().flat_map(|w| w.coords.first())).find_map(|&c| project(c)).unwrap_or([0.0, 0.0]);
         let rel = |p: [f64; 2]| [(p[0] - origin[0]) as f32, (p[1] - origin[1]) as f32];
 
         let ways: Vec<VWay> = b
@@ -57,15 +82,15 @@ impl VectorData {
                 if pts.len() < 2 {
                     return None;
                 }
-                let mut lods = Vec::with_capacity(LOD_TOL.len());
-                let mut cur = simplify(&pts, LOD_TOL[0]);
-                for &tol in &LOD_TOL[1..] {
-                    let next = simplify(&cur, tol);
-                    lods.push(cur);
-                    cur = next;
-                }
-                lods.push(cur);
-                Some(VWay { level: w.level, bbox: bbox_of(&pts), lods })
+                Some(VWay { level: w.level, bbox: bbox_of(&pts), lods: lods_of(&pts) })
+            })
+            .collect();
+        let water: Vec<VWater> = b
+            .water
+            .par_iter()
+            .filter_map(|w| {
+                let pts: Vec<[f32; 2]> = w.coords.iter().filter_map(|&c| project(c)).map(rel).collect();
+                (pts.len() >= 2).then(|| VWater { kind: w.kind, bbox: bbox_of(&pts), lods: lods_of(&pts) })
             })
             .collect();
 
@@ -85,19 +110,28 @@ impl VectorData {
         areas.sort_by_key(|a| a.level);
 
         let mut level_counts = BTreeMap::new();
+        let mut water_counts = BTreeMap::new();
         let mut bounds = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
         let mut n_points = 0;
+        let mut grow = |bb: [f32; 4]| {
+            bounds = [
+                bounds[0].min(origin[0] + bb[0] as f64),
+                bounds[1].min(origin[1] + bb[1] as f64),
+                bounds[2].max(origin[0] + bb[2] as f64),
+                bounds[3].max(origin[1] + bb[3] as f64),
+            ];
+        };
         for w in &ways {
             *level_counts.entry(w.level).or_insert(0) += 1;
             n_points += w.lods[0].len();
-            bounds = [
-                bounds[0].min(origin[0] + w.bbox[0] as f64),
-                bounds[1].min(origin[1] + w.bbox[1] as f64),
-                bounds[2].max(origin[0] + w.bbox[2] as f64),
-                bounds[3].max(origin[1] + w.bbox[3] as f64),
-            ];
+            grow(w.bbox);
         }
-        VectorData { origin, ways, areas, level_counts, bounds, n_points }
+        for w in &water {
+            *water_counts.entry(w.kind).or_insert(0) += 1;
+            n_points += w.lods[0].len();
+            grow(w.bbox);
+        }
+        VectorData { origin, ways, areas, water, level_counts, water_counts, bounds, n_points }
     }
 
     /// Pick the coarsest LOD whose tolerance is below `max_err` world units.
@@ -162,13 +196,16 @@ pub struct LevelStyle {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VectorStyle {
     pub levels: BTreeMap<u8, LevelStyle>,
+    /// Rivers and lake outlines, by kind.
+    #[serde(default)]
+    pub water: BTreeMap<Water, LevelStyle>,
     pub labels: bool,
     pub width_scale: f32,
 }
 
 impl Default for VectorStyle {
     fn default() -> Self {
-        VectorStyle { levels: BTreeMap::new(), labels: true, width_scale: 1.0 }
+        VectorStyle { levels: BTreeMap::new(), water: BTreeMap::new(), labels: true, width_scale: 1.0 }
     }
 }
 
@@ -180,6 +217,25 @@ impl VectorStyle {
     pub fn get(&self, level: u8) -> LevelStyle {
         self.levels.get(&level).copied().unwrap_or_else(|| default_level_style(level))
     }
+
+    pub fn water_mut(&mut self, w: Water) -> &mut LevelStyle {
+        self.water.entry(w).or_insert_with(|| default_water_style(w))
+    }
+
+    pub fn water(&self, w: Water) -> LevelStyle {
+        self.water.get(&w).copied().unwrap_or_else(|| default_water_style(w))
+    }
+}
+
+/// Water in blues, rivers widest; canals start hidden.
+pub fn default_water_style(w: Water) -> LevelStyle {
+    let (color, width, visible) = match w {
+        Water::River => ([70, 150, 255, 255], 1.6, true),
+        Water::RiverArea => ([110, 180, 255, 255], 1.0, true),
+        Water::Lake => ([90, 170, 255, 255], 1.3, true),
+        Water::Canal => ([120, 190, 230, 255], 0.9, false),
+    };
+    LevelStyle { visible, color, width }
 }
 
 pub fn default_level_style(level: u8) -> LevelStyle {
@@ -225,6 +281,37 @@ mod tests {
         assert_eq!(simplify(&pts, 0.5), vec![[0.0, 0.0], [99.0, 0.0]]);
         let zig = vec![[0.0, 0.0], [1.0, 5.0], [2.0, 0.0]];
         assert_eq!(simplify(&zig, 1.0).len(), 3);
+    }
+
+    #[test]
+    fn water_is_projected_and_counted() {
+        use crate::osm::{BoundaryWay, WaterLine};
+        let b = OsmBoundaries {
+            ways: vec![BoundaryWay { level: 8, coords: vec![[113_000_000, 464_000_000], [113_100_000, 464_000_000]] }],
+            areas: Vec::new(),
+            water: vec![
+                WaterLine { kind: Water::Lake, coords: vec![[112_600_000, 463_800_000], [112_610_000, 463_800_000], [112_610_000, 463_810_000], [112_600_000, 463_800_000]] },
+                WaterLine { kind: Water::River, coords: vec![[113_200_000, 464_700_000], [113_200_000, 464_000_000]] },
+                WaterLine { kind: Water::River, coords: vec![[113_200_000, 464_700_000]] },
+            ],
+        };
+        let v = VectorData::build(&b, Crs::LAEA_EUROPE);
+        assert_eq!(v.water.len(), 2, "a line needs two points");
+        assert_eq!(v.water_counts.get(&Water::River), Some(&1));
+        assert_eq!(v.n_points, 2 + 4 + 2);
+        // the river reaches further north than the boundary: in the bounds
+        let top = v.origin[1] + v.water[1].bbox[3] as f64;
+        assert!(v.bounds[3] >= top - 1.0 && v.bounds[3] > v.origin[1] + v.ways[0].bbox[3] as f64);
+    }
+
+    #[test]
+    fn styles_saved_before_water_still_load() {
+        let old = r#"{"levels":{"8":{"visible":true,"color":[255,255,90,255],"width":1.2}},"labels":true,"width_scale":1.0}"#;
+        let mut s: VectorStyle = serde_json::from_str(old).unwrap();
+        assert!(s.water.is_empty() && s.water(Water::River).visible && !s.water(Water::Canal).visible);
+        s.water_mut(Water::Lake).visible = false;
+        let back: VectorStyle = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!back.water(Water::Lake).visible && back == s);
     }
 
     #[test]

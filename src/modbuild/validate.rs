@@ -345,6 +345,28 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
             let (px, pz): (f64, f64) = (x[1].parse().unwrap_or(-1.0), x[2].parse().unwrap_or(-1.0));
             c.check(px >= 0.0 && px < w as f64 && pz > 0.0 && pz <= h as f64 && is(prov_at(px, pz), "sea"), || format!("ocean sound at {px},{pz} is not over sea"));
         }
+        // placed objects: an entity the mod or the game defines, on the map
+        let fixed = |t: &str| t.starts_with("frame_border") || matches!(t, "ambient_wind_entity" | "ambient_water_entity" | "chinese_wall_entity");
+        if atypes.iter().any(|t| !fixed(t)) {
+            use crate::models::catalog::{Catalog, Origin, Root};
+            let mut roots = vec![Root { origin: Origin::Content("the mod".into()), dir: md.to_path_buf() }];
+            roots.extend(Catalog::roots(g, None));
+            let cat = Catalog::load(roots);
+            let script = crate::content::script::Script::parse(&at);
+            for b in script.root.blocks("type") {
+                let t = b.atom("type").unwrap_or("");
+                if fixed(t) {
+                    continue;
+                }
+                c.check(cat.entity(t).is_some(), || format!("ambient_object.txt: entity {t} is defined neither in the mod nor in the game"));
+                for o in b.blocks("object") {
+                    let p: Vec<f64> = o.block("position").map(|p| p.values().filter_map(|v| v.parse().ok()).collect()).unwrap_or_default();
+                    c.check(p.len() == 3 && p[0] >= 0.0 && p[0] <= w as f64 && p[2] >= 0.0 && p[2] <= h as f64, || {
+                        format!("ambient_object.txt: {} object {} at {p:?} is off the map", t, o.atom("name").unwrap_or("?"))
+                    });
+                }
+            }
+        }
         let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
         for t in &atypes {
             *counts.entry(t).or_default() += 1;

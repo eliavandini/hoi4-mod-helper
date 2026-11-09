@@ -277,6 +277,43 @@ pub struct Port {
     pub level: u8,
 }
 
+/// A 3D object placed on the map (an ambient object of
+/// map/ambient_object.txt): an entity of the game or the mod, or a mesh
+/// (`pdxmesh`) the build makes an entity for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Ambient {
+    /// The entity (or with `mesh`, the pdxmesh) it shows.
+    pub entity: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mesh: bool,
+    /// Map pixel (x right, y down).
+    pub at: [f32; 2],
+    /// Height above the ground, or above the water at sea (map units: one
+    /// is 10 steps of the heightmap).
+    #[serde(default)]
+    pub lift: f32,
+    /// Degrees about x (tilt forward), y (turn, clockwise seen from above)
+    /// and z (roll), as the game's `rotation`.
+    #[serde(default)]
+    pub rotation: [f32; 3],
+    #[serde(default = "one")]
+    pub scale: f32,
+    /// What it plays: a state of the entity, or an animation of the mesh;
+    /// None stands still.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation: Option<String>,
+    /// Seen from any distance (the game hides small objects zoomed out).
+    #[serde(default)]
+    pub always_visible: bool,
+    /// The object's name in the file (else made from the entity).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+fn one() -> f32 {
+    1.0
+}
+
 /// Everything in provinces.json (cloned for undo; the bitmap is not).
 #[derive(Clone, Debug, Default)]
 pub struct MapData {
@@ -293,6 +330,8 @@ pub struct MapData {
     /// passable state.
     pub supply_hubs: Option<Vec<[f32; 2]>>,
     pub ports: Vec<Port>,
+    /// 3D objects on the map.
+    pub ambient: Vec<Ambient>,
     /// Other top-level keys (size, pixel_m, origin, crs, ...), kept as they are.
     pub header: Map<String, Value>,
     pub pixel_m: f64,
@@ -644,11 +683,12 @@ pub fn load(dir: &Path, progress: &Progress) -> Result<Loaded> {
     }
     let rivers: Vec<River> = serde_json::from_value(take("rivers")).context("rivers")?;
     let ports: Vec<Port> = serde_json::from_value(take("ports")).context("ports")?;
+    let ambient: Vec<Ambient> = serde_json::from_value(take("ambient_objects")).context("ambient_objects")?;
     let railways: Option<Vec<Railway>> = root.remove("railways").map(serde_json::from_value).transpose().context("railways")?;
     let supply_hubs: Option<Vec<[f32; 2]>> = root.remove("supply_hubs").map(serde_json::from_value).transpose().context("supply_hubs")?;
     let pixel_m = root.get("pixel_m").and_then(Value::as_f64).unwrap_or(1.0);
 
-    let mut data = MapData { header: root, pixel_m, adjacencies, rivers, railways, supply_hubs, ports, ..Default::default() };
+    let mut data = MapData { header: root, pixel_m, adjacencies, rivers, railways, supply_hubs, ports, ambient, ..Default::default() };
     for p in provinces {
         if p.id == 0 || data.provinces.contains(p.id) {
             bail!("province id {} is 0 or used twice", p.id);
@@ -998,6 +1038,9 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
     }
     if !data.ports.is_empty() {
         root.insert("ports".into(), serde_json::to_value(&data.ports)?);
+    }
+    if !data.ambient.is_empty() {
+        root.insert("ambient_objects".into(), serde_json::to_value(&data.ambient)?);
     }
 
     let w = labels.w as usize;

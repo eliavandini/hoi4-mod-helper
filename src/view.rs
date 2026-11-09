@@ -216,7 +216,7 @@ fn draw_tile_part(
     dc.painter.add(Shape::mesh(mesh));
 }
 
-/// Draw boundary lines (and labels) of a vector layer.
+/// Draw the water lines, then the boundary lines (and labels) of a vector layer.
 pub fn draw_vector(dc: &DrawCtx, vd: &VectorData, style: &VectorStyle, offset: [f64; 2], opacity: f32) {
     let vb = dc.cam.view_bounds(dc.rect);
     let o = [vd.origin[0] + offset[0], vd.origin[1] + offset[1]];
@@ -227,10 +227,25 @@ pub fn draw_vector(dc: &DrawCtx, vd: &VectorData, style: &VectorStyle, offset: [
     let cl = [dc.cam.center[0] - o[0], dc.cam.center[1] - o[1]];
     let to_screen = |p: [f32; 2]| pos2(c.x + ((p[0] as f64 - cl[0]) * inv) as f32, c.y - ((p[1] as f64 - cl[1]) * inv) as f32);
     let alpha = opacity.clamp(0.0, 1.0);
+    let in_view = |b: [f32; 4]| !(b[2] < lb[0] || b[0] > lb[2] || b[3] < lb[1] || b[1] > lb[3]);
+
+    // rivers and lakes under the boundaries (sorted by kind)
+    let mut last_kind = None;
+    let (mut stroke, mut visible) = (Stroke::NONE, false);
+    for w in &vd.water {
+        if last_kind != Some(w.kind) {
+            last_kind = Some(w.kind);
+            let ls = style.water(w.kind);
+            visible = ls.visible;
+            let col = Color32::from_rgba_unmultiplied(ls.color[0], ls.color[1], ls.color[2], ls.color[3]);
+            stroke = Stroke::new(ls.width * style.width_scale, col.gamma_multiply(alpha));
+        }
+        if visible && in_view(w.bbox) {
+            dc.painter.add(Shape::line(w.lods[lod].iter().map(|&p| to_screen(p)).collect(), stroke));
+        }
+    }
 
     let mut last_level = u8::MAX;
-    let mut stroke = Stroke::NONE;
-    let mut visible = false;
     for way in &vd.ways {
         if way.level != last_level {
             last_level = way.level;

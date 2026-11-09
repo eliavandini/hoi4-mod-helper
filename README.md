@@ -3,11 +3,12 @@
 Map tools for the Tyrol / Trentino HOI4 total conversion:
 
 1. a **layer viewer**: the rasters in `../maps/processed maps` and the
-   administrative boundaries in `../maps/osm regions`, stacked as layers that
+   administrative boundaries, rivers and lakes in `../maps/osm regions`, stacked as layers that
    can be toggled, reordered, moved, restyled and imported;
 2. a **map editor** for the mod's map: provinces, states, nations, air and sea
-   zones, adjacencies, state and nation properties, and inaccessible zones
-   (see [Map editor](#map-editor));
+   zones, adjacencies, state and nation properties, inaccessible zones, and
+   the 3D objects on the map, with an animated model preview (see
+   [Map editor](#map-editor));
 3. a **nation content** editor: focus trees (visual), events, decisions,
    ideas, characters and the rest of what nations have, with checks, imports
    from the base game and other mods, and exports (see
@@ -35,10 +36,23 @@ map (45 % opacity) are visible; the other layers start hidden. The layer stack,
 styles, offsets and view are saved to `mod-helper.project.json` on exit or
 with Ctrl+S. Paths are stored relative to the project file.
 
-The first time an `.osm.pbf` is loaded, its boundaries are extracted, which
-takes a while for the 600–800 MB extracts. The result is cached in
-`~/.cache/mod-helper/`, so later loads are instant. The cache is rebuilt when
-the file changes.
+The first time an `.osm.pbf` is loaded, its boundaries, rivers and lakes are
+extracted, which takes about 10 s for the 600–800 MB extracts. The result is
+cached in `~/.cache/mod-helper/`, so later loads are instant. The cache is
+rebuilt when the file changes (and once when the cache format changes, as it
+did when water was added).
+
+An OSM layer draws:
+
+- the administrative boundaries, styled per admin level, with area names;
+- under them, the water: river centre lines (`waterway=river`), the outlines
+  of river areas (`natural=water` + `water=river`, `waterway=riverbank`), the
+  outlines of lakes and reservoirs (`natural=water`, `landuse=reservoir`, as
+  closed ways or multipolygons), and canals (hidden at first). Ponds, basins
+  and lakes under 1 ha are left out.
+
+The layer's Display section has a row per admin level and per kind of water
+(show, colour); "Line width" scales all of them.
 
 ## Controls
 
@@ -73,7 +87,7 @@ plus `provinces.json` (names, types, states, nations, strategic regions,
 adjacencies, overrides), as written by `make_provinces.py`. The viewer's
 layers stay underneath ("Background layers" at the bottom of the panel).
 
-**Levels** (keys `1`–`9`, `0`): what clicks select and what the actions work on.
+**Levels** (keys `1`–`9`, `0`, `G`): what clicks select and what the actions work on.
 
 | Level | Select / paint | Actions |
 |---|---|---|
@@ -86,6 +100,7 @@ layers stay underneath ("Background layers" at the bottom of the panel).
 | Rivers | rivers; Draw tool (`D`): click a new river from its source to its mouth | move, add and remove points, widths, rename, reverse, simplify, delete, **generate from the heights** |
 | Supply | railways, supply hubs, ports; Railway (`R`), Hub (`H`) and Port (`N`) tools | levels, delete, automatic or laid railways and hubs, a port in each coastal state, **supply estimate** |
 | Terrain | provinces; the paint brush paints `terrain.bmp` (Alt+click picks the terrain under the cursor) | paint the selection, clear the painting, **import / export `terrain.bmp` and `heightmap.bmp`** |
+| Objects | the 3D objects on the map (units, trees, buildings, landmarks…); Place tool (`A`): click to put down the model picked in the browser | move, turn, tilt, scale, lift, name, animation, always visible, duplicate, delete; **model browser** and **animated 3D preview** |
 
 **Varying detail.** "Generate by terrain" re-cuts the selected provinces
 with a province size for every pixel, set in "Generation parameters":
@@ -361,6 +376,64 @@ as `terrain_paint.bmp` (255 where the build decides) and
 `heightmap_import.bmp`, and go into the backups. A map without them gets the
 build's.
 
+**Objects.** This level places the game's 3D models on the map: what the
+build writes to `map/ambient_object.txt`. Any entity or mesh of the game,
+its DLCs and the mod (`<map>/content/*/gfx/`) can be placed: units, trees,
+buildings, landmarks, ships, planes.
+
+- **Models** is a browser of all of them (about 3300 in the base game and
+  DLCs). It has a search over names and files, a filter by where they come
+  from (the game, a DLC, the mod), "animated", a folder tree (by the
+  folders of `gfx/models`), and a picture of each one. ↻ reads the models
+  again after adding files to the mod's content.
+- **Preview** shows the picked model in 3D with its textures, as the game
+  would draw it. It is skinned to its skeleton, with the entities the game
+  attaches (a soldier's rifle, a tank's crew). *plays* chooses an entity's
+  state (`idle`, `move`, `attack`…) or any of the mesh's animations. Play,
+  pause, speed and a time slider control it. Drag to turn it, use the wheel
+  to zoom, and double-click to reset. *On the map* shows the map around
+  the selected objects (or the last place clicked) in 3D, with the objects
+  as the build will set them: height from the heightmap, water at the
+  water plane. "⛶ Bigger…" moves the preview to a window of its own.
+- **Place** (`A`) puts down the picked model where you click. Its scale,
+  turn ("random" for a new one each time) and visibility come from *New
+  objects*, and it plays what the preview plays.
+- **Select** clicks objects (Shift / Ctrl add and toggle) or drags a box.
+  Drag them to move them. Drag the yellow knob to turn them (Shift snaps
+  to 15°). Alt+click picks an object's model in the browser.
+  - `[` / `]` turn by 15° (Shift: 1°), arrows move by a pixel (Shift: 10).
+  - Ctrl+D duplicates, Del deletes, Esc clears the selection.
+  - The panel edits the selection: name, place, turn, tilt and roll,
+    scale, lift above the ground, what it plays, always visible. "Use the
+    browser's model" swaps the model.
+- The map draws each object as its picture seen from above, turned and
+  scaled like the object, and a dot when it is too small to see
+  ("objects" in the display options shows them on every level).
+
+The objects are saved in `provinces.json` (`ambient_objects`): the model,
+the map pixel, lift, rotation (degrees about x, y, z; y is the turn,
+clockwise from north), scale, animation, visibility and name. In the build:
+
+- objects of one model, scale, animation and visibility share a `type`
+  block;
+- a model played in another state than its default gets a clone of its
+  entity with that `default_state`;
+- a mesh without an entity, or a second scale or visibility of one, gets an
+  entity of its own. These go in `gfx/entities/mod_helper_ambient.asset`;
+- a DLC's model gets `dlc_allowed`, so it shows only to players with the
+  DLC;
+- the height is the ground's (or the water plane on the sea and lakes)
+  plus the lift;
+- the rotation is turned into the game's: the editor turns clockwise like
+  a compass (90° faces east), but the game's `rotation` y turns
+  counter-clockwise, so the build writes the negative (a turn of 336° is
+  `0 24 0`). This was taken from vanilla: naval bases in `buildings.txt`
+  face their sea at 180° minus their rotation, and the Golden Gate Bridges
+  of Kaiserreich and The Fire Rises only span the bay turned that way.
+
+The check of the built mod looks for each object's entity in the mod and
+the game, and checks that it is on the map.
+
 **Checks** run in the background after every edit: province size and box
 limit, separate pieces, crossings, provinces without state or zone, zone
 type, contiguity of states and zones, capitals, tags, straits, rivers cut
@@ -606,7 +679,8 @@ It writes `<mods>/<folder>/` and `<mods>/<folder>.mod`:
   around impassable borders, and a hub in the main victory point of each
   state), adjacencies, strategic regions, and `ambient_object.txt` (the
   frame only if the option is on, ocean sounds over this map's sea zones, no
-  Great Wall);
+  Great Wall, and the editor's objects, with the entities they need in
+  `gfx/entities/mod_helper_ambient.asset`);
 - **history:** states (category, manpower, buildings, victory points, the
   editor's naval bases), countries and their militia;
 - **countries:** one per nation, with tag, colour unlike its neighbours',
@@ -636,7 +710,8 @@ it, lakes either way), states and regions covering every province
 once, positions inside their provinces, adjacencies, railways (levels 1–5),
 naval bases (coastal, levels 1–10), `rivers.bmp` (one pixel wide, markers,
 no blocks), building slots, countries (tags, files, colours, flags, history, units, names, localisation),
-bookmark, tutorial ids and the `.mod` path.
+bookmark, tutorial ids, the entities and places of the ambient objects,
+and the `.mod` path.
 
 This replaces `make_map_mod.py` and `validate_mod.py`, which stay in
 `maps/utils/edit_terrain` but are no longer used. Output matches theirs
@@ -691,8 +766,8 @@ top, in metres.
 | `raster.rs` | in-memory rasters in their **native** form (palette indices stay indices, heights stay heights); BMP (own codec: 1/4/8/24/32-bit, RLE8), GeoTIFF (parallel chunk decoding; own reader for 8-bit palette/gray/RGB(A) TIFFs, the `tiff` crate for 16-bit/float), PNG/JPEG; colour maps; tile rendering |
 | `tiles.rs` | 512² tile pyramid, rendered on a worker pool, LRU-evicted above 1 GB of textures; style changes bump a generation so tiles re-render without flicker |
 | `geo.rs` | CRSs and projections (LAEA, UTM, Web Mercator; checked against GDAL), geotransforms, sidecar parsing |
-| `osm.rs` | three-pass `.osm.pbf` boundary extraction + cache |
-| `vector.rs` | projected boundaries with Douglas–Peucker LODs, line styles per admin level |
+| `osm.rs` | three-pass `.osm.pbf` extraction of boundaries, rivers and lake outlines + cache |
+| `vector.rs` | projected boundaries and water with Douglas–Peucker LODs, line styles per admin level and kind of water |
 | `layers.rs` | layer config (persisted) and runtime state, pixel ↔ world placement |
 | `view.rs` | camera, raster/vector drawing, scale bar |
 | `app.rs` | UI (egui/eframe 0.37, wgpu) |
@@ -731,6 +806,12 @@ top, in metres.
 | `content/refactor.rs`, `gfx.rs`, `zip.rs`, `build.rs` | renames, deletes, find & replace; sprites and pictures; bundles; the content in the built mod |
 | `content/ui/` | the screen: nations, forms and code editor, wizards and the sprite picker, the focus tree canvas, check, import / export, test play, tools |
 | `editor/content_link.rs` | what the content screen asks of the map: nations, tags, states, the build |
+| `models/pdxbin.rs`, `mesh.rs`, `anim.rs` | the game's binary `.mesh` and `.anim` files: meshes, skeletons, skinning, locators, animation samples |
+| `models/catalog.rs` | the game's, the DLCs' and the mod's `pdxmesh`, `animation` and `entity` definitions (clones, states, attachments), where they come from, case-blind file lookup |
+| `models/render.rs`, `math.rs` | a small software renderer (depth buffer, perspective-correct mipmapped textures, cut-outs, sun light) and the 3D maths |
+| `models/mod.rs` | a model ready to draw: entity + mesh + textures + animations + attached entities; posing and drawing it; the pictures of the browser and the map |
+| `editor/objects_ui.rs` | the Objects level: browser, preview and its window, the scene on the map, placing, moving, turning, the panel |
+| `modbuild/ambient.rs` | the objects in the build: `ambient_object.txt` blocks and the entities they need |
 
 Rasters sit behind `Arc<RwLock<Raster>>` and tiles are keyed by
 `(layer, level, x, y)`, so editing tools can change pixels and invalidate only
@@ -742,6 +823,13 @@ the affected tiles.
   (about 0.3 GB for the 4608 × 2816 map with undo).
 - "Remove from play" (lake provinces) and "Make lake" are untested in the
   game (the built files pass the checks and match vanilla's lakes).
+- Ambient objects are only partly tested in the game. Tilt and roll are
+  mirrored like the turn, and the order of the three rotations is a guess;
+  whether `use_animation` plays a clone's `default_state`, and the height
+  of objects on the water follow vanilla's files. All of these need a look
+  in the game. The preview is a
+  software renderer: no normal maps, specular or shadows, and textures at
+  most 512 px.
 - The supply estimate leaves out motorization, damage, weather and fleets;
   the game's numbers will differ somewhat.
 - Rasters are loaded fully into RAM in their native format. The 40000² CLC+

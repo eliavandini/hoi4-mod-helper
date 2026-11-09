@@ -15,6 +15,7 @@ pub mod doc;
 pub mod from_image;
 pub mod kmeans;
 mod lasso;
+pub mod objects_ui;
 pub mod launcher;
 pub mod model;
 pub mod ops;
@@ -76,10 +77,12 @@ pub enum Level {
     Supply,
     /// terrain.bmp (the ground textures) and the heightmap.
     Terrain,
+    /// 3D objects on the map (ambient objects).
+    Objects,
 }
 
 impl Level {
-    pub const ALL: [Level; 10] = [
+    pub const ALL: [Level; 11] = [
         Level::Provinces,
         Level::States,
         Level::Nations,
@@ -90,6 +93,7 @@ impl Level {
         Level::Rivers,
         Level::Supply,
         Level::Terrain,
+        Level::Objects,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -103,6 +107,7 @@ impl Level {
             Level::Rivers => "Rivers",
             Level::Supply => "Supply",
             Level::Terrain => "Terrain",
+            Level::Objects => "Objects",
         }
     }
     /// Levels that edit lines and points rather than provinces.
@@ -119,6 +124,7 @@ impl Level {
             Level::Adjacencies => "adjacency",
             Level::Rivers => "river",
             Level::Supply => "railway",
+            Level::Objects => "object",
         }
     }
 }
@@ -188,7 +194,7 @@ impl MapMode {
             (MapMode::Auto, Level::SeaZones) => MapMode::SeaZones,
             (MapMode::Auto, Level::Inaccessible | Level::Rivers) => MapMode::Types,
             (MapMode::Auto, Level::Supply) => MapMode::Supply,
-            (MapMode::Auto, Level::Terrain) => MapMode::Texture,
+            (MapMode::Auto, Level::Terrain | Level::Objects) => MapMode::Texture,
             (m, _) => m,
         }
     }
@@ -215,6 +221,8 @@ pub enum Tool {
     Hub,
     /// Supply: add or remove a naval base.
     Port,
+    /// Objects: put the browser's model on the map.
+    Place,
 }
 
 impl Tool {
@@ -223,6 +231,7 @@ impl Tool {
         match level {
             Level::Rivers => &[Tool::Select, Tool::Draw, Tool::Pan],
             Level::Supply => &[Tool::Select, Tool::Rail, Tool::Hub, Tool::Port, Tool::Pan],
+            Level::Objects => &[Tool::Select, Tool::Place, Tool::Pan],
             Level::Adjacencies => &[Tool::Select, Tool::Link, Tool::Border, Tool::Pan],
             Level::Provinces | Level::States => &[Tool::Select, Tool::Paint, Tool::Lasso, Tool::Cut, Tool::Border, Tool::Pan],
             _ => &[Tool::Select, Tool::Paint, Tool::Border, Tool::Pan],
@@ -254,6 +263,8 @@ pub struct Settings {
     pub adjacencies: bool,
     /// Draw the rivers on every level.
     pub rivers: bool,
+    /// Draw the 3D objects on every level.
+    pub objects: bool,
     pub coarsen: bool,
     pub auto_check: bool,
     /// The HOI4 install (None: the Steam default).
@@ -280,6 +291,7 @@ impl Default for Settings {
             borders: true,
             adjacencies: true,
             rivers: true,
+            objects: true,
             coarsen: true,
             auto_check: true,
             game_dir: None,
@@ -482,6 +494,8 @@ pub struct Editor {
     tex: texture_ui::TextureUi,
     /// Open the terrain rules when the "Mod details" window shows next.
     meta_terrain: bool,
+    /// The Objects level.
+    ob: objects_ui::ObjectsUi,
 }
 
 /// The "Mod details" window: the edited copy, the stored value it started
@@ -583,6 +597,7 @@ impl Editor {
             tt: Default::default(),
             tex: Default::default(),
             meta_terrain: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "terrain"),
+            ob: Default::default(),
         }
     }
 
@@ -608,7 +623,7 @@ impl Editor {
     /// Cursor for the map.
     pub fn cursor(&self) -> egui::CursorIcon {
         match self.settings.tool {
-            Tool::Paint | Tool::Lasso | Tool::Cut | Tool::Link | Tool::Border | Tool::Draw | Tool::Rail | Tool::Hub | Tool::Port => egui::CursorIcon::Crosshair,
+            Tool::Paint | Tool::Lasso | Tool::Cut | Tool::Link | Tool::Border | Tool::Draw | Tool::Rail | Tool::Hub | Tool::Port | Tool::Place => egui::CursorIcon::Crosshair,
             Tool::Select => egui::CursorIcon::Default,
             Tool::Pan => egui::CursorIcon::Grab,
         }
@@ -848,7 +863,7 @@ impl Editor {
                     0
                 }
             }
-            Level::Rivers | Level::Supply => 0,
+            Level::Rivers | Level::Supply | Level::Objects => 0,
         };
         (r != 0).then_some(r)
     }
@@ -866,7 +881,7 @@ impl Editor {
                     }
                 }
                 Level::AirZones | Level::SeaZones => out.extend_from_slice(doc.index.provs_of_region(id)),
-                Level::Rivers | Level::Supply => {}
+                Level::Rivers | Level::Supply | Level::Objects => {}
             }
         }
         out.sort_unstable();
@@ -936,7 +951,7 @@ impl Editor {
             Level::States => d.states.contains(i),
             Level::Nations => d.nations.contains(i),
             Level::AirZones | Level::SeaZones => d.regions.contains(i),
-            Level::Rivers | Level::Supply => false,
+            Level::Rivers | Level::Supply | Level::Objects => false,
         });
         if self.sel_adj.is_some_and(|i| i >= d.adjacencies.len()) {
             self.sel_adj = None;
@@ -1295,6 +1310,7 @@ impl Editor {
         match self.settings.level {
             Level::Rivers => self.rivers_keys(ctx),
             Level::Supply => self.supply_keys(ctx),
+            Level::Objects => self.objects_keys(ctx),
             _ => self.lasso_keys(ctx),
         }
         let keys = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9, Key::Num0];
@@ -1303,6 +1319,9 @@ impl Editor {
                 self.set_level(Level::ALL[i]);
             }
         }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::G)) {
+            self.set_level(Level::Objects);
+        }
         let pressed = |k| ctx.input(|i| i.key_pressed(k) && !i.modifiers.command);
         if pressed(Key::S) {
             self.settings.tool = Tool::Select;
@@ -1310,7 +1329,7 @@ impl Editor {
         let level = self.settings.level;
         // P stays the pan tool (the viewer's key); a key used here is taken
         // so the viewer does not act on it too (H hides a layer there)
-        for (k, t) in [(Key::B, Tool::Paint), (Key::O, Tool::Lasso), (Key::K, Tool::Cut), (Key::I, Tool::Border), (Key::D, Tool::Draw), (Key::R, Tool::Rail), (Key::H, Tool::Hub), (Key::N, Tool::Port)] {
+        for (k, t) in [(Key::B, Tool::Paint), (Key::O, Tool::Lasso), (Key::K, Tool::Cut), (Key::I, Tool::Border), (Key::D, Tool::Draw), (Key::R, Tool::Rail), (Key::H, Tool::Hub), (Key::N, Tool::Port), (Key::A, Tool::Place)] {
             if Tool::of(level).contains(&t) && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k)) {
                 self.settings.tool = t;
             }
@@ -1319,10 +1338,11 @@ impl Editor {
             self.set_level(Level::Adjacencies);
             self.settings.tool = Tool::Link;
         }
-        if pressed(Key::OpenBracket) {
+        // on the Objects level [ and ] turn the selection
+        if pressed(Key::OpenBracket) && level != Level::Objects {
             self.settings.brush = (self.settings.brush / 1.25).max(0.5);
         }
-        if pressed(Key::CloseBracket) {
+        if pressed(Key::CloseBracket) && level != Level::Objects {
             self.settings.brush = (self.settings.brush * 1.25).min(400.0);
         }
         if pressed(Key::Escape) && self.lasso.take().is_none() && self.cut.take().is_none() {
@@ -1338,7 +1358,7 @@ impl Editor {
                 Level::Nations => Some(Act::DissolveNations),
                 Level::AirZones | Level::SeaZones => Some(Act::DissolveRegions),
                 Level::Adjacencies => self.sel_adj.map(Act::DeleteAdjacency),
-                Level::Inaccessible | Level::Rivers | Level::Supply | Level::Terrain => None,
+                Level::Inaccessible | Level::Rivers | Level::Supply | Level::Terrain | Level::Objects => None,
             };
             if let Some(a) = act {
                 self.apply(a, ctx);
@@ -1573,7 +1593,7 @@ impl Editor {
                     }
                 }
             }
-            Level::Provinces | Level::Rivers | Level::Supply | Level::Terrain => {}
+            Level::Provinces | Level::Rivers | Level::Supply | Level::Terrain | Level::Objects => {}
         }
         let labels = groups
             .into_iter()
@@ -1636,6 +1656,9 @@ impl Editor {
         if level == Level::Supply {
             self.draw_supply(dc, &pl, px_scale);
         }
+        if self.settings.objects || level == Level::Objects {
+            self.draw_objects(dc, &pl, px_scale, level == Level::Objects);
+        }
         if self.settings.labels {
             self.map_labels();
             self.draw_labels(dc, &pl, px_scale);
@@ -1689,6 +1712,7 @@ impl Editor {
         match level {
             Level::Rivers => return self.rivers_input(dc, response, pl),
             Level::Supply => return self.supply_input(dc, response, pl),
+            Level::Objects => return self.objects_input(dc, response, pl, px_scale),
             _ => {}
         }
         let mods = dc.ctx.input(|i| i.modifiers);
@@ -2190,6 +2214,7 @@ impl Editor {
             match self.settings.level {
                 Level::Rivers => self.rivers_panel(ui),
                 Level::Supply => self.supply_panel(ui),
+                Level::Objects => self.objects_panel(ui),
                 Level::Terrain => {
                     self.selection_ui(ui, &mut acts);
                     self.texture_panel(ui, &mut acts);
@@ -2267,7 +2292,8 @@ impl Editor {
         ui.horizontal_wrapped(|ui| {
             ui.label("Edit:");
             for (i, l) in Level::ALL.into_iter().enumerate() {
-                if ui.selectable_label(self.settings.level == l, l.name()).on_hover_text(format!("key {}", (i + 1) % 10)).clicked() {
+                let key = if i < 10 { ((i + 1) % 10).to_string() } else { "G".into() };
+                if ui.selectable_label(self.settings.level == l, l.name()).on_hover_text(format!("key {key}")).clicked() {
                     acts.push(Act::SetLevel(l));
                 }
             }
@@ -2279,6 +2305,10 @@ impl Editor {
                 let (text, tip) = match (t, level) {
                     (Tool::Select, Level::Rivers) => ("⬚ Select", "S · click a river; drag its points"),
                     (Tool::Select, Level::Supply) => ("⬚ Select", "S · click a railway, supply hub or port"),
+                    (Tool::Select, Level::Objects) => (
+                        "⬚ Select",
+                        "S · click an object (Shift: add or remove), drag it to move the selection, drag its knob to turn it, drag elsewhere to select in a box; Alt+click picks its model",
+                    ),
                     (Tool::Select, _) => ("⬚ Select", "S · click: select, Shift: add/remove, Ctrl: remove, drag: select with the brush, Alt+click: pick"),
                     (Tool::Paint, Level::Provinces) => ("🖌 Paint", "B · paint the selected province over others (redraw borders)"),
                     (Tool::Paint, Level::Inaccessible) => ("🖌 Paint", "B · brush-select provinces to make inaccessible"),
@@ -2298,11 +2328,12 @@ impl Editor {
                     (Tool::Rail, _) => ("🚂 Railway", "R · click the provinces a new railway stops in"),
                     (Tool::Hub, _) => ("■ Hub", "H · click a province to add or remove a supply hub"),
                     (Tool::Port, _) => ("⚓ Port", "N · click a coastal province to add or remove a naval base"),
+                    (Tool::Place, _) => ("➕ Place", "A · click the map to put down the model picked in the list; Alt+click picks the model of an object"),
                 };
                 ui.selectable_value(&mut self.settings.tool, t, text).on_hover_text(tip);
             }
         });
-        if matches!(self.settings.tool, Tool::Paint | Tool::Select) && !self.settings.level.is_network() {
+        if matches!(self.settings.tool, Tool::Paint | Tool::Select) && !self.settings.level.is_network() && self.settings.level != Level::Objects {
             ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut self.settings.brush, 0.5..=400.0).logarithmic(true).text("brush px ([ ])"));
             });
@@ -2338,6 +2369,7 @@ impl Editor {
             ui.checkbox(&mut self.settings.labels, "names");
             ui.checkbox(&mut self.settings.adjacencies, "adjacencies");
             ui.checkbox(&mut self.settings.rivers, "rivers");
+            ui.checkbox(&mut self.settings.objects, "objects").on_hover_text("Show the 3D objects on every level");
         });
         if self.settings.tool == Tool::Border {
             ui.label(
@@ -2793,7 +2825,7 @@ impl Editor {
         }
         let d = &doc.data;
         let name = |id: Id| match level {
-            Level::Provinces | Level::Inaccessible | Level::Adjacencies | Level::Rivers | Level::Supply | Level::Terrain => d.prov_name(id),
+            Level::Provinces | Level::Inaccessible | Level::Adjacencies | Level::Rivers | Level::Supply | Level::Terrain | Level::Objects => d.prov_name(id),
             Level::States => d.state_name(id),
             Level::Nations => d.nation_name(id),
             Level::AirZones | Level::SeaZones => d.region_name(id),
@@ -2928,7 +2960,7 @@ impl Editor {
                     );
                 }
                 Level::Adjacencies => self.adjacency_list_ui(ui, acts),
-                Level::Rivers | Level::Supply | Level::Terrain => {}
+                Level::Rivers | Level::Supply | Level::Terrain | Level::Objects => {}
                 Level::Inaccessible => {
                     ui.label(RichText::new(
                         "Select provinces (click, or drag the brush). Then:\n\
@@ -3006,7 +3038,7 @@ impl Editor {
                 Level::States => d.states.get(id).map(|s| Draft::State(id, s.clone())),
                 Level::Nations => d.nations.get(id).map(|n| Draft::Nation(id, n.clone())),
                 Level::AirZones | Level::SeaZones => d.regions.get(id).map(|r| Draft::Region(id, r.clone())),
-                Level::Adjacencies | Level::Rivers | Level::Supply => None,
+                Level::Adjacencies | Level::Rivers | Level::Supply | Level::Objects => None,
             }),
         };
         let same_entity = |a: &Draft, b: &Draft| match (a, b) {
@@ -3349,6 +3381,7 @@ impl Editor {
 
     /// Build log and the unsaved-changes dialog.
     pub fn windows(&mut self, ctx: &egui::Context) {
+        self.objects_window(ctx);
         if let Some(act) = self.ask_discard.clone() {
             let what = if matches!(act, Act::Open) { "Open another map" } else { "Read the files again" };
             let mut choice = None;

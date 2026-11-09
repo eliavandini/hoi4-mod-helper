@@ -7,6 +7,7 @@ mod editor;
 mod geo;
 mod modbuild;
 mod layers;
+mod models;
 mod osm;
 mod project;
 mod raster;
@@ -25,9 +26,9 @@ usage:
   mod-helper --editor [PROJECT]         open with the map editor (maps/processed maps/suedtirol)
   mod-helper --content [PROJECT]        open with the nation content screen (focus trees, events...)
   mod-helper --info FILE...             print size, format and georeference of rasters
-  mod-helper --extract-osm FILE.pbf...  extract (and cache) admin boundaries from OSM extracts
+  mod-helper --extract-osm FILE.pbf...  extract (and cache) admin boundaries, rivers and lakes from OSM extracts
   mod-helper --export-geojson IN OUT.geojson [LON0,LAT0,LON1,LAT1]
-                                        write boundary lines and area labels of an OSM extract
+                                        write boundary and water lines and area labels of an OSM extract
                                         (.osm.pbf or a cache .bin) as GeoJSON, optionally clipped
                                         to ways and labels touching a lon/lat box
   mod-helper --build-mod [MAP_DIR] [--game DIR] [--mods DIR]
@@ -171,7 +172,18 @@ fn cli_export_geojson(args: &[String]) -> anyhow::Result<()> {
             }));
         }
     }
-    let (n_ways, mut n_areas) = (features.len(), 0);
+    let n_ways = features.len();
+    for w in &b.water {
+        let pts: Vec<[f64; 2]> = w.coords.iter().map(|&c| deg(c)).collect();
+        if pts.len() >= 2 && pts.iter().any(|&p| inside(p)) {
+            features.push(serde_json::json!({
+                "type": "Feature",
+                "properties": { "kind": "water", "water": format!("{:?}", w.kind).to_lowercase() },
+                "geometry": { "type": "LineString", "coordinates": pts },
+            }));
+        }
+    }
+    let (n_water, mut n_areas) = (features.len() - n_ways, 0);
     for a in &b.areas {
         if let Some(p) = a.label.map(deg).filter(|&p| inside(p)) {
             n_areas += 1;
@@ -184,7 +196,7 @@ fn cli_export_geojson(args: &[String]) -> anyhow::Result<()> {
     }
     let fc = serde_json::json!({ "type": "FeatureCollection", "features": features });
     std::fs::write(output, serde_json::to_vec(&fc)?)?;
-    println!("{output}: {n_ways} ways, {n_areas} area labels");
+    println!("{output}: {n_ways} ways, {n_water} water lines, {n_areas} area labels");
     Ok(())
 }
 
@@ -197,6 +209,9 @@ fn cli_extract(files: &[String]) -> anyhow::Result<()> {
         println!("{f}: {} ways ({} points), {} areas, {:.1}s", v.ways.len(), v.n_points, v.areas.len(), t0.elapsed().as_secs_f32());
         for (lvl, n) in &v.level_counts {
             println!("  admin_level {lvl:>2}: {n:>6} ways");
+        }
+        for (w, n) in &v.water_counts {
+            println!("  {:<16} {n:>6} lines", w.label());
         }
         println!("  bounds (EPSG:3035): {:?}", v.bounds.map(|x| x.round()));
         let mut names: Vec<&str> = b.areas.iter().filter(|a| a.level == 4).map(|a| a.name.as_str()).collect();
