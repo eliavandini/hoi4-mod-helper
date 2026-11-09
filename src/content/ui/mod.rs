@@ -11,6 +11,7 @@ pub mod code;
 pub mod form;
 pub mod import_ui;
 pub mod picker;
+pub mod statemap;
 pub mod tools;
 pub mod tree;
 pub mod wizard;
@@ -331,7 +332,7 @@ pub struct Screen {
     /// The game's documentation (read when the game folder is known).
     docs: (PathBuf, Arc<crate::content::docs::Docs>),
     /// From the start spec: a definition to open, and a window to open on it
-    /// (`wizard:<field>`, `picker:<field>`, `code`).
+    /// (`wizard:<field>`, `picker:<field>`, `code`, `about:<field>`, `map:<field>`).
     start_def: Option<(Kind, String)>,
     start_popup: Option<String>,
 }
@@ -608,6 +609,19 @@ impl Screen {
         let ctx = ui.ctx().clone();
         editor.ensure_open(&ctx);
         self.poll(editor, &ctx);
+        // files the map editor wrote to disk (an imported model)
+        let written = editor.take_content_written();
+        let mut errs = Vec::new();
+        if let Some(st) = &mut self.store {
+            for (pkg, files) in written {
+                if let Err(e) = st.adopt(&pkg, &files) {
+                    errs.push(format!("{e:#}"));
+                }
+            }
+        }
+        for e in errs {
+            self.error(e);
+        }
         self.pin_tags(editor);
         let (loading, err) = editor.load_state();
         if self.store.is_none() {
@@ -697,6 +711,8 @@ impl Screen {
                     self.form.wizard.show_page(pg);
                 }
             }
+        } else if p.starts_with("about:") || p.starts_with("map:") {
+            self.form.start = Some(p);
         } else if let Some(f) = p.strip_prefix("picker:") {
             let prefix = key.kind.spec().fields.iter().find(|x| x.key == f).and_then(|x| if let kinds::FieldType::Sprite(p) = x.ty { Some(p) } else { None }).unwrap_or("");
             self.form.picker = Some(form::PickTarget { key, field: f.to_string(), prefix: prefix.to_string() });

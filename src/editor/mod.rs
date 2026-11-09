@@ -16,6 +16,7 @@ pub mod doc;
 pub mod from_image;
 pub mod kmeans;
 mod lasso;
+mod model_import_ui;
 pub mod objects_ui;
 pub mod launcher;
 pub mod model;
@@ -51,7 +52,9 @@ use crate::util::Progress;
 use crate::view::{self, DrawCtx};
 
 use density::{Terrain, TerrainRule};
-pub use content_link::{MapFacts, NationInfo};
+pub use content_link::{MapFacts, NationInfo, WATER};
+#[cfg(test)]
+pub use content_link::StatePixels;
 use doc::Doc;
 use model::{Adjacency, Id, Kind, Nation, Province, Region, State};
 use ops::{Constraint, GenParams, Retile};
@@ -506,6 +509,9 @@ pub struct Editor {
     meta_terrain: bool,
     /// The Objects level.
     ob: objects_ui::ObjectsUi,
+    /// Content files written straight to disk (an imported model), for the
+    /// content screen to take in: (package, paths).
+    content_written: Vec<(String, Vec<String>)>,
 }
 
 /// The "Mod details" window: the edited copy, the stored value it started
@@ -605,6 +611,7 @@ impl Editor {
             tex: Default::default(),
             meta_terrain: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "terrain"),
             ob: Default::default(),
+            content_written: Vec::new(),
         }
     }
 
@@ -664,6 +671,11 @@ impl Editor {
         let m = m.into();
         log::warn!("{m}");
         self.msg = Some((m, true, Instant::now()));
+    }
+
+    /// Content files written to disk since asked last (see `content_written`).
+    pub fn take_content_written(&mut self) -> Vec<(String, Vec<String>)> {
+        std::mem::take(&mut self.content_written)
     }
 
     pub fn message(&self) -> Option<(&str, bool)> {
@@ -3448,6 +3460,7 @@ impl Editor {
     /// Build log and the unsaved-changes dialog.
     pub fn windows(&mut self, ctx: &egui::Context) {
         self.objects_window(ctx);
+        self.model_import_window(ctx);
         if let Some(act) = self.ask_discard.clone() {
             let what = "Read the map as it was saved";
             let mut choice = None;

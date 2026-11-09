@@ -71,6 +71,16 @@ pub enum FieldType {
     Ref(Kind),
     /// A localisation key.
     Loc,
+    /// A country tag (`TYR`).
+    Tag,
+    /// A state of the map (its number).
+    State,
+    /// The name of a file of this folder without its extension (`oob`:
+    /// `history/units`).
+    File(&'static str),
+    /// The id of a `block = { id = x }` in the files of a folder, the
+    /// content's and the base game's (folder, block).
+    IdIn(&'static str, &'static str),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -311,8 +321,8 @@ pub const SPECS: &[Spec] = &[
         path: &[],
         entry: Entry::File,
         fields: &[
-            f("capital", Number, "The capital state (the map editor's capital wins: the build writes it)"),
-            f("oob", Text, "Starting divisions: a history/units file name"),
+            f("capital", State, "The capital state; the build writes the map's capital first, this one comes later and wins"),
+            f("oob", File("history/units"), "Starting divisions: the name of a history/units file, without .txt"),
             f("set_research_slots", Number, "Research slots"),
             f("set_stability", Number, "Stability, 0 to 1"),
             f("set_war_support", Number, "War support, 0 to 1"),
@@ -321,13 +331,13 @@ pub const SPECS: &[Spec] = &[
             f("set_popularities", Block, "Party popularities (sum 100)"),
             f("set_technology", Block, "Starting technologies: tech = 1"),
             rep("add_ideas", Block, "Starting ideas: { idea_a idea_b } or one id"),
-            rep("recruit_character", Ref(Kind::Character), "Characters the country starts with"),
-            rep("set_country_flag", Word, "Flags set at the start"),
-            rep("add_to_tech_sharing_group", Word, "Technology sharing groups"),
-            f("set_variable", Block, "Variables"),
-            rep("create_faction", Word, "Starts a faction"),
-            rep("add_to_faction", Word, "Adds a tag to its faction"),
-            rep("give_guarantee", Word, "Guarantees a tag"),
+            rep("recruit_character", Ref(Kind::Character), "Hires a character: a leader, general, admiral, advisor or scientist of the country"),
+            rep("set_country_flag", Word, "A named marker the country carries, for has_country_flag in conditions"),
+            rep("add_to_tech_sharing_group", IdIn("common/technology_sharing", "technology_sharing_group"), "Joins a technology sharing group: faster research of what its members have"),
+            f("set_variable", Block, "Variables of the country: { name = value }"),
+            rep("create_faction", Loc, "Founds a faction led by the country; the value is the faction's name (a localisation key)"),
+            rep("add_to_faction", Tag, "Puts that country into this country's faction"),
+            rep("give_guarantee", Tag, "Guarantees that country's independence"),
             rep("diplomatic_relation", Block, "relation = military_access country = TAG"),
             rep("set_autonomy", Block, "A subject: target = TAG autonomous_state = ..."),
         ],
@@ -418,7 +428,7 @@ pub const SPECS: &[Spec] = &[
         entry: Entry::Keyed,
         fields: &[
             f("value", Number, "Opinion change"),
-            f("decay", Number, "Lost per month"),
+            f("decay", Number, "Lost each day, towards 0"),
             f("min_trust", Number, "Lowest value"),
             f("max_trust", Number, "Highest value"),
             f("days", Number, "How long it lasts"),
@@ -602,7 +612,7 @@ pub const SPECS: &[Spec] = &[
             f("can_host_government_in_exile", Bool, "Can host governments in exile"),
             f("can_be_boosted", Bool, "Its popularity can be boosted"),
             f("can_collaborate", Bool, "Can have collaboration governments"),
-            f("ai_ideology_wanted_units_factor", Number, ""),
+            f("ai_ideology_wanted_units_factor", Number, "AI: how much more its countries build units (1 = as usual)"),
         ],
         loc: &[("{id}", "Name"), ("{id}_noun", "Noun"), ("{id}_desc", "Description"), ("{id}_drift", "Drift")],
         unique: true,
@@ -711,7 +721,7 @@ pub const SPECS: &[Spec] = &[
         ext: "txt",
         path: &[],
         entry: Entry::Keyed,
-        fields: &[f("enable", Block, "When it applies"), f("annex_randomness", Number, ""), f("liberate_randomness", Number, "")],
+        fields: &[f("enable", Block, "When it applies"), f("annex_randomness", Number, "How much chance changes whether the AI annexes"), f("liberate_randomness", Number, "How much chance changes whether the AI liberates")],
         loc: &[],
         unique: true,
         national: false,
@@ -725,7 +735,7 @@ pub const SPECS: &[Spec] = &[
         ext: "txt",
         path: &[],
         entry: Entry::Keyed,
-        fields: &[f("peace_action_type", Block, "take_states / puppet / liberate ..."), f("cost_multiplier", Number, ""), f("enable", Block, "When it applies")],
+        fields: &[f("peace_action_type", Block, "take_states / puppet / liberate ..."), f("cost_multiplier", Number, "The cost in peace conference points is multiplied by this"), f("enable", Block, "When it applies")],
         loc: &[],
         unique: true,
         national: false,
@@ -753,7 +763,7 @@ pub const SPECS: &[Spec] = &[
         ext: "txt",
         path: &[],
         entry: Entry::Field(&["autonomy_state"], "id"),
-        fields: &[f("min_freedom_level", Number, ""), f("manpower_influence", Number, ""), f("rule", Block, ""), f("modifier", Block, "")],
+        fields: &[f("min_freedom_level", Number, "Freedom (0 to 1) a subject needs for this level"), f("manpower_influence", Number, "Share of the subject's manpower the overlord gets"), f("rule", Block, "Rules of subjects at this level: can_decline_call_to_war = yes ..."), f("modifier", Block, "Modifiers of subjects at this level")],
         loc: NAME_DESC,
         unique: true,
         national: false,
@@ -828,7 +838,7 @@ const FOCUS_FIELDS: &[Field] = &[
     f("continue_if_invalid", Bool, "Goes on when available no longer holds"),
     f("available_if_capitulated", Bool, "Can be taken while capitulated"),
     f("cancelable", Bool, "Can be cancelled"),
-    f("will_lead_to_war_with", Word, "AI: it leads to war with this tag"),
+    f("will_lead_to_war_with", Tag, "AI: it leads to war with this country, which the AI prepares for"),
     f("search_filters", Block, "{ FOCUS_FILTER_POLITICAL ... } for the search of the tree view"),
     f("text", Loc, "Another localisation key for the name"),
     f("select_effect", Block, "Effects when it is started"),
@@ -846,7 +856,7 @@ const TRAIT_FIELDS: &[Field] = &[
     f("targeted_modifier", Block, "Modifiers against a tag"),
     f("research_bonus", Block, "Research bonuses"),
     f("equipment_bonus", Block, "Equipment stats"),
-    f("command_cap_increase", Number, ""),
+    f("command_cap_increase", Number, "More command power the country can hold"),
 ];
 
 pub fn spec(kind: Kind) -> &'static Spec {

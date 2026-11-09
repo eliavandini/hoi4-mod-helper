@@ -4,8 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::model::Id;
+use parking_lot::RwLock;
+
+use super::model::{Id, Labels};
 use super::{Act, Editor};
 use crate::modbuild::{self, countries};
 
@@ -24,6 +27,29 @@ pub struct NationInfo {
     pub capital_state: Id,
     pub states: Vec<Id>,
     pub language: String,
+    /// Its colour in the map editor.
+    pub colour: [u8; 3],
+}
+
+/// By province: sea or a lake of water (in [`StatePixels::province_state`]).
+pub const WATER: Id = Id::MAX;
+
+/// What the state map of the content screen draws: the map's pixels and,
+/// by province, the state it is in.
+#[derive(Clone, Default)]
+pub struct StatePixels {
+    /// Province ids per pixel (the editor's: as the pixels are now).
+    pub labels: Option<Arc<RwLock<Labels>>>,
+    /// By province id: its state, 0 for none, [`WATER`] for water.
+    pub province_state: Vec<Id>,
+    /// By state: its nation.
+    pub state_nation: BTreeMap<Id, Id>,
+}
+
+impl std::fmt::Debug for StatePixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "StatePixels({} provinces)", self.province_state.len())
+    }
 }
 
 /// The nations of the map and its states and provinces, at one edit.
@@ -35,6 +61,9 @@ pub struct MapFacts {
     pub provinces: u32,
     /// Why the tags could not be made (a bad tag of a nation).
     pub tag_error: Option<String>,
+    pub pixels: StatePixels,
+    /// The edit of the map these are of (it changes with every edit).
+    pub version: u64,
 }
 
 impl Editor {
@@ -63,11 +92,17 @@ impl Editor {
             Ok(t) => (t, None),
             Err(e) => (BTreeMap::new(), Some(format!("{e:#}"))),
         };
-        let mut out = MapFacts { tag_error, provinces: d.provinces.cap().saturating_sub(1) as u32, ..Default::default() };
+        let mut out = MapFacts { tag_error, provinces: d.provinces.cap().saturating_sub(1) as u32, version: doc.meta_version, ..Default::default() };
         for (id, s) in d.states.iter() {
             out.states.insert(id);
             out.state_names.insert(id, s.name.clone());
         }
+        let mut px = StatePixels { labels: Some(doc.labels.clone()), province_state: vec![0; d.provinces.cap()], ..Default::default() };
+        for (p, pr) in d.provinces.iter() {
+            px.province_state[p as usize] = if pr.is_water() { WATER } else { pr.state };
+        }
+        px.state_nation = d.states.iter().filter_map(|(id, s)| s.nation.map(|n| (id, n))).collect();
+        out.pixels = px;
         for (id, n) in d.nations.iter() {
             let own = n.tag.clone().filter(|t| !t.is_empty());
             out.nations.push(NationInfo {
@@ -79,6 +114,7 @@ impl Editor {
                 capital_state: n.capital_state,
                 states: doc.index.states_of_nation(id).to_vec(),
                 language: n.language.clone(),
+                colour: n.color.unwrap_or_else(|| super::render::id_colour(id, 2)),
             });
         }
         Some(out)

@@ -9,6 +9,7 @@
 //! | [`script`] | Paradox script read with byte spans, edits that keep the rest of a file |
 //! | [`loc`] | localisation files |
 //! | [`kinds`] | the kinds of content: folders, shapes, fields, localisation, templates |
+//! | [`about`] | what the fields do in the game, at length, with a line of each |
 //! | [`store`] | the project's content in memory: packages, undo, save |
 //! | [`focus`] | focus trees: positions, the game's rules, checks, layout, edits |
 //! | [`source`] | the base game, mods, folders, nations and bundles to import from |
@@ -19,6 +20,7 @@
 //! | [`errlog`] | the game's error.log, pointed back to the content |
 //! | [`gfx`] | pictures of sprites (DDS, TGA, PNG) as textures |
 
+pub mod about;
 pub mod build;
 pub mod docs;
 pub mod drawio;
@@ -29,6 +31,7 @@ pub mod import;
 pub mod kinds;
 pub mod loc;
 pub mod refactor;
+pub mod shapes;
 pub mod wizard;
 pub mod script;
 pub mod source;

@@ -34,6 +34,7 @@ cargo run --release -- --extract-osm austria-latest.osm.pbf
 cargo run --release -- --build-mod "My map.hoi4proj"  # build the project's mod, then check it
 cargo run --release -- --import-map "Base game.hoi4proj" [--mod MOD_DIR] [--name NAME]
 cargo run --release -- --convert mod-helper.project.json "My map.hoi4proj"
+cargo run --release -- --import-model chapel.glb "My map.hoi4proj" [--name NAME] [--height PX] [--snow] [--bumps]
 cargo run --release -- --validate-mod ~/.local/share/Paradox\ Interactive/Hearts\ of\ Iron\ IV/mod/suedtirol_test
 ```
 
@@ -529,6 +530,68 @@ buildings, landmarks, ships, planes.
   scaled like the object, and a dot when it is too small to see
   ("objects" in the display options shows them on every level).
 
+**New models.** *Import a model…* (under Models) makes a new model for
+the game out of a 3D file and its pictures. It does in one step what
+Paradox's Blender exporter and the modding guides
+([this one](https://steamcommunity.com/sharedfiles/filedetails/?id=3004523941))
+do by hand: the `.mesh`, the DDS textures, the `pdxmesh` and the entity.
+
+- **The 3D file** can be:
+  - a glTF (`.glb`, or `.gltf` with its `.bin`) or an OBJ (with its
+    `.mtl`), as Blender exports them (File → Export), so no plugin is
+    needed;
+  - a `.mesh` written by Paradox's exporter (io_pdx_mesh). Its bones,
+    skin and locators are kept as they are.
+
+  Its triangles, normals, texture coordinates and materials are read, with
+  the transforms of a glTF's nodes. Blender's exporters write y up and
+  right-handed; the game is y up and left-handed. So z is mirrored and the
+  faces turned around, and the model looks as it did in Blender. *up* picks
+  Z for an OBJ exported with Blender's own axes. Faces without normals are
+  drawn flat.
+- **Its pictures** can be DDS, PNG, JPEG or TGA. They are found where the
+  file says, or by their name next to it or in a `textures` folder, and a
+  GLB's own pictures are read from inside it. Each material gets three
+  textures, written as the game's shader (`PdxMeshAdvanced` in
+  `gfx/FX/pdxmesh.shader`) reads them:
+  - **diffuse**: the colour picture, tinted by the material's colour (a
+    glTF's base colour), or the plain colour when there is no picture;
+  - **normal** (*bumps*): the game keeps x in green and y in alpha, and
+    uses blue as a glow at night. The model's normal map is converted
+    (Blender's green points up; tick *DirectX* for Substance's). A grey bump
+    map, or *from the colour's brightness* (what the guide does with
+    Paint.NET's emboss), becomes bumps of the chosen strength. *none* is
+    flat;
+  - **specular** (*surface*): the game keeps shine in green, metal in blue
+    and gloss in alpha. It comes from a glTF's metal-roughness map, or the
+    same all over from the sliders (a glTF's and an MTL's metal and
+    roughness set them), or a picture already in that layout;
+  - **glow** at night: a glTF's emissive map, an MTL's `map_Ke` / `Ke`, or
+    any picture (bright is lit: windows, lamps).
+
+  Each side is made a power of two (at most the size chosen, 1024 px at
+  first). They are written uncompressed (B8G8R8A8) with every mipmap.
+- **size**: map pixels per unit of the file, or the height in map pixels.
+  On the game's map a tree is about 0.5 map px high and Big Ben about 6.
+  This is the `pdxmesh`'s `scale`. *stands on the middle of its bottom*
+  moves the model so its feet are where it stands. *snow* uses
+  `PdxMeshAdvancedSnow`, which turns the model white in winter as the
+  game's buildings and trees do.
+- The **preview** shows the model as it will be written (the `.mesh` read
+  back), with its colours. The game adds the bumps, shine, glow and snow.
+- **Import** writes into a content package, `shared` by default:
+  - `gfx/models/<folder>/<name>.mesh` and its textures
+    (`<name>[_<material>]_diffuse.dds`, `_normal.dds`, `_specular.dds`);
+  - `gfx/entities/<name>.gfx`, with the `pdxmesh` `<name>_mesh`, its scale
+    and a `meshsettings` per material;
+  - `gfx/entities/<name>.asset`, with the entity `<name>_entity`.
+
+  The browser then reads the models again and picks the new one, ready
+  for the Place tool. Importing a name again replaces that model, and
+  the files it replaces go to `content/.backups/`. A name the game or a
+  DLC already has is refused. A mesh with more than 65535 vertices is cut
+  into several. `--import-model` does the same from the command line.
+
 The objects are saved in `provinces.json` (`ambient_objects`): the model,
 the map pixel, lift, rotation (degrees about x, y, z; y is the turn,
 clockwise from north), scale, animation, visibility and name. In the build:
@@ -704,6 +767,23 @@ The nations are down the left. For the one picked:
   ids name, a preview of events, ideas and decisions) or as code
   (highlighted, with errors marked).
   New, duplicate, rename, delete, copy to another nation.
+  - What a field does (every field of every kind): hover its name, or
+    click it or its **?** to keep the explanation open under it: what the
+    field does in the game and how it
+    is used (`create_faction` founds a faction led by the country and takes
+    its name, a localisation key; `recruit_character` hires a character;
+    `capital` and `oob` come after what the build writes and win, ...),
+    what it takes, the field as written in a file, and for a country's
+    history (run as effects when the game starts) the game's own
+    documentation of the effect.
+  - Fields of a country, a state, a character, an OOB file or a technology
+    sharing group have a list to pick from beside them and show what the
+    value names (the nation, the state, a missing localisation text, a
+    file that is not there).
+  - States are also picked on a map (🗺, in the forms and the wizards):
+    the states in their nation's colour, the nation's own bright and the
+    picked one lit up, named when zoomed in; the wheel zooms, dragging
+    moves, a click picks.
 - **Wizards** (🪄 next to a script field, and "Insert…" on the code tab):
   build script without writing it by hand. What they add goes into the
   field where the cursor was (or replaces it, for fields that are a list),
@@ -722,6 +802,27 @@ The nations are down the left. For the one picked:
     a country's politics, popularities (sliders), technologies, ideas,
     research bonus, search filters, and the battalions of a division
     template (placed in the free slots, with a grid preview).
+  - Every other block of the forms is built whole from a form of its own,
+    filled from what the field has (what the form does not know is kept and
+    written back after it):
+    - a character's leader, general, field marshal, admiral, advisor and
+      scientist roles (ideology, traits, skills, slot, cost, conditions) and
+      portraits (with the pictures);
+    - positions (a tree's continuous focuses and first view, a focus's
+      offset with its condition), a technology's folder and path;
+    - the subject, relations and variables of a country's history;
+    - a scripted localisation's texts, AI strategies, agency upgrade levels;
+    - lists to tick (technology and unit categories and types, equipment
+      and battalions a technology unlocks, decision targets, peace actions,
+      sub-ideologies, the focuses the AI takes, in order);
+    - weights (random events of an on action, AI research and ideas,
+      resources, equipment a battalion needs);
+    - names (first names, surnames, callsigns, faction names);
+    - rules of ideas, autonomies and ideologies (yes / no / left out), an
+      ideology's colour, and equipment bonuses (stats per equipment).
+
+    Scripts inside them (conditions, effects, modifiers) are built with the
+    catalogs: 🪄 next to the part, then ✔ Done.
 - **Sprite picker:** every focus icon, idea and event picture, portrait and
   decision icon, of the content and the base game. Filter by words of the
   name or the file, by kind, by whose; a sidebar with the folders of the
@@ -930,20 +1031,22 @@ top, in metres.
 | `modbuild/img.rs` | BMP / DDS / TGA I/O, Pillow-equivalent resampling, distance transform |
 | `modbuild/vanilla.rs`, `countries.rs`, `rail.rs` | samples from the game; tags, colours, flags; railway graph |
 | `content/script.rs`, `loc.rs` | the game's script (lossless parse, spans for edits) and localisation files |
-| `content/kinds.rs` | the kinds of content: where they live, how definitions are found, their fields, templates |
+| `content/kinds.rs`, `about.rs` | the kinds of content: where they live, how definitions are found, their fields, templates; what each field does, at length |
 | `content/store.rs` | the content packages in memory: files, definitions, undo / redo, save with backups |
 | `content/source.rs`, `import.rs` | the base game, mods, folders and bundles as sources; import plans (follow, rename, localisation, sprites) |
 | `content/focus.rs`, `drawio.rs` | focus trees: layout, checks, play, edits; trees from draw.io |
-| `content/docs.rs`, `wizard.rs` | the game's documentation of effects, triggers and modifiers; the wizards' catalog, roles of fields, and how built script is merged in |
+| `content/docs.rs`, `wizard.rs`, `shapes.rs` | the game's documentation of effects, triggers and modifiers; the wizards' catalog, roles of fields, and how built script is merged in; the forms of the fields built whole (read, write, what is missing) |
 | `content/validate.rs`, `errlog.rs` | the content checks; the game's `error.log` |
 | `content/refactor.rs`, `gfx.rs`, `zip.rs`, `build.rs` | renames, deletes, find & replace; sprites and pictures; bundles (in memory, with `zip.rs`); the content in the built mod |
-| `content/ui/` | the screen: nations, forms and code editor, wizards and the sprite picker, the focus tree canvas, check, import / export, test play, tools |
+| `content/ui/` | the screen: nations, forms and code editor, wizards, the sprite picker and the state map, the focus tree canvas, check, import / export, test play, tools |
 | `editor/content_link.rs` | what the content screen asks of the map: nations, tags, states, the build |
 | `models/pdxbin.rs`, `mesh.rs`, `anim.rs` | the game's binary `.mesh` and `.anim` files: meshes, skeletons, skinning, locators, animation samples |
 | `models/catalog.rs` | the game's, the DLCs' and the mod's `pdxmesh`, `animation` and `entity` definitions (clones, states, attachments), where they come from, case-blind file lookup |
 | `models/render.rs`, `math.rs` | a small software renderer (depth buffer, perspective-correct mipmapped textures, cut-outs, sun light) and the 3D maths |
 | `models/mod.rs` | a model ready to draw: entity + mesh + textures + animations + attached entities; posing and drawing it; the pictures of the browser and the map |
 | `editor/objects_ui.rs` | the Objects level: browser, preview and its window, the scene on the map, placing, moving, turning, the panel |
+| `models/import/` | new models: glTF / GLB and OBJ / MTL readers, a `.mesh` of Paradox's exporter, the game's space and tangents, textures in the game's layout (DDS with mipmaps), the `.gfx` / `.asset` definitions |
+| `editor/model_import_ui.rs` | the "Import a model…" window: options per material, the preview, writing into a content package |
 | `modbuild/ambient.rs` | the objects in the build: `ambient_object.txt` blocks and the entities they need |
 
 Rasters sit behind `Arc<RwLock<Raster>>` and tiles are keyed by
@@ -974,6 +1077,15 @@ the affected tiles.
     stand up to one unit too high; lower them with the lift.
 - The model preview is a software renderer: no normal maps, specular or
   shadows, and textures at most 512 px.
+- Imported models are static. Bones and animations of a glTF are not
+  read. A `.mesh` keeps its bones, but its animations (`.anim`) are not
+  imported, and the game draws a skinned model only while it plays one.
+  Textures are written uncompressed: four times the size of the game's
+  DXT5. Draco or meshopt compressed glTFs, texture transforms and
+  diffuse transparency (the game's shader draws no holes) are not
+  supported. Imported models were checked with the game's own files
+  (shader, meshes, textures) and through the build's checks. They have not
+  been looked at in the game yet.
 - The supply estimate leaves out motorization, damage, weather and fleets;
   the game's numbers will differ somewhat.
 - Rasters are loaded fully into RAM in their native format. The 40000² CLC+

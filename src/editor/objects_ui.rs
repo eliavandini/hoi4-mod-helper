@@ -125,7 +125,7 @@ enum Drag {
 type ListKey = (usize, String, Whose, Option<String>, bool);
 
 pub struct ObjectsUi {
-    loader: Option<Arc<Loader>>,
+    pub(super) loader: Option<Arc<Loader>>,
     loading: Option<(PathBuf, PathBuf, Receiver<Arc<Loader>>)>,
     loaded_for: Option<(PathBuf, PathBuf)>,
     /// Selected objects (indexes into the map's objects).
@@ -165,6 +165,10 @@ pub struct ObjectsUi {
     /// screenshots; with $MOD_HELPER_PREVIEW=scene or window).
     start: Option<usize>,
     seed: u64,
+    /// The "Import a model…" window.
+    pub(super) imp: super::model_import_ui::ImportUi,
+    /// Pick this model once the models are read again.
+    after_load: Option<Pick>,
 }
 
 impl Default for ObjectsUi {
@@ -199,6 +203,8 @@ impl Default for ObjectsUi {
             focus: None,
             start: std::env::var("MOD_HELPER_OBJECT").ok().and_then(|v| v.parse().ok()),
             seed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1) | 1,
+            imp: super::model_import_ui::ImportUi::from_env(),
+            after_load: None,
         }
     }
 }
@@ -344,6 +350,13 @@ impl ObjectsUi {
         }
     }
 
+    /// Read the models again (files were added to the mod), then pick `pick`.
+    pub(super) fn reload(&mut self, pick: Option<Pick>) {
+        self.loading = None;
+        self.loaded_for = None;
+        self.after_load = pick;
+    }
+
     fn set_pick(&mut self, pick: Pick, play: Option<Play>) {
         let play = play.unwrap_or_else(|| self.loader.as_ref().map(|l| default_play(&l.cat, &pick)).unwrap_or_default());
         if self.pick.as_ref() != Some(&pick) || self.pv.play != play {
@@ -371,6 +384,15 @@ impl Editor {
                 ob.thumbs.clear();
                 ob.list = None;
                 ob.loader = Some(l);
+                if let Some(p) = ob.after_load.take() {
+                    // shown in the list whatever the filters were
+                    ob.search.clear();
+                    ob.folder = None;
+                    ob.whose = Whose::All;
+                    ob.animated_only = false;
+                    ob.set_pick(p, None);
+                    ob.scroll_to_pick = true;
+                }
             }
         } else if ob.loaded_for.as_ref() != Some(&(game.clone(), content.clone())) {
             let (tx, rx) = unbounded();
@@ -913,9 +935,16 @@ impl Editor {
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.ob.search).hint_text("search names and files").desired_width(ui.available_width() - 70.0));
             if ui.small_button("↻").on_hover_text("Read the models again (after adding files to the mod's content)").clicked() {
-                self.ob.loaded_for = None;
+                self.ob.reload(None);
             }
         });
+        if ui
+            .button("➕ Import a model…")
+            .on_hover_text("A model made in Blender (glTF, OBJ, or .mesh from Paradox's exporter) and its pictures, made into the game's files in the mod")
+            .clicked()
+        {
+            self.ob.imp.open = true;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.label("from");
             for w in Whose::ALL {

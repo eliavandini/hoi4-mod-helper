@@ -5,6 +5,7 @@
 
 pub mod anim;
 pub mod catalog;
+pub mod import;
 pub mod math;
 pub mod mesh;
 pub mod pdxbin;

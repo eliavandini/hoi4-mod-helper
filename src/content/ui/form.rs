@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 
 use eframe::egui::{self, RichText};
 
-use super::{Cx, ERR, Nav, OK, WARN, code, picker, wizard};
+use super::{Cx, ERR, Nav, OK, WARN, code, picker, statemap, wizard};
+use crate::content::about;
 use crate::content::import;
 use crate::content::kinds::{self, Field, FieldType, Kind};
 use crate::content::loc;
@@ -41,6 +42,9 @@ pub struct FormState {
     picker_for: Option<PickTarget>,
     pub pick: picker::PickerState,
     pub wizard: wizard::WizardState,
+    /// For screenshots: `about:<field>` opens what a field does, `map:<field>`
+    /// the map of a state field.
+    pub start: Option<String>,
     /// Script from the wizard for the code tab (at its cursor).
     code_insert: Option<String>,
     jump: Option<usize>,
@@ -193,12 +197,27 @@ pub fn fields(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, list: &[Field], skip
     let label_w = (ui.available_width() * 0.28).clamp(80.0, 180.0);
     for row in rows {
         let f = row.f;
+        // what the field does: on the label, and under the row behind its ?
+        let about_id = kid.with(("about", f.key));
+        let mut about_open = ui.data(|d| d.get_temp::<bool>(about_id)).unwrap_or(false);
+        if st_state.start.as_deref() == Some(format!("about:{}", f.key).as_str()) {
+            st_state.start = None;
+            about_open = true;
+            ui.data_mut(|d| d.insert_temp(about_id, true));
+        }
         ui.horizontal_top(|ui| {
             ui.allocate_ui_with_layout(egui::vec2(label_w, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.set_min_width(label_w);
-                let label = ui.add(egui::Label::new(RichText::new(f.key).monospace()).truncate());
-                if !f.help.is_empty() {
-                    label.on_hover_text(f.help);
+                let label = ui.scope(|ui| {
+                    ui.set_max_width(label_w - 26.0);
+                    ui.add(egui::Label::new(RichText::new(f.key).monospace()).truncate().sense(egui::Sense::click()))
+                });
+                let q = ui.add(egui::Button::new(RichText::new("?").small()).small().selected(about_open));
+                let cxr: &Cx = cx;
+                let label = label.inner.on_hover_ui(|ui| about_card(ui, cxr, key.kind, &f, false));
+                if label.clicked() || q.on_hover_text("what it does, what it takes, how it is written").clicked() {
+                    about_open = !about_open;
+                    ui.data_mut(|d| d.insert_temp(about_id, about_open));
                 }
             });
             ui.vertical(|ui| {
@@ -233,18 +252,43 @@ pub fn fields(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, list: &[Field], skip
                                 }
                             }
                             (ty, Value::Atom(a)) => {
-                                let width = if matches!(ty, FieldType::Number) { 80.0 } else { (ui.available_width() - 120.0).clamp(80.0, 260.0) };
+                                let width = if matches!(ty, FieldType::Number | FieldType::State) { 80.0 } else { (ui.available_width() - 150.0).clamp(80.0, 260.0) };
                                 let ok: &dyn Fn(&str) -> bool = match ty {
-                                    FieldType::Number => &is_number,
-                                    FieldType::Text => &|_: &str| true,
+                                    FieldType::Number | FieldType::State => &is_number,
+                                    FieldType::Text | FieldType::File(_) => &|_: &str| true,
                                     _ => &is_word,
                                 };
-                                if let Some(new) = line_field(ui, fid, &a, width, "", ok) {
+                                let mut new = line_field(ui, fid, &a, width, hint(ty), ok);
+                                // picked from a list, or on the map
+                                if let Some(p) = crate::content::wizard::param_of(ty) {
+                                    let items = wizard::list(cx, &mut st_state.wizard.lists, p);
+                                    if let Some(v) = wizard::pick_menu(ui, fid.with("pick"), &a, &|| items.clone()) {
+                                        new = Some(v);
+                                    }
+                                }
+                                let open_map = st_state.start.as_deref() == Some(format!("map:{}", f.key).as_str());
+                                if open_map {
+                                    st_state.start = None;
+                                }
+                                if ty == FieldType::State
+                                    && let Some(s) = statemap::button(ui, cx, fid.with("map"), &a, open_map)
+                                {
+                                    new = Some(s.to_string());
+                                }
+                                if let Some(new) = new.filter(|n| *n != a) {
+                                    ui.data_mut(|d| d.remove::<String>(fid));
                                     let key = f.key.to_string();
                                     let v = render(ty, &new);
                                     pending.push((format!("set {key}"), Box::new(move |_t: &str, b: &Block| nth(b, &key, i).and_then(|it| it.atom()).map(|at| vec![Edit { range: at.span.clone(), text: if at.quoted && !v.starts_with('"') { script::quote(&v) } else { v.clone() } }]).unwrap_or_default())));
                                 }
                                 extra(ui, cx, key, f, &a, st_state);
+                                // a block written as one word (`peace_action_type = puppet`)
+                                if ty == FieldType::Block
+                                    && let Some(role) = crate::content::wizard::role_of(key.kind, f.key)
+                                    && ui.small_button("🪄").on_hover_text(format!("{} wizard: build it from menus", role.label())).clicked()
+                                {
+                                    st_state.wizard.open(wizard::Target { key: key.clone(), field: f.key.to_string(), nth: Some(i), role, cursor: None });
+                                }
                             }
                             (_, Value::Block(inner)) | (_, Value::Other(inner)) => {
                                 // not the shape the field usually has: as code
@@ -268,7 +312,7 @@ pub fn fields(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, list: &[Field], skip
                         let label = if n == 0 { "+ add".to_string() } else { format!("+ another {}", f.key) };
                         if ui.small_button(label).on_hover_text(f.help).clicked() {
                             let key = f.key.to_string();
-                            let init = default_value(f, cx.tag());
+                            let init = default_value(f, cx);
                             pending.push((format!("add {key}"), Box::new(move |t: &str, b: &Block| vec![script::insert_item(t, b, &format!("{key} = {init}"), last_index(b, &key))])));
                         }
                         if f.ty == FieldType::Block
@@ -281,6 +325,12 @@ pub fn fields(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, list: &[Field], skip
                 }
             });
         });
+        if about_open {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                about_card(ui, cx, key.kind, &f, true);
+            });
+        }
         ui.add_space(3.0);
     }
     if !others.is_empty() {
@@ -298,7 +348,8 @@ pub fn fields(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, list: &[Field], skip
 }
 
 /// What a new field starts as.
-fn default_value(f: Field, tag: &str) -> String {
+fn default_value(f: Field, cx: &Cx) -> String {
+    let tag = cx.tag();
     match f.ty {
         FieldType::Bool => "yes".into(),
         FieldType::Number => "0".into(),
@@ -311,7 +362,60 @@ fn default_value(f: Field, tag: &str) -> String {
         },
         FieldType::Text => "\"\"".into(),
         FieldType::Sprite(_) => "GFX_goal_unknown".into(),
+        FieldType::Loc => format!("{tag}_{}", f.key),
+        FieldType::Tag => tag.to_string(),
+        FieldType::State => cx.nation.map(|n| n.capital_state).filter(|s| *s != 0).or_else(|| cx.facts.states.first().copied()).unwrap_or(1).to_string(),
+        FieldType::File(_) => format!("\"{tag}_1936\""),
         _ => "x".into(),
+    }
+}
+
+/// The grey text of an empty field: what goes in.
+fn hint(ty: FieldType) -> &'static str {
+    match ty {
+        FieldType::Loc => "localisation key",
+        FieldType::Tag => "country tag",
+        FieldType::State => "state",
+        FieldType::File(_) => "file name",
+        FieldType::Ref(_) | FieldType::IdIn(..) => "id",
+        FieldType::Number => "number",
+        _ => "",
+    }
+}
+
+/// What a field does in the game, what it takes and how it is written; with
+/// the game's own documentation of it when the field is an effect. `full`:
+/// under the row (the tooltip has less).
+fn about_card(ui: &mut egui::Ui, cx: &Cx, kind: Kind, f: &Field, full: bool) {
+    if !full {
+        ui.set_max_width(460.0);
+        // the name may be cut short on the form
+        ui.label(RichText::new(f.key).monospace().strong());
+    }
+    let about = about::about(kind, f.key);
+    ui.label(about.map_or(f.help, |a| a.text));
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("Takes").weak());
+        ui.label(about::value_of(f.ty));
+        if f.repeat {
+            ui.label(RichText::new("· can be there more than once").weak());
+        }
+    });
+    let example = about::example(kind, f, cx.tag());
+    ui.label(RichText::new("Written in the file:").weak());
+    egui::Frame::new().fill(ui.visuals().extreme_bg_color).inner_margin(egui::Margin::symmetric(8, 4)).corner_radius(3.0).show(ui, |ui| {
+        ui.label(RichText::new(example.replace('\t', "    ")).monospace());
+    });
+    // country history is run as effects when the game starts
+    if full
+        && kind == Kind::CountryHistory
+        && let Some(e) = cx.docs.effect(f.key)
+    {
+        ui.label(RichText::new(format!("The game's documentation of {}:", e.name)).weak());
+        ui.label(RichText::new(crate::content::docs::plain(&e.text).replace('\t', "    ")).monospace().small());
+    }
+    if !full {
+        ui.label(RichText::new("click the name or ? to keep this open").weak().small());
     }
 }
 
@@ -349,6 +453,35 @@ fn extra(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, f: Field, value: &str, st
         FieldType::Loc => {
             if let Some(t) = cx.text(value) {
                 ui.label(RichText::new(loc::plain(t)).weak().small());
+            } else if !value.is_empty() {
+                ui.label(RichText::new("no text yet").color(WARN).small()).on_hover_text("give it a text on the Localisation page");
+            }
+        }
+        FieldType::Tag => {
+            if let Some(n) = cx.facts.nations.iter().find(|n| n.tag == value) {
+                ui.label(RichText::new(&n.name).weak().small());
+            } else if cx.base.is_some_and(|b| b.tags.contains(value)) {
+                ui.label(RichText::new(cx.text(value).map(loc::plain).unwrap_or_else(|| "base game".into())).weak().small());
+            } else if !value.is_empty() && !crate::content::wizard::TARGETS.contains(&value) {
+                ui.label(RichText::new(format!("no country {value}")).color(WARN).small());
+            }
+        }
+        FieldType::State => match value.parse::<u32>().ok().and_then(|s| cx.facts.state_names.get(&s)) {
+            Some(n) => {
+                ui.label(RichText::new(n).weak().small());
+            }
+            None => {
+                ui.label(RichText::new("not a state of the map").color(WARN).small());
+            }
+        },
+        FieldType::File(folder) => {
+            let rel = format!("{folder}/{}.txt", value.trim_matches('"'));
+            let ours = cx.st.packages.values().any(|p| p.files.contains_key(&rel));
+            let built = folder == "history/units" && cx.facts.nations.iter().any(|n| format!("{}_1936", n.tag) == value.trim_matches('"'));
+            if built && !ours {
+                ui.label(RichText::new("made by the build").weak().small()).on_hover_text("the starting divisions the build places from the map");
+            } else if !ours {
+                ui.label(RichText::new(format!("no {rel}")).color(WARN).small());
             }
         }
         _ => {}

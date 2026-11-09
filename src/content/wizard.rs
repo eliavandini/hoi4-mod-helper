@@ -36,6 +36,16 @@ pub enum Role {
     /// A division template's battalions and support companies.
     Regiments,
     Support,
+    /// Fields built whole from a form of their own ([`super::shapes`]):
+    /// named parts, words, weights, quoted texts, yes / no rules, a colour,
+    /// equipment bonuses.
+    Values,
+    Words,
+    Weights,
+    Texts,
+    Rules,
+    Colour,
+    EquipmentBonus,
 }
 
 impl Role {
@@ -57,6 +67,13 @@ impl Role {
             Role::SearchFilters => "Search filters",
             Role::Regiments => "Battalions",
             Role::Support => "Support companies",
+            Role::Values => "Form",
+            Role::Words => "List",
+            Role::Weights => "Weights",
+            Role::Texts => "Texts",
+            Role::Rules => "Rules",
+            Role::Colour => "Colour",
+            Role::EquipmentBonus => "Equipment stats",
         }
     }
 
@@ -67,12 +84,20 @@ impl Role {
 
     /// What it builds replaces the field (else it is added to it).
     pub fn replaces(self) -> bool {
-        matches!(self, Role::Prerequisite | Role::Exclusive | Role::Politics | Role::Popularities | Role::Technologies | Role::Ideas | Role::SearchFilters)
+        matches!(self, Role::Prerequisite | Role::Exclusive | Role::Politics | Role::Popularities | Role::Technologies | Role::Ideas | Role::SearchFilters) || self.is_shape()
+    }
+
+    /// Built from a form of its own ([`super::shapes`]).
+    pub fn is_shape(self) -> bool {
+        matches!(self, Role::Values | Role::Words | Role::Weights | Role::Texts | Role::Rules | Role::Colour | Role::EquipmentBonus)
     }
 }
 
 /// The wizard of a field of a definition, if it has one.
 pub fn role_of(kind: Kind, key: &str) -> Option<Role> {
+    if let Some(s) = super::shapes::shape_of(kind, key) {
+        return Some(s.role());
+    }
     Some(match key {
         "ai_will_do" | "ai_chance" | "weight" | "chance" => Role::AiWeight,
         "mean_time_to_happen" => Role::Mtth,
@@ -88,7 +113,7 @@ pub fn role_of(kind: Kind, key: &str) -> Option<Role> {
         "regiments" if kind == Kind::DivisionTemplate => Role::Regiments,
         "support" if kind == Kind::DivisionTemplate => Role::Support,
         "modifier" | "modifiers" | "faction_modifiers" | "targeted_modifier" => Role::Modifier,
-        "immediate" | "complete_effect" | "remove_effect" | "timeout_effect" | "on_add" | "on_remove" | "select_effect" | "completion_reward" | "effect" | "option" | "on_cancel" | "on_completion" => Role::Effect,
+        "immediate" | "complete_effect" | "remove_effect" | "timeout_effect" | "on_add" | "on_remove" | "select_effect" | "completion_reward" | "effect" | "option" | "on_cancel" | "on_completion" | "complete_tooltip" => Role::Effect,
         "trigger" | "allowed" | "visible" | "available" | "cancel_trigger" | "target_trigger" | "cancel" | "enable" | "abort" | "remove_trigger" | "allow" | "allow_branch" | "bypass" | "allowed_civil_war" | "show_major" | "limit" | "can_be_removed" | "is_good" => Role::Trigger,
         _ => return None,
     })
@@ -126,6 +151,30 @@ pub enum Param {
     Resource,
     TechCategory,
     WarGoal,
+    /// A sprite (`GFX_...`): the content's and the base game's.
+    Sprite,
+    /// A leader's ideology: the sub-ideologies of the ideologies.
+    SubIdeology,
+    /// One of these.
+    Of(&'static [&'static str]),
+    /// The name of a file of a folder of the content, without its extension.
+    File(&'static str),
+    /// The id of a `block = { id = x }` in the files of a folder, the
+    /// content's and the base game's (folder, block).
+    IdIn(&'static str, &'static str),
+}
+
+/// What a value of a form's field is picked from (None: it is typed).
+pub fn param_of(ty: super::kinds::FieldType) -> Option<Param> {
+    use super::kinds::FieldType as F;
+    match ty {
+        F::Ref(k) => Some(Param::Ref(k)),
+        F::Tag => Some(Param::Tag),
+        F::State => Some(Param::State),
+        F::File(folder) => Some(Param::File(folder)),
+        F::IdIn(folder, block) => Some(Param::IdIn(folder, block)),
+        _ => None,
+    }
 }
 
 /// One entry of a catalog: `{0}`, `{1}`, ... in the template are the values.
@@ -501,7 +550,9 @@ mod tests {
         assert_eq!(role_of(Kind::Focus, "prerequisite"), Some(Role::Prerequisite));
         assert_eq!(role_of(Kind::FocusTree, "country"), Some(Role::TreeCountry));
         assert_eq!(role_of(Kind::Event, "country"), None);
-        assert_eq!(role_of(Kind::Character, "portraits"), None);
+        assert_eq!(role_of(Kind::Character, "portraits"), Some(Role::Values));
+        assert_eq!(role_of(Kind::Focus, "complete_tooltip"), Some(Role::Effect));
+        assert!(Role::Words.replaces() && Role::Words.is_shape() && !Role::Words.is_catalog());
         assert!(Role::Politics.replaces() && !Role::Effect.replaces());
     }
 

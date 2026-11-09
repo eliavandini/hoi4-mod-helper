@@ -132,6 +132,32 @@ pub fn example_of(name: &str, text: &str) -> Option<String> {
     Some(crate::content::script::format(&out.join("\n")).trim_end().to_string())
 }
 
+/// The documentation's text without its markdown: `[name](#link)` is the
+/// name, `### Examples` is `Examples:`, the lines keep their breaks.
+pub fn plain(text: &str) -> String {
+    let mut out = Vec::new();
+    for l in text.lines() {
+        let t = l.trim_end();
+        if let Some(h) = t.trim_start().strip_prefix("### ") {
+            out.push(format!("{}:", h.trim()));
+            continue;
+        }
+        // links
+        let mut line = String::new();
+        let mut rest = t;
+        while let Some(i) = rest.find('[') {
+            let Some(j) = rest[i..].find("](").map(|j| i + j) else { break };
+            let Some(k) = rest[j..].find(')').map(|k| j + k) else { break };
+            line.push_str(&rest[..i]);
+            line.push_str(&rest[i + 1..j]);
+            rest = &rest[k + 1..];
+        }
+        line.push_str(rest);
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
+}
+
 pub fn parse_entries(md: &str) -> Vec<Entry> {
     let mut out: Vec<Entry> = sections(md)
         .into_iter()
@@ -185,6 +211,12 @@ mod tests {
         assert_eq!(e[2].targets, ["THIS", "ROOT"]);
         assert_eq!(e[2].example.as_deref(), Some("load_focus_tree = {\n\ttree = persian_focus_tree\n}"));
         assert!(e[2].in_scope("state") && !e[0].in_scope("STATE"));
+    }
+
+    #[test]
+    fn plain_text() {
+        let t = "Create a faction, prefer [create_faction_from_template](#create_faction_from_template) instead.\n### Examples\nTAG = {\n\tcreate_faction = X\n}";
+        assert_eq!(plain(t), "Create a faction, prefer create_faction_from_template instead.\nExamples:\nTAG = {\n\tcreate_faction = X\n}");
     }
 
     #[test]

@@ -46,6 +46,11 @@ usage:
   mod-helper --convert OLD.project.json NEW.hoi4proj
                                         make a project file of a project of the old format (its
                                         settings and map folder; those are only read)
+  mod-helper --import-model MODEL PROJECT.hoi4proj [--name NAME] [--scale S | --height PX] [--up z]
+             [--snow] [--bumps] [--folder F] [--package P]
+                                        a new 3D model in the project's content: MODEL is a .glb,
+                                        .gltf, .obj or a .mesh of Paradox's Blender exporter; its
+                                        textures are made the game's DDS (see the Objects level)
   mod-helper --validate-mod MOD_DIR [GAME_DIR]
                                         check a built mod against the game's rules";
 
@@ -67,6 +72,7 @@ fn main() -> anyhow::Result<()> {
         Some("--validate-mod") => cli_validate_mod(&args[1..]),
         Some("--import-map") => cli_import_map(&args[1..]),
         Some("--convert") => cli_convert(&args[1..]),
+        Some("--import-model") => cli_import_model(&args[1..]),
         Some("--editor") => run_gui(args.get(1).map(PathBuf::from), app::Start::Editor),
         Some("--content") => run_gui(args.get(1).map(PathBuf::from), app::Start::Content),
         Some(a) if a.starts_with("--") => anyhow::bail!("unknown option {a}\n{USAGE}"),
@@ -193,6 +199,81 @@ fn cli_convert(args: &[String]) -> anyhow::Result<()> {
         println!("{l}");
     }
     println!("wrote {}", p.path.display());
+    Ok(())
+}
+
+fn cli_import_model(args: &[String]) -> anyhow::Result<()> {
+    use models::import;
+    let mut files: Vec<PathBuf> = Vec::new();
+    let (mut name, mut scale, mut height, mut up_z, mut snow, mut bumps, mut folder, mut package) = (None, None, None, false, false, false, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = |what: &str| it.next().cloned().ok_or_else(|| anyhow::anyhow!("{what} needs a value"));
+        match a.as_str() {
+            "--name" => name = Some(val("--name")?),
+            "--scale" => scale = Some(val("--scale")?.parse::<f32>()?),
+            "--height" => height = Some(val("--height")?.parse::<f32>()?),
+            "--up" => up_z = val("--up")?.eq_ignore_ascii_case("z"),
+            "--snow" => snow = true,
+            "--bumps" => bumps = true,
+            "--folder" => folder = Some(val("--folder")?),
+            "--package" => package = Some(val("--package")?),
+            x if x.starts_with("--") => anyhow::bail!("unknown option {x}\n{USAGE}"),
+            x => files.push(x.into()),
+        }
+    }
+    let [model, proj] = &files[..] else { anyhow::bail!("--import-model needs MODEL and PROJECT.{}\n{USAGE}", bundle::EXT) };
+    let src = import::read(model)?;
+    for n in &src.notes {
+        println!("note: {n}");
+    }
+    let mut o = import::Options::for_source(&src);
+    if let Some(n) = name {
+        o.name = n;
+    }
+    if let Some(f) = folder {
+        o.folder = f;
+    }
+    o.up = if up_z { import::Up::Z } else { import::Up::Y };
+    o.snow = snow;
+    if bumps {
+        for m in &mut o.mats {
+            if m.normal == import::NormalFrom::Flat {
+                m.normal = import::NormalFrom::Bumps;
+            }
+        }
+    }
+    o.scale = scale.unwrap_or(1.0);
+    if let Some(h) = height {
+        // the height at scale 1, then the scale for the height asked
+        o.scale = 1.0;
+        let raw = import::make(&src, &o)?;
+        let r = raw.mesh.max.y - raw.mesh.min.y;
+        anyhow::ensure!(r > 0.0, "the model has no height");
+        o.scale = h / r;
+    }
+    let made = import::make(&src, &o)?;
+    for n in &made.notes {
+        println!("note: {n}");
+    }
+    let (mut p, pf) = bundle::Project::open(proj)?;
+    let pkg = package.unwrap_or_else(|| content::store::SHARED.to_string());
+    let written = import::install(&made, &p.map_dir().join("content"), &pkg)?;
+    for w in &written {
+        println!("  content/{pkg}/{w}");
+    }
+    p.save(&pf, false)?;
+    let (lo, hi) = made.bounds();
+    let s = hi - lo;
+    println!(
+        "{}: {} triangles, {:.2} × {:.2} map px, {:.2} high; saved in {}",
+        made.entity,
+        made.mesh.triangles(),
+        s.x,
+        s.z,
+        s.y,
+        p.path.display()
+    );
     Ok(())
 }
 

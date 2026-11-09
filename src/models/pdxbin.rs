@@ -135,8 +135,7 @@ pub fn parse(b: &[u8]) -> Result<Node> {
     Ok(stack.pop().unwrap())
 }
 
-/// Write a tree in the same format (for tests and generated files).
-#[cfg(test)]
+/// Write a tree in the same format (generated models, tests).
 pub fn write(root: &Node) -> Vec<u8> {
     fn props(out: &mut Vec<u8>, n: &Node) {
         for (k, p) in &n.props {

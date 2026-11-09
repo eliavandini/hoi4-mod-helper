@@ -13,6 +13,12 @@
 //! of a focus tree, prerequisites and exclusive focuses, a country's
 //! politics, popularities, technologies and ideas, research bonuses, focus
 //! search filters and the battalions of a division template.
+//!
+//! The other blocks are built whole from a form ([`shapes`]): a character's
+//! roles, positions, lists, weights, names, rules, a colour, equipment
+//! bonuses.
+
+mod shapes;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -23,6 +29,7 @@ use super::{Cx, ERR, WARN, code};
 use crate::content::kinds::Kind;
 use crate::content::script::{self, Script};
 use crate::content::store::DefKey;
+use crate::content::shapes as sh;
 use crate::content::wizard::{self as wz, Item, Param, Role};
 
 /// Where what is built goes.
@@ -58,6 +65,8 @@ enum Pick {
 enum CondFor {
     If,
     Modifier,
+    /// A part of a form (`WizardState::part`).
+    Part,
 }
 
 #[derive(Default)]
@@ -98,9 +107,13 @@ pub struct WizardState {
     count: String,
     /// The pages were set from this field.
     init_for: Option<(DefKey, String, Option<usize>)>,
-    lists: Lists,
+    pub(super) lists: Lists,
     /// An entry to pick when the page shows next.
     pending_pick: Option<Pick>,
+    /// A field built from a form: what it has.
+    form: sh::Form,
+    /// The part of the form being built with a catalog: (path, label).
+    part: (String, String),
 }
 
 impl WizardState {
@@ -142,11 +155,11 @@ impl WizardState {
 
 /// (value, what it is) lists by kind of value, with the store generation and
 /// whether the base game was there when they were made.
-type Lists = HashMap<Param, (u64, bool, Arc<Vec<(String, String)>>)>;
+pub(super) type Lists = HashMap<Param, (u64, bool, Arc<Vec<(String, String)>>)>;
 
 /// (value, what it is) for a kind of value: the map's nations and states,
 /// ids of the content and the base game.
-fn list(cx: &Cx, lists: &mut Lists, p: Param) -> Arc<Vec<(String, String)>> {
+pub(super) fn list(cx: &Cx, lists: &mut Lists, p: Param) -> Arc<Vec<(String, String)>> {
     let key = (cx.st.generation, cx.base.is_some());
     if let Some((g, b, l)) = lists.get(&p)
         && (*g, *b) == key
@@ -183,6 +196,81 @@ fn list(cx: &Cx, lists: &mut Lists, p: Param) -> Arc<Vec<(String, String)>> {
         Param::Building => v = statics(wz::BUILDINGS),
         Param::Resource => v = statics(wz::RESOURCES),
         Param::TechCategory => v = statics(wz::TECH_CATEGORIES),
+        Param::Of(xs) => v = statics(xs),
+        Param::Sprite => {
+            let mut seen = BTreeSet::new();
+            for k in cx.st.defs().filter(|k| k.kind == Kind::Sprite) {
+                if seen.insert(k.id.clone()) {
+                    v.push((k.id.clone(), k.pkg.clone()));
+                }
+            }
+            if let Some(b) = cx.base {
+                v.extend(b.sprites.keys().filter(|n| !seen.contains(*n)).map(|n| (n.clone(), String::new())));
+            }
+            v.sort();
+        }
+        Param::SubIdeology => {
+            // the types of the ideologies: the content's, then the base game's
+            let mut seen = BTreeSet::new();
+            let mut add = |v: &mut Vec<(String, String)>, ideology: &str, types: &script::Block| {
+                for t in types.items.iter().filter_map(|i| i.key.as_ref()) {
+                    if seen.insert(t.text.clone()) {
+                        v.push((t.text.clone(), ideology.to_string()));
+                    }
+                }
+            };
+            for k in cx.st.defs().filter(|k| k.kind == Kind::Ideology) {
+                if let Some((d, _, s)) = cx.st.def(&k)
+                    && let Some(t) = d.block(s).and_then(|b| b.block("types"))
+                {
+                    add(&mut v, &k.id, t);
+                }
+            }
+            if let Some(b) = cx.base {
+                for d in b.of_kind(Kind::Ideology) {
+                    let Some(text) = b.text_of(d) else { continue };
+                    let s = Script::parse(&text);
+                    for i in &s.root.items {
+                        if let Some(t) = i.block().and_then(|bl| bl.block("types")) {
+                            add(&mut v, i.key(), t);
+                        }
+                    }
+                }
+            }
+        }
+        Param::File(folder) => {
+            let dir = format!("{folder}/");
+            let mut seen = BTreeSet::new();
+            for (pkg, p) in &cx.st.packages {
+                for path in p.files.keys() {
+                    if let Some(name) = path.strip_prefix(&dir).filter(|n| !n.contains('/'))
+                        && let Some((stem, _)) = name.rsplit_once('.')
+                        && seen.insert(stem.to_string())
+                    {
+                        v.push((stem.to_string(), pkg.clone()));
+                    }
+                }
+            }
+            // the starting divisions the build makes from the map
+            if folder == "history/units" {
+                v.extend(cx.facts.nations.iter().map(|n| format!("{}_1936", n.tag)).filter(|n| !seen.contains(n)).map(|n| (n, "made by the build from the map".to_string())));
+            }
+        }
+        Param::IdIn(folder, block) => {
+            let mut seen = BTreeSet::new();
+            let dir = format!("{folder}/");
+            for (pkg, p) in &cx.st.packages {
+                for (path, f) in p.files.iter().filter(|(path, _)| path.starts_with(&dir)) {
+                    let _ = path;
+                    for id in f.script.iter().flat_map(|s| s.root.blocks(block)).filter_map(|b| b.atom("id")) {
+                        if seen.insert(id.to_string()) {
+                            v.push((id.to_string(), pkg.clone()));
+                        }
+                    }
+                }
+            }
+            v.extend(base_ids(cx.game, folder, block).iter().filter(|id| !seen.contains(id.as_str())).map(|id| (id.clone(), "base game".to_string())));
+        }
         Param::WarGoal => {
             v = statics(wz::WAR_GOALS);
             if let Some(b) = cx.base {
@@ -196,9 +284,44 @@ fn list(cx: &Cx, lists: &mut Lists, p: Param) -> Arc<Vec<(String, String)>> {
     l
 }
 
+/// The ids of `block = { id = x }` in the base game's files of a folder
+/// (read once).
+fn base_ids(game: &std::path::Path, folder: &str, block: &str) -> Arc<Vec<String>> {
+    /// (game, folder, block) → ids.
+    type Ids = BTreeMap<(std::path::PathBuf, String, String), Arc<Vec<String>>>;
+    static CACHE: std::sync::Mutex<Ids> = std::sync::Mutex::new(BTreeMap::new());
+    let key = (game.to_path_buf(), folder.to_string(), block.to_string());
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(key)
+        .or_insert_with(|| {
+            let mut files: Vec<_> = std::fs::read_dir(game.join(folder)).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "txt")).collect();
+            files.sort();
+            let mut out = Vec::new();
+            for f in files {
+                let text = std::fs::read_to_string(&f).unwrap_or_default();
+                let s = Script::parse(&text);
+                out.extend(s.root.blocks(block).filter_map(|b| b.atom("id")).map(String::from));
+            }
+            out.dedup();
+            Arc::new(out)
+        })
+        .clone()
+}
+
 /// A text field with a searchable list of choices beside it.
 fn choose(ui: &mut egui::Ui, id: egui::Id, value: &mut String, items: &dyn Fn() -> Arc<Vec<(String, String)>>, width: f32) -> bool {
     let mut changed = ui.add(egui::TextEdit::singleline(value).id(id).desired_width(width)).changed();
+    if let Some(v) = pick_menu(ui, id, value, items) {
+        *value = v;
+        changed = true;
+    }
+    changed
+}
+
+/// A searchable list of choices behind a ▾: what is picked.
+pub(super) fn pick_menu(ui: &mut egui::Ui, id: egui::Id, value: &str, items: &dyn Fn() -> Arc<Vec<(String, String)>>) -> Option<String> {
+    let mut picked = None;
     ui.menu_button("▾", |ui| {
         let qid = id.with("q");
         let mut q: String = ui.data(|d| d.get_temp(qid)).unwrap_or_default();
@@ -217,15 +340,14 @@ fn choose(ui: &mut egui::Ui, id: egui::Id, value: &mut String, items: &dyn Fn() 
         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
             for (v, l) in hits {
                 let text = if l.is_empty() { v.clone() } else { format!("{v}   {l}") };
-                if ui.selectable_label(*value == *v, text).clicked() {
-                    *value = v.clone();
-                    changed = true;
+                if ui.selectable_label(value == v, text).clicked() {
+                    picked = Some(v.clone());
                     ui.close();
                 }
             }
         });
     });
-    changed
+    picked
 }
 
 /// The editor of one value of an entry.
@@ -264,6 +386,11 @@ fn param_ui(ui: &mut egui::Ui, cx: &Cx, lists: &mut Lists, id: egui::Id, p: Para
                 }
             }
             if p == Param::State
+                && let Some(s) = super::statemap::button(ui, cx, id.with("map"), value, false)
+            {
+                *value = s.to_string();
+            }
+            if p == Param::State
                 && let Ok(id) = value.trim().parse::<u32>()
             {
                 match cx.facts.state_names.get(&id) {
@@ -291,7 +418,11 @@ fn current(cx: &Cx, t: &Target) -> Option<String> {
 
 /// The values of the field's own pages, from what the field has.
 fn init(cx: &Cx, ws: &mut WizardState, t: &Target) {
-    let cur = current(cx, t).unwrap_or_default();
+    let had = current(cx, t);
+    if let Some(shape) = sh::shape_of(t.key.kind, &t.field) {
+        ws.form = sh::read(&shape, had.as_deref(), &sh::Fill { id: &t.key.id, tag: cx.tag() });
+    }
+    let cur = had.unwrap_or_default();
     let s = Script::parse(&cur);
     let atom = |k: &str| s.root.atom(k).map(str::to_string);
     let words = || -> Vec<String> { s.root.items.iter().filter_map(|i| i.key.as_ref().map(|k| k.text.clone())).collect() };
@@ -333,7 +464,7 @@ fn init(cx: &Cx, ws: &mut WizardState, t: &Target) {
         Role::Support => ws.battalion = "engineer".into(),
         _ => {}
     }
-    ws.first = ws.picks.clone();
+    ws.first = if t.role.is_shape() { ws.form.words.clone() } else { ws.picks.clone() };
     ws.init_for = Some((t.key.clone(), t.field.clone(), t.nth));
 }
 
@@ -360,12 +491,20 @@ pub fn window(ctx: &egui::Context, cx: &mut Cx, ws: &mut WizardState) -> Option<
                 pages.extend([Role::Effect, Role::Trigger, Role::Modifier]);
             } else if matches!(t.role, Role::AiWeight | Role::Mtth | Role::TreeCountry) {
                 pages.push(Role::Trigger);
+            } else if matches!(ws.cond_for, Some((CondFor::Part, _))) && page.is_catalog() {
+                pages.push(page);
             }
             let mut p = page;
             for r in pages {
                 ui.selectable_value(&mut p, r, RichText::new(r.label()).strong());
             }
             if p != page {
+                // back to the form from building a part of it: what was built goes in
+                if matches!(ws.cond_for, Some((CondFor::Part, _))) && !p.is_catalog() {
+                    ws.form.vals.insert(ws.part.0.clone(), ws.cond.trim().to_string());
+                    ws.cond.clear();
+                    ws.cond_for = None;
+                }
                 ws.page = Some(p);
                 ws.pick = None;
             }
@@ -376,11 +515,16 @@ pub fn window(ctx: &egui::Context, cx: &mut Cx, ws: &mut WizardState) -> Option<
         if let Some((what, back)) = ws.cond_for {
             ui.horizontal(|ui| {
                 let label = match what {
-                    CondFor::If => "the condition of the if",
-                    CondFor::Modifier => "the condition of the modifier",
+                    CondFor::If => "Conditions you add now go into the condition of the if.".to_string(),
+                    CondFor::Modifier => "Conditions you add now go into the condition of the modifier.".to_string(),
+                    CondFor::Part => format!("What you add now goes into “{}”.", ws.part.1),
                 };
-                ui.label(RichText::new(format!("Conditions you add now go into {label}.")).color(WARN));
+                ui.label(RichText::new(label).color(WARN));
                 if ui.button("✔ Done").clicked() {
+                    if what == CondFor::Part {
+                        ws.form.vals.insert(ws.part.0.clone(), ws.cond.trim().to_string());
+                        ws.cond.clear();
+                    }
                     ws.page = Some(back);
                     ws.cond_for = None;
                     ws.pick = None;
@@ -388,6 +532,12 @@ pub fn window(ctx: &egui::Context, cx: &mut Cx, ws: &mut WizardState) -> Option<
             });
         }
         ui.separator();
+        // a form: what the field will be, and what is wrong with it
+        let shape = sh::shape_of(t.key.kind, &t.field).filter(|_| t.role.is_shape());
+        let problems = shape.map(|s| {
+            ws.built = sh::write(&s, &ws.form);
+            sh::problems(&s, &ws.form)
+        });
         // what is built (at the bottom)
         let replace = t.role.replaces();
         egui::Panel::bottom("wizard_built").resizable(true).default_size(210.0).min_size(120.0).show(ui, |ui| {
@@ -414,7 +564,7 @@ pub fn window(ctx: &egui::Context, cx: &mut Cx, ws: &mut WizardState) -> Option<
                 code::editor(ui, egui::Id::unique("wizard_built_code"), &mut ws.built, code::Lang::Script, &errs, rows, &mut jump);
             }
             ui.horizontal(|ui| {
-                let ok = parsed.errors.is_empty() && (replace || !ws.built.trim().is_empty());
+                let ok = parsed.errors.is_empty() && (replace || !ws.built.trim().is_empty()) && problems.as_ref().is_none_or(|p| p.is_empty());
                 let label = match (replace, t.field.is_empty()) {
                     (true, _) => format!("Set {}", t.field),
                     (false, true) => "Insert into the code".to_string(),
@@ -427,12 +577,16 @@ pub fn window(ctx: &egui::Context, cx: &mut Cx, ws: &mut WizardState) -> Option<
                 }
                 if let Some(e) = parsed.errors.first() {
                     ui.label(RichText::new(format!("line {}: {}", script::line_of(&ws.built, e.at), e.message)).color(ERR).small());
+                } else if let Some(p) = problems.as_ref().and_then(|p| p.first()) {
+                    let more = problems.as_ref().map(|p| p.len() - 1).unwrap_or(0);
+                    ui.label(RichText::new(if more > 0 { format!("{p} (and {more} more)") } else { p.clone() }).color(WARN).small());
                 }
             });
         });
-        match page {
-            Role::Effect | Role::Trigger | Role::Modifier => catalog(ui, cx, ws, page),
-            r => own_page(ui, cx, ws, &t, r),
+        match (page, shape) {
+            (Role::Effect | Role::Trigger | Role::Modifier, _) => catalog(ui, cx, ws, page),
+            (_, Some(s)) => shapes::page(ui, cx, ws, &t, s),
+            (r, None) => own_page(ui, cx, ws, &t, r),
         }
     });
     if !open {
@@ -485,6 +639,9 @@ fn wrappers(ui: &mut egui::Ui, cx: &Cx, ws: &mut WizardState, page: Role) {
             }
             let states = list(cx, &mut ws.lists, Param::State);
             choose(ui, egui::Id::unique("wrap_state"), &mut ws.wrap_state, &|| states.clone(), 50.0);
+            if let Some(s) = super::statemap::button(ui, cx, egui::Id::unique("wrap_state_map"), &ws.wrap_state, false) {
+                ws.wrap_state = s.to_string();
+            }
             if ui.add_enabled(!empty && !ws.wrap_state.trim().is_empty(), egui::Button::new("for this state").small()).clicked() {
                 ws.built = wz::wrap(ws.wrap_state.trim(), &ws.built);
             }
@@ -660,7 +817,7 @@ fn doc_text(ui: &mut egui::Ui, e: &crate::content::docs::Entry) {
     if !e.text.is_empty() {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt(("doc_text", &e.name)).max_height(180.0).show(ui, |ui| {
-                ui.label(RichText::new(&e.text).monospace().small());
+                ui.label(RichText::new(crate::content::docs::plain(&e.text)).monospace().small());
             });
         });
     }
@@ -779,7 +936,11 @@ fn detail(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, page: Role) {
 
 fn add_button(ui: &mut egui::Ui, ws: &mut WizardState, line: &str, problem: Option<String>) {
     ui.horizontal(|ui| {
-        let into = if ws.cond_for.is_some() { "Add to the condition ↓" } else { "Add ↓" };
+        let into = match ws.cond_for {
+            Some((CondFor::Part, _)) => format!("Add to “{}” ↓", ws.part.1),
+            Some(_) => "Add to the condition ↓".to_string(),
+            None => "Add ↓".to_string(),
+        };
         if ui.add_enabled(problem.is_none(), egui::Button::new(RichText::new(into).strong())).clicked() {
             add_line(ws, line);
         }
@@ -789,7 +950,7 @@ fn add_button(ui: &mut egui::Ui, ws: &mut WizardState, line: &str, problem: Opti
     });
     if ws.cond_for.is_some() {
         ui.add_space(6.0);
-        ui.label(RichText::new("The condition so far:").weak());
+        ui.label(RichText::new(if matches!(ws.cond_for, Some((CondFor::Part, _))) { "So far:" } else { "The condition so far:" }).weak());
         ui.add(egui::TextEdit::multiline(&mut ws.cond).code_editor().desired_rows(3).desired_width(f32::INFINITY));
     }
 }
@@ -1052,4 +1213,47 @@ fn battalion_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, t: &Targ
             ui.end_row();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::content::gfx::Gfx;
+    use crate::content::store::Store;
+    use crate::content::ui::{LocCache, Settings};
+    use crate::editor::MapFacts;
+
+    const CHARS: &str = "characters = {\n\tTYR_hofer = {\n\t\tname = TYR_hofer\n\t\tcountry_leader = {\n\t\t\tideology = conservatism\n\t\t\ttraits = { popular_figure }\n\t\t\texpire = \"1965.1.1\"\n\t\t\tdesc = TYR_hofer_desc\n\t\t}\n\t}\n}\n";
+
+    fn with_cx<R>(st: &mut Store, f: impl FnOnce(&mut Cx) -> R) -> R {
+        let (mut gfx, mut settings, facts, loc) = (Gfx::default(), Settings::default(), MapFacts::default(), LocCache::default());
+        let (mut msg, mut nav) = (None, None);
+        let mut cx = Cx { st, base: None, gfx: &mut gfx, settings: &mut settings, facts: &facts, pkg: "TYR", nation: None, msg: &mut msg, nav: &mut nav, loc: &loc, game: std::path::Path::new("/none"), user_dir: std::path::Path::new("/none"), docs: &Default::default() };
+        f(&mut cx)
+    }
+
+    #[test]
+    fn a_form_is_read_from_the_definition_and_written_back() {
+        let mut st = Store::empty(std::env::temp_dir().join("mh-wizard-none"));
+        st.begin("setup");
+        st.set_text("TYR", "common/characters/TYR.txt", CHARS.to_string());
+        st.commit();
+        let key = st.defs_of(Some("TYR"), Kind::Character).into_iter().next().unwrap();
+        with_cx(&mut st, |cx| {
+            let mut ws = WizardState::default();
+            // the field there
+            let t = Target { key: key.clone(), field: "country_leader".into(), nth: Some(0), role: Role::Values, cursor: None };
+            init(cx, &mut ws, &t);
+            assert_eq!(ws.form.vals["ideology"], "conservatism");
+            assert_eq!(ws.form.vals["expire"], "1965.1.1");
+            ws.form.vals.insert("traits".into(), "popular_figure war_hero".into());
+            let shape = sh::shape_of(Kind::Character, "country_leader").unwrap();
+            assert_eq!(sh::write(&shape, &ws.form), "ideology = conservatism\ntraits = { popular_figure war_hero }\nexpire = \"1965.1.1\"\ndesc = TYR_hofer_desc");
+            // a new one: starts with the character's id and the nation's tag
+            let t = Target { key: key.clone(), field: "advisor".into(), nth: None, role: Role::Values, cursor: None };
+            init(cx, &mut ws, &t);
+            assert_eq!(ws.form.vals["idea_token"], "TYR_hofer");
+            assert_eq!(ws.form.vals["allowed"], "original_tag = TYR");
+        });
+    }
 }

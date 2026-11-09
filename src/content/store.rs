@@ -212,6 +212,20 @@ impl Store {
         Ok(st)
     }
 
+    /// Take in files something else wrote to disk (an imported model): what
+    /// the store holds of them becomes what is on disk.
+    pub fn adopt(&mut self, pkg: &str, rels: &[String]) -> Result<()> {
+        let dir = self.root.join(pkg);
+        for rel in rels {
+            let (body, bom) = read_body(&dir.join(rel), rel)?;
+            let p = self.packages.entry(pkg.to_string()).or_default();
+            p.removed.remove(rel);
+            p.files.insert(rel.clone(), SrcFile::new(rel, body.clone(), bom, Some(body)));
+        }
+        self.generation += 1;
+        Ok(())
+    }
+
     pub fn package(&self, name: &str) -> Option<&Package> {
         self.packages.get(name)
     }
