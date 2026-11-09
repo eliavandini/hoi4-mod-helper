@@ -134,7 +134,9 @@ and a report lists what came over and what did not.
 **What comes over:**
 - provinces: colour, type, terrain, and the name of their victory point;
 - states: owner, provinces, manpower, category, buildings, resources,
-  victory points, impassable;
+  victory points, impassable, cores (`add_core_of`, kept when they are not
+  just the owner's) and the occupier (`controller`, when it is not the
+  owner), of countries that own a state;
 - the countries that own them: name, colour, capital, ruling party;
 - strategic regions, adjacencies and their rules;
 - rivers (traced back into lines), railways, supply hubs, naval bases and 3D
@@ -157,8 +159,7 @@ rules or the build's checks:
 - Land and sea that touch only diagonally (vanilla has 155 such points) are
   a warning in the editor's checks, not an error.
 
-**Not imported:** cores and claims (the build gives each owner its states as
-cores), dated history, province buildings other than naval bases, the
+**Not imported:** claims, dated history, province buildings other than naval bases, the
 weather of strategic regions (the build writes its own), and sea provinces
 listed in states.
 
@@ -288,7 +289,21 @@ action, undo, save, build) and counts as unsaved. The fields:
 - Province: name, terrain (else derived from the land cover).
 - State: name, owner, impassable, population (manpower), state category,
   buildings (infrastructure, factories, dockyards, air base, anti-air,
-  refinery, silo, radar, rocket site, reactor), resources, victory points.
+  refinery, silo, radar, rocket site, reactor), resources, victory points,
+  cores and "occupied by":
+  - **cores:** the owner's alone (the default, "the owner (automatic)"),
+    other nations' as well or instead, or nobody's. A core is a nation's
+    own land: full manpower and factories from it, and the right to claim
+    it back. Cores of a merged or removed nation follow it or go.
+  - **occupied by:** a nation that holds the state at the start without
+    owning it (HOI4 `controller`). Colour mode *nations* stripes it in the
+    occupier's colour. The base game only starts occupations between
+    countries at war, so pair it with a war in the nations' history (or
+    expect the state to go back to its owner). A capital that starts
+    occupied is a warning: the owner's starting divisions are placed there.
+
+  So a state cored by nobody but held by an occupier is owner X, cores
+  "nobody", occupied by Y.
 - Nation: name, tag, colour, language (name lists), ruling ideology,
   settlement rank, capital, whether it starts with a militia.
 - Zone: name. Adjacency: name, type, sea province crossed, rule, ends.
@@ -788,8 +803,8 @@ The nations are down the left. For the one picked:
   build script without writing it by hand. What they add goes into the
   field where the cursor was (or replaces it, for fields that are a list),
   as one undo step.
-  - Effects, conditions and modifiers: the common ones by topic with a form
-    for their values (nations, states, ids of the content and the base game
+  - Effects, conditions and modifiers: the common ones by topic (to take,
+    occupy, core or claim a state, ...) with a form for their values (nations, states, ids of the content and the base game
     to pick from), and every effect, trigger and modifier of the game's own
     documentation, filtered by scope or category, with its description and
     example. Conditions can be negated.
@@ -910,7 +925,8 @@ It writes `<mods>/<folder>/` and `<mods>/<folder>.mod`:
   frame only if the option is on, ocean sounds over this map's sea zones, no
   Great Wall, and the editor's objects, with the entities they need in
   `gfx/entities/mod_helper_ambient.asset`);
-- **history:** states (category, manpower, buildings, victory points, the
+- **history:** states (owner, occupier as `controller`, cores as
+  `add_core_of`, category, manpower, buildings, victory points, the
   editor's naval bases), countries and their militia;
 - **countries:** one per nation, with tag, colour unlike its neighbours',
   procedural flag, and name lists by language;

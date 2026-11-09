@@ -466,6 +466,20 @@ impl Doc {
                 d.nations.get_mut(n).unwrap().capital_state = best;
             }
         }
+        // cores and occupiers: nations that are still there; held by its owner is not occupied
+        let nations = &d.nations;
+        for (_, s) in d.states.iter_mut() {
+            if let Some(c) = &mut s.cores {
+                let mut seen = Vec::new();
+                c.retain(|n| nations.contains(*n) && !seen.contains(n) && {
+                    seen.push(*n);
+                    true
+                });
+            }
+            if s.controller.is_some_and(|c| !nations.contains(c) || Some(c) == s.nation) {
+                s.controller = None;
+            }
+        }
         // adjacencies
         let provinces = &d.provinces;
         d.adjacencies.retain(|a| a.from != a.to && provinces.contains(a.from) && provinces.contains(a.to));

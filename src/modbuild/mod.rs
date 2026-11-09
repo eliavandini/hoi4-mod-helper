@@ -1021,7 +1021,12 @@ fn build_into(
         };
         *categories.entry(cat.clone()).or_default() += 1;
         let country = country_of_state(s.id);
-        let mut hist = vec![format!("\t\towner = {country}"), format!("\t\tadd_core_of = {country}")];
+        // the owner, who holds it when another does, the cores (the owner's unless set)
+        let mut hist = vec![format!("\t\towner = {country}")];
+        if let Some(c) = s.occupier().and_then(|n| tag_of.get(&n)) {
+            hist.push(format!("\t\tcontroller = {c}"));
+        }
+        hist.extend(s.core_nations().iter().filter_map(|n| tag_of.get(n)).map(|c| format!("\t\tadd_core_of = {c}")));
         for (p, val) in vps.get(&s.id).into_iter().flatten() {
             hist.push(format!("\t\tvictory_points = {{ {p} {val} }}"));
         }

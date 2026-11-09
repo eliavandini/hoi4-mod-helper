@@ -67,6 +67,7 @@ fn field_name(k: &str) -> &str {
         "victory_points" => "victory points",
         "color" => "colour",
         "through" => "sea crossed",
+        "controller" => "occupied by",
         "start" | "stop" => "ends",
         k => k,
     }
@@ -256,6 +257,43 @@ mod tests {
         assert_eq!(cur.manpower, None);
         assert_eq!(cur.buildings, BTreeMap::from([("air_base".to_string(), 1), ("infrastructure".to_string(), 4)]));
         assert!(merge_changes(&mut cur, &orig, &orig).unwrap().is_empty());
+    }
+
+    /// Cores and an occupier set in the panel are saved, follow a merge of
+    /// nations, and go when they name the owner or a nation that is gone.
+    #[test]
+    fn cores_and_occupation() {
+        let dir = out_dir("cores");
+        let mut ed = Editor::new(Settings::default());
+        ed.doc = Some(tiny(dir.clone()));
+        ed.settings.level = Level::States;
+        ed.sel = vec![2];
+        ed.sync_draft();
+        let s = state_draft(&mut ed);
+        assert_eq!((s.core_nations(), s.occupier()), (vec![2], None), "automatic: the owner's core, not occupied");
+        s.cores = Some(vec![1, 2]);
+        s.controller = Some(1);
+        ed.sel = vec![1];
+        ed.sync_draft();
+        let b = ed.doc.as_ref().unwrap().data.states.get(2).unwrap().clone();
+        assert_eq!((b.cores.clone(), b.occupier()), (Some(vec![1, 2]), Some(1)));
+        // B is N2's capital: a warning
+        let msgs: Vec<String> = super::super::validate::validate(&super::super::validate::Snapshot::of(ed.doc.as_ref().unwrap())).into_iter().map(|i| i.msg).collect();
+        assert!(msgs.iter().any(|m| m.starts_with("the capital of N2 is occupied by N1")), "{msgs:?}");
+        // saved and read again
+        ed.doc.as_mut().unwrap().save().unwrap();
+        let l = model::load(&dir, &crate::util::Progress::default()).unwrap();
+        let b2 = l.data.states.get(2).unwrap();
+        assert_eq!((b2.cores.clone(), b2.controller), (Some(vec![1, 2]), Some(1)));
+        // N1 merged into N2: the core is N2's (once), and N2 holds its own state
+        ed.run("merge", |d, _| d.merge_nations(&[2, 1]).map(|_| String::new()));
+        let d = &ed.doc.as_ref().unwrap().data;
+        assert!(!d.nations.contains(1));
+        let b = d.states.get(2).unwrap();
+        assert_eq!((b.cores.clone(), b.controller), (Some(vec![2]), None));
+        // N1's own state is now N2's
+        let a = d.states.get(1).unwrap();
+        assert_eq!(a.nation, Some(2));
     }
 
     /// The panel's edits survive selecting something else, changing level,

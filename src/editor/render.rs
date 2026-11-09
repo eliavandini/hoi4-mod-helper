@@ -21,6 +21,9 @@ pub struct RenderStyle {
     pub borders: bool,
     /// A colour per map pixel instead of the fill, in some provinces.
     pub pixels: Option<PixelFill>,
+    /// Diagonal stripes of this colour over the fill, per province id
+    /// (alpha 0: none; occupied states).
+    pub stripes: Vec<[u8; 4]>,
 }
 
 /// Colours per map pixel (terrain.bmp, the heightmap).
@@ -37,7 +40,7 @@ pub struct PixelFill {
 
 impl RenderStyle {
     pub fn empty() -> Self {
-        RenderStyle { fill: Vec::new(), group_a: Vec::new(), group_b: Vec::new(), selected: Vec::new(), borders: true, pixels: None }
+        RenderStyle { fill: Vec::new(), group_a: Vec::new(), group_b: Vec::new(), selected: Vec::new(), borders: true, pixels: None, stripes: Vec::new() }
     }
 }
 
@@ -106,6 +109,12 @@ pub fn render(lab: &Labels, st: &RenderStyle, level: u8, r: [u32; 4]) -> ColorIm
         for i in 0..tw {
             let a = cur[i + 1];
             let mut c = pixel(a, xs[i + 1], ys[j + 1]).unwrap_or_else(|| fill(a));
+            // stripes 4 screen pixels wide at any zoom (counted in pixels of this level)
+            if let Some(&sc) = st.stripes.get(a as usize).filter(|sc| sc[3] != 0)
+                && ((xs[i + 1] / s + ys[j + 1] / s) / 4) % 2 == 0
+            {
+                c = sc;
+            }
             let sa = sel(a);
             if sa {
                 c = [((c[0] as u32 + 255) / 2) as u8, ((c[1] as u32 + 230) / 2) as u8, ((c[2] as u32 + 120) / 2) as u8, c[3].max(170)];

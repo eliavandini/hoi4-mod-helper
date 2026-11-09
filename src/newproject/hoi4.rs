@@ -445,6 +445,9 @@ pub fn import(src: &Source, out: &Path, meta: &ModMeta, proj: &Projection, progr
     progress.set_stage("reading the states");
     let cats: BTreeSet<&str> = modbuild::CATEGORY_SLOTS.iter().map(|c| c.0).collect();
     let mut owners: BTreeMap<String, Vec<Id>> = BTreeMap::new();
+    // by state: the tags with a core on it, and the tag that holds it
+    let mut core_tags: BTreeMap<Id, Vec<String>> = BTreeMap::new();
+    let mut controllers: BTreeMap<Id, String> = BTreeMap::new();
     let state_files = fs.list("history/states", "txt", false);
     for f in &state_files {
         let Ok(t) = vanilla::read_text(f) else { continue };
@@ -469,6 +472,8 @@ pub fn import(src: &Source, out: &Path, meta: &ModMeta, proj: &Projection, progr
                 buildings: BTreeMap::new(),
                 resources: BTreeMap::new(),
                 victory_points: Vec::new(),
+                cores: None,
+                controller: None,
                 extra: Map::new(),
             };
             if !key.is_empty() {
@@ -527,9 +532,13 @@ pub fn import(src: &Source, out: &Path, meta: &ModMeta, proj: &Projection, progr
                 if dated > 0 {
                     *left_out.entry("dated history entries of states").or_default() += dated;
                 }
-                let cores = hist.all("add_core_of").count() + hist.all("add_claim_by").count();
-                if cores > 0 {
-                    *left_out.entry("cores and claims (the build gives the owner its states as cores)").or_default() += cores;
+                core_tags.insert(sid, hist.all("add_core_of").filter_map(|i| i.text()).map(str::to_string).collect());
+                if let Some(c) = hist.atom("controller") {
+                    controllers.insert(sid, c.to_string());
+                }
+                let claims = hist.all("add_claim_by").count();
+                if claims > 0 {
+                    *left_out.entry("claims on states").or_default() += claims;
                 }
             }
             if let Some(pb) = st.block("provinces") {
@@ -583,6 +592,7 @@ pub fn import(src: &Source, out: &Path, meta: &ModMeta, proj: &Projection, progr
     let mut kept_tags = 0;
     let mut sizes: Vec<(String, usize)> = owners.iter().map(|(t, s)| (t.clone(), s.len())).collect();
     sizes.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut nation_of_tag: BTreeMap<String, Id> = BTreeMap::new();
     for (tag, _) in &sizes {
         let states = &owners[tag];
         let color = tag_files.get(tag).and_then(|f| fs.text(&format!("common/{f}"))).and_then(|t| {
@@ -635,6 +645,23 @@ pub fn import(src: &Source, out: &Path, meta: &ModMeta, proj: &Projection, progr
             if let Some(st) = data.states.get_mut(s) {
                 st.nation = Some(nid);
             }
+        }
+        nation_of_tag.insert(tag.clone(), nid);
+    }
+    // cores (kept when they are not just the owner's) and occupiers, of the countries that own states
+    for (sid, st) in data.states.iter_mut() {
+        let cores: Vec<Id> = core_tags.get(&sid).into_iter().flatten().filter_map(|t| nation_of_tag.get(t).copied()).collect();
+        let lost = core_tags.get(&sid).map_or(0, |c| c.len()) - cores.len();
+        if lost > 0 {
+            *left_out.entry("cores of countries that own no state").or_default() += lost;
+        }
+        if cores != st.nation.into_iter().collect::<Vec<_>>() {
+            st.cores = Some(cores);
+        }
+        match controllers.get(&sid).map(|t| nation_of_tag.get(t)) {
+            Some(Some(&c)) if Some(c) != st.nation => st.controller = Some(c),
+            Some(None) => *left_out.entry("occupiers that own no state").or_default() += 1,
+            _ => {}
         }
     }
     let unowned = data.states.iter().filter(|(_, s)| s.nation.is_none()).count();
@@ -1018,11 +1045,12 @@ mod tests {
         put(game.join("localisation/english/map_l_english.yml"), "l_english:\n STRATEGICREGION_1:0 \"Heartland\"\n STATE_1:0 \"Old state\"\n VICTORY_POINTS_2:0 \"Midtown\"\n");
         // the mod replaces the states: two of them, owned by a new country
         put(md.join("descriptor.mod"), "name=\"Tiny\"\nversion=\"2.0\"\nreplace_path=\"history/states\"\n");
-        put(md.join("history/states/1-West.txt"), "state={ id=1 name=\"STATE_1\" manpower=5000 state_category=city provinces={ 1 } history={ owner = TIN victory_points = { 1 5 } buildings = { infrastructure = 3 1 = { naval_base = 2 } } 1939.1.1 = { owner = GER } } }\n");
-        put(md.join("history/states/2-East.txt"), "state={ id=2 name=\"STATE_2\" state_category=made_up provinces={ 2 } history={ owner = TIN } }\n");
+        put(md.join("history/states/1-West.txt"), "state={ id=1 name=\"STATE_1\" manpower=5000 state_category=city provinces={ 1 } history={ owner = TIN add_core_of = TIN victory_points = { 1 5 } buildings = { infrastructure = 3 1 = { naval_base = 2 } } 1939.1.1 = { owner = GER } } }\n");
+        // East is another country's, also a core of Tiny (and of Germany, which owns nothing), held by Tiny
+        put(md.join("history/states/2-East.txt"), "state={ id=2 name=\"STATE_2\" state_category=made_up provinces={ 2 } history={ owner = SEC add_core_of = SEC add_core_of = TIN add_core_of = GER controller = TIN } }\n");
         put(md.join("common/country_tags/01_tiny.txt"), "TIN = \"countries/Tiny.txt\"\n");
         put(md.join("common/countries/Tiny.txt"), "color = rgb { 200 100 50 }\n");
-        put(md.join("history/countries/TIN - Tiny.txt"), "capital = 2\nset_politics = { ruling_party = communism }\n");
+        put(md.join("history/countries/TIN - Tiny.txt"), "capital = 1\nset_politics = { ruling_party = communism }\n");
         put(md.join("localisation/english/tiny_l_english.yml"), "l_english:\n TIN:0 \"Tinyland\"\n STATE_1:0 \"West\"\n STATE_2:0 \"East\"\n");
 
         let src = Source { game: game.clone(), mod_dir: Some(md.clone()) };
@@ -1045,9 +1073,16 @@ mod tests {
         assert_eq!(west.victory_points, vec![[1, 5]]);
         assert_eq!(west.buildings.get("infrastructure"), Some(&3));
         assert_eq!(d.states.get(2).unwrap().category, None, "unknown categories are left to the build");
-        assert_eq!(d.nations.count(), 1);
-        let n = d.nations.iter().next().unwrap().1;
-        assert_eq!((n.name.as_str(), n.tag.as_deref(), n.color, n.ideology.as_deref(), n.capital_state), ("Tinyland", Some("TIN"), Some([200, 100, 50]), Some("communism"), 2));
+        assert_eq!(d.nations.count(), 2);
+        let (tin, n) = d.nations.iter().find(|(_, n)| n.tag.as_deref() == Some("TIN")).unwrap();
+        assert_eq!((n.name.as_str(), n.color, n.ideology.as_deref(), n.capital_state), ("Tinyland", Some([200, 100, 50]), Some("communism"), 1));
+        // cores and occupation: the owner's alone is automatic; Germany owns no state
+        let east = d.states.get(2).unwrap();
+        let sec = east.nation.unwrap();
+        assert_ne!(sec, tin);
+        assert_eq!((west.cores.clone(), west.controller), (None, None));
+        assert_eq!((east.cores.clone(), east.controller, east.occupier()), (Some(vec![sec, tin]), Some(tin), Some(tin)));
+        assert!(joined.contains("cores of countries that own no state"), "{joined}");
         assert_eq!(d.regions.count(), 2);
         let r1 = d.regions.get(1).unwrap();
         assert_eq!((r1.name.as_str(), r1.naval), ("Heartland", false));

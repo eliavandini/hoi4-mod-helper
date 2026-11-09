@@ -113,6 +113,8 @@ pub fn create_blank(dir: &Path, w: u32, h: u32, fill: Fill, proj: &Projection, m
                     buildings: Default::default(),
                     resources: Default::default(),
                     victory_points: Vec::new(),
+                    cores: None,
+                    controller: None,
                     extra: Map::new(),
                 },
             );

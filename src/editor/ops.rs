@@ -1127,6 +1127,8 @@ impl Doc {
             buildings: Default::default(),
             resources: Default::default(),
             victory_points: Vec::new(),
+            cores: None,
+            controller: None,
             extra: Default::default(),
         })
     }
@@ -1228,6 +1230,11 @@ impl Doc {
             if l != keep {
                 n += 1;
                 let id = self.new_state(format!("{} {}", st.name, roman(n)), st.nation, st.impassable);
+                // the pieces keep who has cores on it and who holds it
+                if let Some(x) = self.data.states.get_mut(id) {
+                    x.cores = st.cores.clone();
+                    x.controller = st.controller;
+                }
                 if let Some(m) = st.manpower {
                     let share = (m as f64 * sz as f64 / total as f64).round() as u64;
                     self.data.states.get_mut(id).unwrap().manpower = Some(share);
@@ -1452,6 +1459,16 @@ impl Doc {
         }
         let states: Vec<Id> = ids[1..].iter().flat_map(|&n| self.index.states_of_nation(n).to_vec()).collect();
         self.assign_states_to_nation(&states, target);
+        // their cores and occupations are the merged nation's
+        let to = |n: Id| if ids[1..].contains(&n) { target } else { n };
+        for (_, s) in self.data.states.iter_mut() {
+            if let Some(c) = &mut s.cores {
+                for n in c.iter_mut() {
+                    *n = to(*n);
+                }
+            }
+            s.controller = s.controller.map(to);
+        }
         Ok(target)
     }
 
@@ -2256,6 +2273,8 @@ mod tests {
             buildings: Default::default(),
             resources: Default::default(),
             victory_points: Vec::new(),
+            cores: None,
+            controller: None,
             extra: blank(),
         });
         let mut zone = |name: &str, naval| doc.data.regions.push(|id| Region { id, name: name.into(), naval, provinces: Vec::new(), states: Vec::new(), extra: blank() });

@@ -105,8 +105,25 @@ pub struct State {
     /// [province, value]; empty = automatic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub victory_points: Vec<[u32; 2]>,
+    /// The nations with a core on it; None: its owner alone, empty: nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<Vec<Id>>,
+    /// The nation that holds it when that is not its owner (it starts occupied).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller: Option<Id>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl State {
+    /// The nations with a core on it: its own list, else its owner.
+    pub fn core_nations(&self) -> Vec<Id> {
+        self.cores.clone().unwrap_or_else(|| self.nation.into_iter().collect())
+    }
+    /// The nation that occupies it (holds it without owning it).
+    pub fn occupier(&self) -> Option<Id> {
+        self.controller.filter(|c| Some(*c) != self.nation)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

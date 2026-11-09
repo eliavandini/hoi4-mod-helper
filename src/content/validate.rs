@@ -54,8 +54,8 @@ pub struct Facts {
 }
 
 /// Keys whose value is a state id.
-const STATE_KEYS: [&str; 10] =
-    ["transfer_state", "add_state_core", "remove_state_core", "add_state_claim", "remove_state_claim", "owns_state", "controls_state", "has_full_control_of_state", "is_core_of", "set_capital"];
+const STATE_KEYS: [&str; 11] =
+    ["transfer_state", "set_state_controller", "add_state_core", "remove_state_core", "add_state_claim", "remove_state_claim", "owns_state", "controls_state", "has_full_control_of_state", "is_core_of", "set_capital"];
 /// Keys whose value is a tag.
 const TAG_KEYS: [&str; 14] = [
     "tag",

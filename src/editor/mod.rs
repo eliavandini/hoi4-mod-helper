@@ -478,6 +478,9 @@ pub struct Editor {
     backups_at_start: bool,
     /// Open and show "Generation parameters" ($MOD_HELPER_OPEN=generation, for screenshots).
     generation_at_start: bool,
+    /// Select this entity and zoom to it once the map is open
+    /// ($MOD_HELPER_SELECT=States:12, a level's name and an id; for screenshots).
+    select_at_start: Option<(Level, Id)>,
     /// The game launcher in the build window.
     launcher: launcher::Launcher,
     /// The "Province from image" window.
@@ -590,6 +593,10 @@ impl Editor {
             meta_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "details" || v == "terrain"),
             backups_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "backups"),
             generation_at_start: std::env::var("MOD_HELPER_OPEN").is_ok_and(|v| v == "generation"),
+            select_at_start: std::env::var("MOD_HELPER_SELECT").ok().and_then(|v| {
+                let (l, id) = v.split_once(':')?;
+                Some((Level::ALL.into_iter().find(|x| x.name() == l)?, id.parse().ok()?))
+            }),
             launcher: launcher::Launcher::default(),
             from_image: from_image::FromImage::at_start(),
             ask_close: false,
@@ -1475,6 +1482,7 @@ impl Editor {
         let mut ga = vec![0u32; n];
         let mut gb = vec![0u32; n];
         let mut selected = vec![false; n];
+        let mut stripes = vec![[0u8; 4]; n];
         const SEA: [u8; 3] = [42, 72, 120];
         const LAKE: [u8; 3] = [92, 150, 160];
         let km2 = d.km2_per_px();
@@ -1502,7 +1510,15 @@ impl Editor {
                 MapMode::Nations => match pr.kind {
                     Kind::Sea => SEA,
                     Kind::Lake => LAKE,
-                    Kind::Land => dim(d.nations.get(nation).and_then(|x| x.color).unwrap_or_else(|| render::id_colour(nation, 2))),
+                    Kind::Land => {
+                        let colour = |n: Id| dim(d.nations.get(n).and_then(|x| x.color).unwrap_or_else(|| render::id_colour(n, 2)));
+                        // occupied: stripes of the occupier's colour
+                        if let Some(o) = st.and_then(|x| x.occupier()) {
+                            let c = colour(o);
+                            stripes[i] = [c[0], c[1], c[2], 255];
+                        }
+                        colour(nation)
+                    }
                 },
                 MapMode::AirZones => match pr.kind {
                     Kind::Sea => [35, 50, 75],
@@ -1593,7 +1609,7 @@ impl Editor {
             MapMode::Heightmap => self.pixel_fill(doc, true),
             _ => None,
         };
-        RenderStyle { fill, group_a: ga, group_b: gb, selected, borders: self.settings.borders, pixels }
+        RenderStyle { fill, group_a: ga, group_b: gb, selected, borders: self.settings.borders, pixels, stripes }
     }
 
     fn map_labels(&mut self) {
@@ -2235,6 +2251,13 @@ impl Editor {
                 self.apply(a, &ctx);
             }
             return;
+        }
+        if let Some((level, id)) = self.select_at_start.take() {
+            self.set_level(level);
+            self.sel = vec![id];
+            self.sync_draft();
+            let provs = Self::provinces_of(self.doc.as_ref().unwrap(), level, &self.sel);
+            self.zoom_provinces(&provs);
         }
         self.header_ui(ui, &mut acts);
         ui.separator();
@@ -3384,6 +3407,19 @@ impl Editor {
                     ui.label("nation");
                     ui.label(format!("{} ({})", d.nation_name(d.nation_of(p)), d.nation_of(p)));
                     ui.end_row();
+                    if let Some(x) = d.states.get(st) {
+                        if let Some(o) = x.occupier() {
+                            ui.label("occupied by");
+                            ui.label(format!("{} ({o})", d.nation_name(o)));
+                            ui.end_row();
+                        }
+                        if x.cores.is_some() {
+                            let cores = x.core_nations();
+                            ui.label("cores");
+                            ui.label(if cores.is_empty() { "nobody".to_string() } else { cores.iter().map(|&n| d.nation_name(n)).collect::<Vec<_>>().join(", ") });
+                            ui.end_row();
+                        }
+                    }
                 }
                 ui.label("zone");
                 ui.label(format!("{} ({})", d.region_name(d.region_of(p)), d.region_of(p)));
@@ -3691,6 +3727,16 @@ fn province_props(ui: &mut egui::Ui, id: Id, p: &mut Province, doc: &Doc, acts: 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// A filter field and the nations whose name has it, by name.
+fn nation_choices<'a>(ui: &mut egui::Ui, d: &'a model::MapData, filter: &mut String) -> Vec<(Id, &'a str)> {
+    ui.add(egui::TextEdit::singleline(filter).hint_text("filter…"));
+    let f = filter.to_lowercase();
+    let mut list: Vec<(Id, &str)> = d.nations.iter().map(|(n, x)| (n, x.name.as_str())).filter(|(_, nm)| f.is_empty() || nm.to_lowercase().contains(&f)).collect();
+    list.sort_by_key(|x| x.1.to_lowercase());
+    list.truncate(300);
+    list
+}
+
 fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut String, vp_new: &mut (Id, u32), sealed: Option<&[f64]>, acts: &mut Vec<Act>) {
     let d = &doc.data;
     let provs = doc.index.provs_of_state(id);
@@ -3703,14 +3749,59 @@ fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut
         ui.vertical(|ui| {
             let cur = s.nation.map(|n| format!("{} ({n})", d.nation_name(n))).unwrap_or_else(|| "—".into());
             egui::ComboBox::from_id_salt("owner").selected_text(cur).height(320.0).show_ui(ui, |ui| {
-                ui.add(egui::TextEdit::singleline(filter).hint_text("filter…"));
-                let f = filter.to_lowercase();
-                let mut list: Vec<(Id, &str)> = d.nations.iter().map(|(n, x)| (n, x.name.as_str())).filter(|(_, nm)| f.is_empty() || nm.to_lowercase().contains(&f)).collect();
-                list.sort_by_key(|x| x.1.to_lowercase());
-                for (n, nm) in list.into_iter().take(300) {
+                for (n, nm) in nation_choices(ui, d, filter) {
                     ui.selectable_value(&mut s.nation, Some(n), nm);
                 }
             });
+        });
+        ui.end_row();
+        ui.label("cores").on_hover_text(
+            "Nations that count the state as their own land. A core gives the full manpower and factories of the state, and a nation may take back its cores by war. Automatic: the owner.",
+        );
+        ui.vertical(|ui| {
+            let mut auto = s.cores.is_none();
+            if ui.checkbox(&mut auto, "the owner (automatic)").changed() {
+                s.cores = if auto { None } else { Some(s.nation.into_iter().collect()) };
+            }
+            if let Some(cores) = &mut s.cores {
+                let mut remove = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (i, &n) in cores.iter().enumerate() {
+                        if ui.small_button(format!("{} ✖", d.nation_name(n))).on_hover_text("take this core away").clicked() {
+                            remove = Some(i);
+                        }
+                    }
+                    if cores.is_empty() {
+                        ui.label(RichText::new("nobody").weak());
+                    }
+                });
+                if let Some(i) = remove {
+                    cores.remove(i);
+                }
+                let mut add = None;
+                egui::ComboBox::from_id_salt("addcore").selected_text("add a core…").height(320.0).show_ui(ui, |ui| {
+                    for (n, nm) in nation_choices(ui, d, filter) {
+                        if !cores.contains(&n) && ui.selectable_label(false, nm).clicked() {
+                            add = Some(n);
+                        }
+                    }
+                });
+                cores.extend(add);
+            }
+        });
+        ui.end_row();
+        ui.label("occupied by").on_hover_text(
+            "The nation that holds the state at the start instead of its owner. The base game starts states occupied only between countries at war.",
+        );
+        let cur = s.occupier().map(|n| format!("{} ({n})", d.nation_name(n))).unwrap_or_else(|| "nobody".into());
+        egui::ComboBox::from_id_salt("controller").selected_text(cur).height(320.0).show_ui(ui, |ui| {
+            ui.selectable_value(&mut s.controller, None, "nobody: the owner holds it");
+            let owner = s.nation;
+            for (n, nm) in nation_choices(ui, d, filter) {
+                if Some(n) != owner {
+                    ui.selectable_value(&mut s.controller, Some(n), nm);
+                }
+            }
         });
         ui.end_row();
         ui.label("impassable");

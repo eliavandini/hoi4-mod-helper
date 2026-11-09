@@ -207,6 +207,14 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
                 prov: doc.index.states_of_nation(n).first().and_then(|&s| doc.index.provs_of_state(s).first().copied()),
             });
         }
+        if let Some(o) = cap.and_then(|c| c.occupier()) {
+            out.push(Issue {
+                severity: Severity::Warning,
+                msg: format!("the capital of {} is occupied by {}: its starting divisions are placed there; pick another capital", nat.name, d.nation_name(o)),
+                at: None,
+                prov: doc.index.provs_of_state(nat.capital_state).first().copied(),
+            });
+        }
         if let Some(t) = &nat.tag {
             if t.len() != 3 || !t.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) || !t.starts_with(|c: char| c.is_ascii_uppercase()) {
                 out.push(Issue { severity: Severity::Error, msg: format!("tag {t} of {} is not three capitals/digits starting with a letter", nat.name), at: None, prov: None });

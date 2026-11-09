@@ -243,6 +243,7 @@ pub const EFFECTS: &[Item] = &[
     it("States", "Remove a core", "remove_state_core", STATE, "remove_state_core = {0}"),
     it("States", "Claim on a state", "add_state_claim", STATE, "add_state_claim = {0}"),
     it("States", "Take a state", "transfer_state", STATE, "transfer_state = {0}"),
+    it("States", "Occupy a state (control it, not own it)", "set_state_controller", STATE, "set_state_controller = {0}"),
     it("States", "Move the capital", "set_capital", STATE, "set_capital = { state = {0} }"),
     // diplomacy
     it("Diplomacy", "Annex a country", "annex_country", TAG, "annex_country = {\n\ttarget = {0}\n\ttransfer_troops = yes\n}"),
