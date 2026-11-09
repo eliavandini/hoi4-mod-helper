@@ -1,7 +1,7 @@
 //! Tests on a copy of the mod's real map (ignored by default, they need the
-//! map files: `cargo test --release -- --ignored editor`). The copy goes to
-//! `$MOD_HELPER_TEST_OUT` (or the system temp folder); the originals are only
-//! read.
+//! map files: `MOD_HELPER_TEST_MAPS=<the maps folder> cargo test --release --
+//! --ignored editor`). The copy goes to `$MOD_HELPER_TEST_OUT` (or the system
+//! temp folder); the originals are only read.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +10,8 @@ use super::doc::Doc;
 use super::model::{self, Id, Kind};
 use super::ops::{Constraint, GenParams, Retile};
 use super::validate::{self, Issue, Severity, Snapshot};
-use super::{default_map_dir, density};
+use super::density;
+use crate::modbuild::bitmaps::{self, Sources};
 use crate::util::Progress;
 
 fn out_dir(name: &str) -> PathBuf {
@@ -21,17 +22,28 @@ fn out_dir(name: &str) -> PathBuf {
     d
 }
 
-/// Copy the map's own files; link the (read-only) terrain inputs.
+/// The real map's folder.
+fn map_src() -> PathBuf {
+    crate::util::test_maps_dir().join("processed maps/suedtirol")
+}
+
+/// The real map's elevation and land cover (read where they are).
+fn sources() -> Sources {
+    let src = map_src();
+    Sources { dem: Some(src.join(bitmaps::DEM_FILE)), cover: Some(src.join(bitmaps::COVER_FILE)) }
+}
+
+/// Where the HOI4 install is, mods go to `out_dir(mods)`, the real map's data.
+fn dirs(mods: &str) -> crate::modbuild::Dirs {
+    crate::modbuild::Dirs { game: crate::modbuild::default_game_dir(), mods: out_dir(mods), sources: sources() }
+}
+
+/// Copy the map's own files.
 fn copy_map(to: &Path) {
-    let src = default_map_dir().expect("maps folder not found");
+    let src = map_src();
     for f in ["provinces.bmp", "provinces.json", "provinces.wld", "provinces.bmp.aux.xml"] {
         if src.join(f).exists() {
             std::fs::copy(src.join(f), to.join(f)).unwrap();
-        }
-    }
-    for f in ["dem_section.tif", "landcover_smooth.bmp", "landcover_smooth.wld", "landcover_smooth.bmp.aux.xml"] {
-        if src.join(f).exists() {
-            std::os::unix::fs::symlink(src.join(f), to.join(f)).unwrap();
         }
     }
 }
@@ -41,7 +53,7 @@ fn open(dir: &Path, terrain: bool) -> Doc {
     let l = model::load(dir, &p).unwrap();
     let mut doc = Doc::new(dir.to_path_buf(), l);
     if terrain {
-        let t = density::load_terrain(dir, doc.w, doc.h, doc.data.pixel_m, &p).unwrap();
+        let t = density::load_terrain(&sources(), doc.w, doc.h, doc.data.pixel_m, doc.heights.as_deref().map(|v| v.as_slice()), &p).unwrap();
         doc.terrain = Some(Arc::new(t));
     }
     doc
@@ -87,7 +99,7 @@ fn step(doc: &mut Doc, label: &str, f: impl FnOnce(&mut Doc) -> anyhow::Result<S
 }
 
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_loads_validates_and_round_trips() {
     let dir = out_dir("roundtrip");
     copy_map(&dir);
@@ -171,7 +183,7 @@ fn real_map_loads_validates_and_round_trips() {
 }
 
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_edits_keep_it_valid() {
     let dir = out_dir("edits");
     copy_map(&dir);
@@ -413,7 +425,7 @@ fn real_map_edits_keep_it_valid() {
     assert_eq!(doc2.data.mod_meta(), meta, "the mod details are saved");
 
     // the edited map makes a mod that passes the checks
-    let dirs = crate::modbuild::Dirs { game: crate::modbuild::default_game_dir(), mods: out_dir("edits-mods") };
+    let dirs = dirs("edits-mods");
     if dirs.game.join("map/provinces.bmp").exists() {
         let mod_dir = crate::modbuild::build(&dir, &dirs, &|l| println!("{l}")).expect("build");
         assert_eq!(mod_dir, dirs.mods.join("mod_helper_test"));
@@ -467,13 +479,13 @@ fn real_map_edits_keep_it_valid() {
 /// (slopes below the peaks, which may be out of play already) takes exactly
 /// the land pixels of the shape, and undo gives them back.
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_province_from_image() {
     use super::from_image::{Channel, Coverage, Source, in_shape, sample};
     let dir = out_dir("from-image");
     copy_map(&dir);
     let mut doc = open(&dir, false);
-    let maps = default_map_dir().unwrap().parent().unwrap().to_path_buf();
+    let maps = map_src().parent().unwrap().to_path_buf();
 
     let sea = Source::load(&maps.join("sea_45m.bmp")).unwrap();
     let (v, how) = sample(&sea, Channel::Red, doc.w, doc.h, &doc.geo);
@@ -525,13 +537,13 @@ fn real_map_province_from_image() {
 /// that keep their air zones, sea stays sea, and with "merge" they are cut to
 /// HOI4's size limits.
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_removed_land_from_image() {
     use super::from_image::{Channel, Source, in_shape, sample};
     let dir = out_dir("removed-from-image");
     copy_map(&dir);
     let mut doc = open(&dir, false);
-    let maps = default_map_dir().unwrap().parent().unwrap().to_path_buf();
+    let maps = map_src().parent().unwrap().to_path_buf();
     let height = Source::load(&maps.join("height.bmp")).unwrap();
     let (v, _) = sample(&height, Channel::Brightness, doc.w, doc.h, &doc.geo);
     let before = doc.labels.read().px.clone();
@@ -600,7 +612,7 @@ fn real_map_removed_land_from_image() {
 /// automatic ones; a new railway, hubs and ports survive saving, and the mod
 /// built from it passes the checks.
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_rivers_and_supply() {
     use super::model::{Port, Railway};
     use super::{rivers, supply};
@@ -700,7 +712,7 @@ fn real_map_rivers_and_supply() {
     assert_eq!(doc2.data.supply_hubs, doc.data.supply_hubs);
     assert_eq!(doc2.data.ports, doc.data.ports);
 
-    let dirs = crate::modbuild::Dirs { game: crate::modbuild::default_game_dir(), mods: out_dir("rivers-supply-mods") };
+    let dirs = dirs("rivers-supply-mods");
     if dirs.game.join("map/provinces.bmp").exists() {
         let log = std::sync::Mutex::new(Vec::<String>::new());
         let mod_dir = crate::modbuild::build(&dir, &dirs, &|l| {
@@ -743,7 +755,7 @@ fn real_map_rivers_and_supply() {
 }
 
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_recut_keeps_straits() {
     let dir = out_dir("straits");
     copy_map(&dir);
@@ -803,13 +815,13 @@ fn real_map_recut_keeps_straits() {
 }
 
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_terrain_bitmaps() {
     use super::{Editor, Settings};
     use crate::modbuild::{self, bitmaps, img};
     let dir = out_dir("bitmaps");
     copy_map(&dir);
-    let dirs = modbuild::Dirs { game: modbuild::default_game_dir(), mods: out_dir("bitmaps-mods") };
+    let dirs = dirs("bitmaps-mods");
     if !dirs.game.join("map/provinces.bmp").exists() {
         println!("HOI4 not found at {}: not tested", dirs.game.display());
         return;
@@ -883,12 +895,12 @@ fn real_map_terrain_bitmaps() {
 }
 
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_lakes_of_water() {
     use crate::modbuild::{self, bitmaps, img, vanilla::WATER};
     let dir = out_dir("lakes");
     copy_map(&dir);
-    let dirs = modbuild::Dirs { game: modbuild::default_game_dir(), mods: out_dir("lakes-mods") };
+    let dirs = dirs("lakes-mods");
     if !dirs.game.join("map/provinces.bmp").exists() {
         println!("HOI4 not found at {}: not tested", dirs.game.display());
         return;
@@ -966,7 +978,7 @@ fn real_map_lakes_of_water() {
 }
 
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_lasso() {
     use super::{Editor, Level, Settings, Tool};
     let dir = out_dir("lasso");
@@ -1031,7 +1043,7 @@ fn real_map_lasso() {
 }
 
 #[test]
-#[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+#[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
 fn real_map_cut() {
     use super::{Editor, Level, Settings, Tool};
     let dir = out_dir("cut");
@@ -1099,4 +1111,42 @@ fn real_map_cut() {
     assert!(new_errors(&ed).is_empty(), "{:?}", new_errors(&ed));
     ed.doc.as_mut().unwrap().undo();
     assert!(errors(ed.doc.as_ref().unwrap()) == before && ed.doc.as_ref().unwrap().can_undo().is_none());
+}
+
+/// The base game imported as a new map: the editor's checks find no errors,
+/// and the mod built from it passes the build's checks.
+#[test]
+#[ignore = "needs the game (cargo test -- --ignored)"]
+fn imported_base_game_builds() {
+    let game = crate::modbuild::default_game_dir();
+    if !game.join("map/provinces.bmp").exists() {
+        println!("HOI4 not found at {}: not tested", game.display());
+        return;
+    }
+    // as a new project: one file, opened again
+    let file = out_dir("import-base").join("Base game test.hoi4proj");
+    let src = crate::newproject::hoi4::Source { game: game.clone(), mod_dir: None };
+    let proj = crate::mapproj::Projection::Plain { pixel_m: 40_075_000.0 / 5632.0 };
+    let req = crate::newproject::Request { name: "Base game test".into(), file: file.clone(), start: crate::newproject::Start::Import(src), proj, game_dir: None };
+    let (_, c) = crate::newproject::create(&req, &Progress::default()).unwrap();
+    println!("{}", c.report.join("\n"));
+    let (p, _) = crate::bundle::Project::open(&file).unwrap();
+    let dir = p.map_dir();
+    let mut doc = open(&dir, false);
+    // no real-world data: heights from the imported heightmap, grass
+    let t = density::load_terrain(&Sources::default(), doc.w, doc.h, doc.data.pixel_m, doc.heights.as_deref().map(|v| v.as_slice()), &Progress::default()).unwrap();
+    doc.terrain = Some(Arc::new(t));
+    assert!(doc.data.provinces.count() > 13_000 && doc.data.states.count() > 1000 && doc.data.nations.count() > 50);
+    assert!(doc.data.rivers.len() > 100 && doc.data.railways.as_ref().is_some_and(|r| r.len() > 100));
+    let errs: Vec<Issue> = validate::validate(&Snapshot::of(&doc)).into_iter().filter(|i| i.severity == Severity::Error).collect();
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in &errs {
+        let k: String = e.msg.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+        *kinds.entry(k.split(':').next().unwrap_or("").to_string()).or_default() += 1;
+    }
+    assert!(errs.is_empty(), "{} errors in the editor's checks: {kinds:#?}", errs.len());
+    let dirs = crate::modbuild::Dirs { game, mods: out_dir("import-base-mods"), sources: Sources::default() };
+    let mod_dir = crate::modbuild::build(&dir, &dirs, &|l| println!("{l}")).expect("build");
+    let errors = crate::modbuild::validate::validate(&mod_dir, &dirs.game, &|l| println!("{l}")).unwrap();
+    assert!(errors.is_empty(), "the built mod fails checks: {errors:#?}");
 }

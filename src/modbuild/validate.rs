@@ -339,7 +339,8 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
         let atypes: Vec<String> = re(r#"(?m)^\ttype\s*=\s*"(\w+)""#).captures_iter(&at).map(|x| x[1].to_string()).collect();
         let frame: Vec<&String> = atypes.iter().filter(|t| t.starts_with("frame_border")).collect();
         c.check(frame.is_empty() || frame.len() == 3, || format!("ambient_object.txt: incomplete map frame {frame:?}"));
-        c.check(!atypes.iter().any(|t| t == "chinese_wall_entity"), || "ambient_object.txt: the Great Wall belongs to the vanilla map".into());
+        // (a map of vanilla's size may be vanilla's own, imported)
+        c.check((w as u32, h as u32) == (vw0, vh0) || !atypes.iter().any(|t| t == "chinese_wall_entity"), || "ambient_object.txt: the Great Wall belongs to the vanilla map".into());
         c.check(at.matches('{').count() == at.matches('}').count(), || "ambient_object.txt: unbalanced braces".into());
         for x in re(r#"name="ambient_water"\s*position=\{\s*([-\d.]+) [-\d.]+ ([-\d.]+)"#).captures_iter(&at) {
             let (px, pz): (f64, f64) = (x[1].parse().unwrap_or(-1.0), x[2].parse().unwrap_or(-1.0));
@@ -415,6 +416,14 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
         match t {
             "sea" => {
                 let th = if th > 0 { th as u32 } else { 0 };
+                // a canal (vanilla's Panama, Kiel, Suez): two seas across land
+                // (vanilla's Kiel and Suez cross land that touches one of them)
+                let canal = is(a, "sea") && is(b, "sea");
+                if canal {
+                    c.check(is(th, "land"), || format!("canal {cm}: through {th} is not land"));
+                    c.check(straits.insert(pr(a, b)), || format!("canal {cm}: duplicate pair"));
+                    continue;
+                }
                 c.check(is(a, "land") && is(b, "land") && is(th, "sea"), || format!("strait {l}: types"));
                 c.check(!touch(a, b), || format!("strait {cm}: {a} and {b} already touch"));
                 c.check(touch(th, a) && touch(th, b), || format!("strait {cm}: through {th} does not touch both"));

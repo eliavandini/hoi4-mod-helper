@@ -4,9 +4,9 @@
 //! heightmap (`heightmap_import.bmp`). The editor previews, exports and
 //! imports them with the same code.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use rayon::prelude::*;
 
 use super::img;
@@ -179,6 +179,76 @@ pub fn final_texture(cover: &[u8], slope: &[f32], sea: &[bool], paint: Option<&[
             }
         })
         .collect()
+}
+
+/// The name the elevation had in the map folders of old projects.
+pub const DEM_FILE: &str = "dem_section.tif";
+/// The name the land cover had in the map folders of old projects.
+pub const COVER_FILE: &str = "landcover_smooth.bmp";
+/// Metres per heightmap step when the heights are made from a heightmap.
+pub const STEP_M: f32 = 30.0;
+/// The height of a map with no heights at all (m).
+pub const FLAT_M: f32 = 200.0;
+
+/// The real-world data a map was made from: files outside the project that
+/// it refers to, of the map's size (None: the map has none).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Sources {
+    /// Heights in metres (a single-band raster).
+    pub dem: Option<PathBuf>,
+    /// Land cover classes (CLC+ Backbone, 8-bit).
+    pub cover: Option<PathBuf>,
+}
+
+/// What the build and the editor work from besides the provinces: heights
+/// (m) and land cover per pixel.
+pub struct Inputs {
+    pub dem: Vec<f32>,
+    pub cover: Vec<u8>,
+    /// What had to be made up (a map without the real data).
+    pub notes: Vec<String>,
+}
+
+/// The heights and land cover of [`Sources`]. A map made without real data
+/// (blank, or imported from a mod) has neither: its heights then come from
+/// its imported heightmap ([`STEP_M`] per step from the water plane), or it
+/// is flat, and its land cover is grass (the painted terrain decides).
+pub fn inputs(src: &Sources, w: usize, h: usize, heights: Option<&[u8]>, progress: &Progress) -> Result<Inputs> {
+    let mut notes = Vec::new();
+    let read = |path: &Path, what: &str| -> Result<raster::Raster> {
+        if !path.is_file() {
+            bail!("the {what} file {} is missing (set it in the map editor's Settings)", path.display());
+        }
+        let (r, _) = raster::load(path, progress).with_context(|| format!("cannot read the {what} file {}", path.display()))?;
+        if (r.width as usize, r.height as usize) != (w, h) {
+            bail!("the {what} file {} is {} × {} px, the map {w} × {h}", path.display(), r.width, r.height);
+        }
+        Ok(r)
+    };
+    let dem: Vec<f32> = if let Some(path) = &src.dem {
+        match read(path, "elevation")?.pixels {
+            Pixels::GrayF32(v) => v,
+            Pixels::Gray16(v) => v.into_iter().map(|x| x as f32).collect(),
+            Pixels::Gray8(v) => v.into_iter().map(|x| x as f32).collect(),
+            _ => bail!("the elevation file {} is not a single-band height map", path.display()),
+        }
+    } else if let Some(v) = heights.filter(|v| v.len() == w * h) {
+        notes.push(format!("no elevation file: heights from the imported heightmap ({STEP_M} m per step)"));
+        v.par_iter().map(|&x| (x as f32 - WATER as f32) * STEP_M).collect()
+    } else {
+        notes.push("no elevation file and no imported heightmap: the land is flat".to_string());
+        vec![FLAT_M; w * h]
+    };
+    let cover: Vec<u8> = if let Some(path) = &src.cover {
+        match read(path, "land cover")?.pixels {
+            Pixels::Indexed8 { data, .. } | Pixels::Gray8(data) => data,
+            _ => bail!("the land cover file {} is not an 8-bit class map", path.display()),
+        }
+    } else {
+        notes.push("no land cover file: the land is grass where no terrain is painted".to_string());
+        vec![GRASS; w * h]
+    };
+    Ok(Inputs { dem, cover, notes })
 }
 
 /// The build's heightmap: land `WATER + 1`..255 for the lowest..highest

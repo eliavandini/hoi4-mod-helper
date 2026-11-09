@@ -642,9 +642,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs the OSM extracts in maps/osm regions"]
+    #[ignore = "needs the OSM extracts (MOD_HELPER_TEST_MAPS)"]
     fn rivers_and_lakes_of_the_real_extract() {
-        let path = crate::project::find_maps_dir().expect("maps folder").join("osm regions/nord-est-261101.osm.pbf");
+        let path = crate::util::test_maps_dir().join("osm regions/nord-est-261101.osm.pbf");
         let b = extract(&path, &Progress::default()).unwrap();
         let count = |k: Water| b.water.iter().filter(|w| w.kind == k).count();
         assert!(count(Water::River) > 500 && count(Water::Lake) > 1000 && count(Water::RiverArea) > 500, "{:?}", Water::ALL.map(count));

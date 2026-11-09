@@ -549,6 +549,92 @@ pub fn generate(dem: &[f32], sea: &[bool], lake: &[bool], w: usize, h: usize, km
         .collect()
 }
 
+/// The rivers of a rivers.bmp (a mod's or the game's) as lines again: each
+/// system from its source (green) along the river, the side rivers at the
+/// pixels beside it: a tributary (its red pixel) from its far end into the
+/// river, a branch (its yellow pixel) from the river to its far end.
+/// Without a source a system starts at an end. Lines are simplified within
+/// `tol` px.
+pub fn trace(img: &[u8], w: usize, h: usize, tol: f32) -> Vec<River> {
+    let river = |i: u32| is_river(img[i as usize]);
+    let marker = |i: u32| matches!(img[i as usize], FLOW_IN | FLOW_OUT);
+    let mut seen = vec![false; w * h];
+    let nbs = |i: u32| N4.iter().filter_map(move |&d| step(i, w, h, d)).filter(move |&q| river(q));
+    // walk from `start` (seen) over pixels not seen yet; at a fork the
+    // unmarked way goes on and the others are side rivers (pixel, the river
+    // pixel beside it)
+    let walk = |start: u32, seen: &mut Vec<bool>, sides: &mut Vec<(u32, u32)>| -> Vec<u32> {
+        let mut path = vec![start];
+        let mut at = start;
+        loop {
+            let next: Vec<u32> = nbs(at).filter(|&q| !seen[q as usize]).collect();
+            for &q in &next {
+                seen[q as usize] = true;
+            }
+            let (marked, plain): (Vec<u32>, Vec<u32>) = next.into_iter().partition(|&q| marker(q));
+            sides.extend(marked.into_iter().map(|q| (q, at)));
+            let mut plain = plain.into_iter();
+            let Some(go) = plain.next() else { break };
+            // no marker says which way the river goes: the widest goes on
+            let mut rest: Vec<u32> = plain.collect();
+            let go = if rest.is_empty() {
+                go
+            } else {
+                rest.push(go);
+                rest.sort_by_key(|&q| (Reverse(img[q as usize]), q));
+                rest.remove(0)
+            };
+            sides.extend(rest.into_iter().map(|q| (q, at)));
+            path.push(go);
+            at = go;
+        }
+        path
+    };
+    let width_of = |path: &[u32]| -> Vec<u8> {
+        // markers take the width of the pixel next to them on the path
+        let raw: Vec<Option<u8>> = path.iter().map(|&p| img[p as usize]).map(|v| (v >= 3).then(|| v - 2)).collect();
+        (0..raw.len())
+            .map(|k| raw[k].or_else(|| (1..raw.len()).find_map(|d| raw.get(k + d).copied().flatten().or_else(|| k.checked_sub(d).and_then(|j| raw[j])))).unwrap_or(1))
+            .collect()
+    };
+    let line = |path: &[u32]| -> River {
+        let wd = width_of(path);
+        let pts: Vec<RiverPoint> = path.iter().zip(&wd).map(|(&i, &d)| RiverPoint((i as usize % w) as f32 + 0.5, (i as usize / w) as f32 + 0.5, d)).collect();
+        River { name: String::new(), points: simplify(&pts, tol) }
+    };
+    // sources first, then ends, then anything left (loops)
+    let mut starts: Vec<u32> = (0..(w * h) as u32).filter(|&i| img[i as usize] == SOURCE).collect();
+    starts.extend((0..(w * h) as u32).filter(|&i| river(i) && img[i as usize] != SOURCE && nbs(i).count() <= 1));
+    starts.extend((0..(w * h) as u32).filter(|&i| river(i)));
+    let mut out = Vec::new();
+    for s in starts {
+        if seen[s as usize] {
+            continue;
+        }
+        seen[s as usize] = true;
+        let mut sides = Vec::new();
+        let main = walk(s, &mut seen, &mut sides);
+        if main.len() >= 2 {
+            out.push(line(&main));
+        }
+        while let Some((q, at)) = sides.pop() {
+            let mut path = walk(q, &mut seen, &mut sides);
+            if img[q as usize] == FLOW_OUT {
+                // a branch leaves the river at `at`
+                path.insert(0, at);
+            } else {
+                // a tributary (or a side without a marker) flows into it
+                path.reverse();
+                path.push(at);
+            }
+            if path.len() >= 2 {
+                out.push(line(&path));
+            }
+        }
+    }
+    out
+}
+
 /// Fewer points (Douglas-Peucker within `tol` px); where the width changes a
 /// point stays.
 pub fn simplify(pts: &[RiverPoint], tol: f32) -> Vec<RiverPoint> {
@@ -689,6 +775,30 @@ mod tests {
         let img = image(&rasterize(&[main, trib], w, h, |_| Ground::Land), w, h);
         assert!(check(&img, w, h).is_empty(), "{:?}", check(&img, w, h));
         assert_eq!(img.iter().filter(|&&v| v == FLOW_IN).count(), 1);
+    }
+
+    /// Drawn rivers traced back from the bitmap draw the same bitmap.
+    #[test]
+    fn traced_rivers_draw_the_same_bitmap() {
+        let (w, h) = (80, 60);
+        let main = river(&[(1.5, 30.5), (40.5, 32.5), (78.5, 20.5)], 6);
+        let trib = river(&[(20.5, 2.5), (25.5, 20.5), (30.5, 31.5)], 2);
+        let trib2 = river(&[(10.5, 55.5), (35.5, 45.5), (45.5, 33.5)], 3);
+        let branch = river(&[(60.5, 26.5), (65.5, 45.5), (70.5, 57.5)], 4);
+        let other = river(&[(5.5, 5.5), (12.5, 18.5)], 1);
+        let rs = [main, trib, trib2, branch, other];
+        let img = rasterize(&rs, w, h, |_| Ground::Land).image(w, h, |_| false);
+        assert!(check(&img, w, h).is_empty(), "{:?}", check(&img, w, h));
+        let traced = trace(&img, w, h, 0.5);
+        assert_eq!(traced.len(), 5, "{traced:?}");
+        let again = rasterize(&traced, w, h, |_| Ground::Land);
+        assert!(again.problems.is_empty(), "{:?}", again.problems);
+        let img2 = again.image(w, h, |_| false);
+        let differ = img.iter().zip(&img2).filter(|(a, b)| a != b).count();
+        assert_eq!(differ, 0, "{differ} px differ");
+        // the branch starts at the main river, the tributaries end at it
+        let ends = |r: &River| (r.points[0], *r.points.last().unwrap());
+        assert!(traced.iter().any(|r| (ends(r).1.1 - 31.0).abs() < 3.0 && ends(r).0.1 < 5.0), "{traced:?}");
     }
 
     #[test]

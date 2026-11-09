@@ -622,7 +622,7 @@ mod tests {
         std::fs::write(game.join("launcher-settings.json"), format!(r#"{{"rawVersion":"1.19.4.1","gameDataPath":"{}"}}"#, user.display())).unwrap();
         std::fs::write(user.join("mod/other.mod"), "name=\"Other Map\"\ntags={ \"Map\" \"Graphics\" }\npath=\"mod/other\"\n").unwrap();
         std::fs::write(user.join("dlc_load.json"), r#"{"disabled_dlcs":[],"enabled_mods":["mod/other.mod"]}"#).unwrap();
-        let dirs = Dirs { game: game.clone(), mods: user.join("mod") };
+        let dirs = Dirs { game: game.clone(), mods: user.join("mod"), sources: Default::default() };
         let mut l = Launcher::default();
         let ctx = egui::Context::default();
         let frame = |l: &mut Launcher, built: Option<(u64, &Path)>| {

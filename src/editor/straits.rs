@@ -41,6 +41,13 @@ impl Doc {
         self.data.provinces.contains(p) && self.stats.get(p).px > 0
     }
 
+    /// A canal (as vanilla's Panama, Kiel and Suez): a "sea" adjacency
+    /// between two sea provinces across a land province. Straits are
+    /// between land provinces.
+    pub fn is_canal(&self, a: &Adjacency) -> bool {
+        a.kind == "sea" && self.data.kind(a.from) == Kind::Sea && self.data.kind(a.to) == Kind::Sea
+    }
+
     /// A strait is right when its ends are two land provinces that both
     /// touch its sea province.
     pub fn strait_ok(&self, a: &Adjacency) -> bool {
@@ -177,7 +184,7 @@ impl Doc {
         let label = |d: &Doc, a: &Adjacency| if a.name.is_empty() { format!("{} - {}", d.data.prov_name(a.from), d.data.prov_name(a.to)) } else { a.name.clone() };
         for i in 0..self.data.adjacencies.len() {
             let a = self.data.adjacencies[i].clone();
-            if a.kind != "sea" || self.strait_ok(&a) {
+            if a.kind != "sea" || self.is_canal(&a) || self.strait_ok(&a) {
                 continue;
             }
             match self.repair_strait(&a, None) {
@@ -222,7 +229,7 @@ impl Doc {
         for i in 0..self.data.adjacencies.len() {
             let a = &self.data.adjacencies[i];
             let cut = [a.from, a.to].into_iter().chain(a.through).any(|p| heirs.contains_key(&p));
-            if a.kind != "sea" || !cut || self.strait_ok(a) {
+            if a.kind != "sea" || !cut || self.is_canal(a) || self.strait_ok(a) {
                 continue;
             }
             let a = a.clone();

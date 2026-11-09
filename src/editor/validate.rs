@@ -129,7 +129,14 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
             }
         }
     }
-    let x = crossings(doc);
+    // land and sea touching only at a corner: "Fix crossings" never changes
+    // the sea, and vanilla's map has 155 of them; the rest are map errors
+    let (coast, x): (Vec<[u32; 2]>, Vec<[u32; 2]>) = crossings(doc).into_iter().partition(|&[x, y]| {
+        let w = doc.labels.w as usize;
+        let i = (y as usize - 1) * w + x as usize - 1;
+        let (a, b) = (doc.labels.px[i], doc.labels.px[i + 1]);
+        a == doc.labels.px[i + w + 1] && b == doc.labels.px[i + w] && ((d.kind(a) == Kind::Sea) != (d.kind(b) == Kind::Sea))
+    });
     if !x.is_empty() {
         out.push(Issue {
             severity: Severity::Error,
@@ -137,6 +144,9 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
             at: Some(x[0]),
             prov: None,
         });
+    }
+    if !coast.is_empty() {
+        out.push(Issue { severity: Severity::Warning, msg: format!("{} points where land and sea touch only diagonally", coast.len()), at: Some(coast[0]), prov: None });
     }
     // states
     let mut st_regions: FxHashMap<Id, FxHashSet<Id>> = FxHashMap::default();
@@ -237,6 +247,12 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
             out.push(Issue { severity: Severity::Error, msg: format!("adjacency {label} is listed twice"), at: None, prov: Some(a.from) });
         }
         match a.kind.as_str() {
+            "sea" if d.kind(a.from) == Kind::Sea && d.kind(a.to) == Kind::Sea => {
+                // (vanilla's Kiel and Suez cross land that touches one of the seas)
+                if !a.through.is_some_and(|t| d.kind(t) == Kind::Land) {
+                    out.push(Issue { severity: Severity::Error, msg: format!("canal {label}: it must cross a land province"), at: None, prov: Some(a.from) });
+                }
+            }
             "sea" => {
                 let ok = a.through.is_some_and(|t| d.kind(t) == Kind::Sea && doc.stats.border_len(a.from, t) > 0 && doc.stats.border_len(a.to, t) > 0);
                 if !ok {

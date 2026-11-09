@@ -39,7 +39,6 @@ use rustc_hash::FxHashSet;
 
 use crate::editor::model::{self, Id, Kind, Nation, State};
 use crate::editor::{rivers, supply};
-use crate::raster::{self, Pixels};
 use crate::util::Progress;
 use countries::{Rng, ascii_name, place_rank, short_name};
 use img::Filter;
@@ -90,7 +89,7 @@ pub const CATEGORY_SLOTS: [(&str, u32); 13] = [
     ("large_island", 3),
 ];
 /// State buildings that take a building slot (shares_slots = yes).
-const SLOT_BUILDINGS: [&str; 7] = ["industrial_complex", "arms_factory", "dockyard", "synthetic_refinery", "fuel_silo", "rocket_site", "nuclear_reactor"];
+pub const SLOT_BUILDINGS: [&str; 7] = ["industrial_complex", "arms_factory", "dockyard", "synthetic_refinery", "fuel_silo", "rocket_site", "nuclear_reactor"];
 pub const IDEOLOGIES: [&str; 4] = ["democratic", "fascism", "communism", "neutrality"];
 /// State category by the sealed (urban) km² of the state: (below, category, slots).
 const STATE_CATEGORIES: [(f64, &str, u32); 7] = [
@@ -134,11 +133,13 @@ const WEATHER: &str = "\tweather={
 \t\t}
 \t}";
 
-/// The HOI4 install and the folder mods go to.
+/// The HOI4 install and the folder mods go to, and the real-world data the
+/// map was made from.
 #[derive(Clone, Debug)]
 pub struct Dirs {
     pub game: PathBuf,
     pub mods: PathBuf,
+    pub sources: bitmaps::Sources,
 }
 
 fn home() -> PathBuf {
@@ -157,7 +158,7 @@ pub fn default_mods_dir() -> PathBuf {
 
 impl Default for Dirs {
     fn default() -> Self {
-        Dirs { game: default_game_dir(), mods: default_mods_dir() }
+        Dirs { game: default_game_dir(), mods: default_mods_dir(), sources: Default::default() }
     }
 }
 
@@ -460,20 +461,9 @@ fn build_into(
 
     log("reading heights and land cover");
     let progress = Progress::default();
-    let (dem_r, _) = raster::load(&map_dir.join("dem_section.tif"), &progress)?;
-    let dem: Vec<f32> = match dem_r.pixels {
-        Pixels::GrayF32(v) => v,
-        Pixels::Gray16(v) => v.into_iter().map(|x| x as f32).collect(),
-        Pixels::Gray8(v) => v.into_iter().map(|x| x as f32).collect(),
-        _ => bail!("dem_section.tif is not a single-band height map"),
-    };
-    let (lc_r, _) = raster::load(&map_dir.join("landcover_smooth.bmp"), &progress)?;
-    let lc: Vec<u8> = match lc_r.pixels {
-        Pixels::Indexed8 { data, .. } | Pixels::Gray8(data) => data,
-        _ => bail!("landcover_smooth.bmp is not an 8-bit class map"),
-    };
-    if (dem_r.width as usize, dem_r.height as usize) != (w, h) || (lc_r.width as usize, lc_r.height as usize) != (w, h) {
-        bail!("dem_section.tif / landcover_smooth.bmp do not match provinces.bmp ({w} x {h})");
+    let bitmaps::Inputs { dem, cover: lc, notes } = bitmaps::inputs(&dirs.sources, w, h, extra.heights.as_deref(), &progress)?;
+    for n in notes {
+        log(&format!("  {n}"));
     }
 
     log("reading the game's files");

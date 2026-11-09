@@ -363,6 +363,22 @@ pub fn load(path: &Path, progress: &Progress) -> Result<(Raster, FileGeoInfo)> {
     Ok((raster, geo))
 }
 
+/// Width and height of a raster from its header (BMP, TIFF, PNG, JPEG),
+/// without reading its pixels.
+pub fn probe_size(path: &Path) -> Option<(u32, u32)> {
+    let mut magic = [0u8; 4];
+    File::open(path).ok()?.read_exact(&mut magic).ok()?;
+    if &magic[..2] == b"BM" {
+        let mut b = [0u8; 26];
+        File::open(path).ok()?.read_exact(&mut b).ok()?;
+        return Some((le_u32(&b, 18) as i32).unsigned_abs()).zip(Some((le_u32(&b, 22) as i32).unsigned_abs()));
+    }
+    if &magic == b"II*\0" || &magic == b"MM\0*" || &magic == b"II+\0" || &magic == b"MM\0+" {
+        return open_tiff(path).ok()?.dimensions().ok();
+    }
+    image::image_dimensions(path).ok()
+}
+
 // --- BMP -------------------------------------------------------------------
 
 fn le_u16(b: &[u8], o: usize) -> u16 {
@@ -1063,9 +1079,9 @@ mod tests {
     /// `landcover.bmp` was exported from `lc_section.tif` with gdal_translate,
     /// so the palette-TIFF and BMP decoders must agree on every pixel.
     #[test]
-    #[ignore = "needs the mod's map files (cargo test -- --ignored)"]
+    #[ignore = "needs the mod's map files (MOD_HELPER_TEST_MAPS=<maps folder> cargo test -- --ignored)"]
     fn palette_tiff_matches_bmp_export() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../maps/processed maps");
+        let dir = crate::util::test_maps_dir().join("processed maps");
         let p = Progress::default();
         let (a, _) = load(&dir.join("lc_section.tif"), &p).unwrap();
         let (b, _) = load(&dir.join("landcover.bmp"), &p).unwrap();

@@ -473,6 +473,133 @@ fn read_world_file(path: &Path) -> Option<(GeoTransform, PathBuf)> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Writing georeferences (world file + .aux.xml), as GDAL does for a BMP
+
+const GRS80: &str = r#"SPHEROID["GRS 1980",6378137,298.257222101,AUTHORITY["EPSG","7019"]]"#;
+const WGS84_SPHEROID: &str = r#"SPHEROID["WGS 84",6378137,298.257223563,AUTHORITY["EPSG","7030"]]"#;
+const GREENWICH: &str = r#"PRIMEM["Greenwich",0,AUTHORITY["EPSG","8901"]]"#;
+const DEGREE: &str = r#"UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]]"#;
+const METRE: &str = r#"UNIT["metre",1,AUTHORITY["EPSG","9001"]]"#;
+
+fn geogcs_wgs84() -> String {
+    format!(r#"GEOGCS["WGS 84",DATUM["WGS_1984",{WGS84_SPHEROID},AUTHORITY["EPSG","6326"]],{GREENWICH},{DEGREE},AUTHORITY["EPSG","4326"]]"#)
+}
+
+fn geogcs_etrs89() -> String {
+    format!(r#"GEOGCS["ETRS89",DATUM["European_Terrestrial_Reference_System_1989",{GRS80},AUTHORITY["EPSG","6258"]],{GREENWICH},{DEGREE},AUTHORITY["EPSG","4258"]]"#)
+}
+
+/// WKT1 (as GDAL writes it) of the CRSs this program can project; None for
+/// the others.
+pub fn wkt(crs: Crs) -> Option<String> {
+    let s = match crs.proj() {
+        Proj::Geographic => match crs.epsg {
+            4326 => geogcs_wgs84(),
+            4258 => geogcs_etrs89(),
+            _ => return None,
+        },
+        Proj::Laea => format!(
+            r#"PROJCS["ETRS89-extended / LAEA Europe",{},PROJECTION["Lambert_Azimuthal_Equal_Area"],PARAMETER["latitude_of_center",52],PARAMETER["longitude_of_center",10],PARAMETER["false_easting",4321000],PARAMETER["false_northing",3210000],{METRE},AXIS["Northing",NORTH],AXIS["Easting",EAST],AUTHORITY["EPSG","3035"]]"#,
+            geogcs_etrs89()
+        ),
+        Proj::Utm { zone, south } => {
+            let etrs = (25801..=25860).contains(&crs.epsg);
+            let (name, geog) = if etrs {
+                (format!("ETRS89 / UTM zone {zone}N"), geogcs_etrs89())
+            } else {
+                (format!("WGS 84 / UTM zone {zone}{}", if south { 'S' } else { 'N' }), geogcs_wgs84())
+            };
+            format!(
+                r#"PROJCS["{name}",{geog},PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",{}],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",{}],{METRE},AXIS["Easting",EAST],AXIS["Northing",NORTH],AUTHORITY["EPSG","{}"]]"#,
+                zone as i32 * 6 - 183,
+                if south { 10_000_000 } else { 0 },
+                crs.epsg
+            )
+        }
+        Proj::WebMercator => format!(
+            r#"PROJCS["WGS 84 / Pseudo-Mercator",{},PROJECTION["Mercator_1SP"],PARAMETER["central_meridian",0],PARAMETER["scale_factor",1],PARAMETER["false_easting",0],PARAMETER["false_northing",0],{METRE},AXIS["Easting",EAST],AXIS["Northing",NORTH],EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0 +lon_0=0 +x_0=0 +y_0=0 +k=1 +units=m +nadgrids=@null +wktext +no_defs"],AUTHORITY["EPSG","3857"]]"#,
+            geogcs_wgs84()
+        ),
+        Proj::Unsupported => return None,
+    };
+    Some(s)
+}
+
+fn escape_xml(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// The world file a raster gets: `<stem>.wld`.
+pub fn world_file_path(raster: &Path) -> PathBuf {
+    raster.with_extension("wld")
+}
+
+/// The sidecars of `raster` that hold a georeference and exist: what
+/// [`FileGeoInfo::add_sidecars`] reads.
+pub fn georef_sidecars(raster: &Path) -> Vec<PathBuf> {
+    let mut v = vec![sidecar(raster, ".aux.xml"), raster.with_extension("prj")];
+    let ext = raster.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let mut exts = vec!["wld".to_string(), format!("{ext}w")];
+    if ext.len() >= 2 {
+        let b = ext.as_bytes();
+        exts.push(format!("{}{}w", b[0] as char, b[ext.len() - 1] as char));
+    }
+    for e in exts {
+        v.push(raster.with_extension(&e));
+        v.push(raster.with_extension(e.to_ascii_uppercase()));
+    }
+    v.push(sidecar(raster, ".wld"));
+    v.sort();
+    v.dedup();
+    v.retain(|p| p.is_file());
+    v
+}
+
+/// Give `raster` this georeference: the old sidecars go, then a world file
+/// (`<stem>.wld`) and, with a CRS, an `.aux.xml` naming it. Without a
+/// transform the raster is left without any.
+pub fn write_georef(raster: &Path, georef: Option<(GeoTransform, Option<Crs>)>) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    for p in georef_sidecars(raster) {
+        std::fs::remove_file(&p).with_context(|| format!("cannot remove {}", p.display()))?;
+    }
+    let Some((gt, crs)) = georef else { return Ok(()) };
+    let g = gt.0;
+    // the world file names the centre of the top-left pixel
+    let (cx, cy) = (g[0] + 0.5 * g[1] + 0.5 * g[2], g[3] + 0.5 * g[4] + 0.5 * g[5]);
+    // (the shortest text that reads back as the same number)
+    let wld = format!("{}\n{}\n{}\n{}\n{}\n{}\n", g[1], g[4], g[2], g[5], cx, cy);
+    let path = world_file_path(raster);
+    std::fs::write(&path, wld).with_context(|| format!("cannot write {}", path.display()))?;
+    if let Some(w) = crs.and_then(wkt) {
+        let axis = if crs == Some(Crs::LAEA_EUROPE) || crs.is_some_and(|c| c.is_geographic()) { " dataAxisToSRSAxisMapping=\"2,1\"" } else { " dataAxisToSRSAxisMapping=\"1,2\"" };
+        let xml = format!("<PAMDataset>\n  <SRS{axis}>{}</SRS>\n  <Metadata>\n    <MDI key=\"AREA_OR_POINT\">Area</MDI>\n  </Metadata>\n</PAMDataset>\n", escape_xml(&w));
+        let path = sidecar(raster, ".aux.xml");
+        std::fs::write(&path, xml).with_context(|| format!("cannot write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// UTM zone (1..=60) of a longitude.
+pub fn utm_zone(lon: f64) -> u32 {
+    (((lon + 180.0) / 6.0).floor() as i64).rem_euclid(60) as u32 + 1
+}
+
+/// The UTM CRS for a place: ETRS89 (EPSG:258zz) or WGS 84 (EPSG:326zz /
+/// 327zz south of the equator).
+pub fn utm_crs(lon: f64, lat: f64, etrs89: bool) -> Crs {
+    let z = utm_zone(lon);
+    match (etrs89 && lat >= 0.0, lat < 0.0) {
+        (true, _) => Crs::new(25800 + z),
+        (false, true) => Crs::new(32700 + z),
+        (false, false) => Crs::new(32600 + z),
+    }
+}
+
+/// Metres per degree of latitude (mean).
+pub const M_PER_DEG: f64 = 111_320.0;
+
 /// Format a lon/lat pair for display.
 pub fn fmt_lonlat(lon: f64, lat: f64) -> String {
     format!(

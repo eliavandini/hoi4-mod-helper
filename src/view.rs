@@ -311,11 +311,14 @@ pub fn draw_vector(dc: &DrawCtx, vd: &VectorData, style: &VectorStyle, offset: [
 }
 
 /// Scale bar in the bottom-left corner.
-pub fn draw_scale_bar(dc: &DrawCtx) {
-    let target = 120.0 * dc.cam.mpp;
+/// `m_per_unit`: metres per unit of the world coordinates (degrees of a
+/// lon/lat CRS are not metres).
+pub fn draw_scale_bar(dc: &DrawCtx, m_per_unit: f64) {
+    let mpp = dc.cam.mpp * m_per_unit;
+    let target = 120.0 * mpp;
     let mag = 10f64.powf(target.log10().floor());
     let len = [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).rfind(|&l| l <= target).unwrap_or(mag);
-    let px = (len / dc.cam.mpp) as f32;
+    let px = (len / mpp) as f32;
     let base = dc.rect.left_bottom() + egui::vec2(16.0, -18.0);
     let stroke = Stroke::new(2.0, Color32::WHITE);
     let bg = Rect::from_min_max(base + egui::vec2(-6.0, -22.0), base + egui::vec2(px + 6.0, 6.0));

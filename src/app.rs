@@ -1,6 +1,6 @@
 //! The application: layer stack management and the user interface.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,7 +15,8 @@ use crate::editor::{self, Editor};
 use crate::geo::{self, Crs, FileGeoInfo, GeoTransform, KNOWN_CRS};
 use crate::layers::{GeorefOverride, Layer, LayerConfig, LayerData, LayerKind, LayerState, RasterLayer};
 use crate::osm;
-use crate::project::{self, PROJECT_EXT, ProjectFile, RASTER_EXTS};
+use crate::bundle;
+use crate::project::{self, ProjectFile, RASTER_EXTS};
 use crate::raster::{self, Colormap, Raster};
 use crate::tiles::TileManager;
 use crate::util::{self, Progress};
@@ -103,14 +104,27 @@ pub struct App {
     editor: Editor,
     /// Tool #3, the content of the nations (when `content.settings.active`).
     content: crate::content::ui::Screen,
+    /// The open project (else only the welcome screen is).
+    project: Option<bundle::Project>,
+    /// [`bundle::writes`] when the project was packed last.
+    synced_writes: u64,
+    /// A project of the old format to convert (asked first).
+    convert: Option<PathBuf>,
+    /// The welcome screen, shown instead of the tools.
+    welcome: Option<crate::welcome::Welcome>,
+    /// A project to open once the unsaved changes are dealt with.
+    pending_open: Option<PathBuf>,
+    /// The Map projection window.
+    proj_win: Option<crate::welcome::ProjWindow>,
+    /// What an import brought over (title, lines).
+    report: Option<(String, Vec<String>)>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext, project_arg: Option<PathBuf>, start: Start) -> Self {
         let (jobs_tx, jobs_rx) = crossbeam_channel::unbounded();
-        let project_path = project_arg.unwrap_or_else(project::default_project_path);
         let mut app = App {
-            project_path: project_path.clone(),
+            project_path: PathBuf::new(),
             crs: Crs::LAEA_EUROPE,
             layers: Vec::new(),
             load_tokens: FxHashMap::default(),
@@ -137,20 +151,39 @@ impl App {
             }),
             editor: Editor::new(editor::Settings::default()),
             content: crate::content::ui::Screen::new(Default::default()),
+            project: None,
+            synced_writes: bundle::writes(),
+            convert: None,
+            welcome: None,
+            pending_open: None,
+            proj_win: None,
+            report: None,
         };
-        let pf = if project_path.exists() {
-            match ProjectFile::load(&project_path) {
-                Ok(p) => p,
-                Err(e) => {
-                    app.error(format!("{e:#}"));
-                    project::default_project(project::find_maps_dir().as_deref())
-                }
+        // started without a project: the welcome screen
+        let Some(path) = project_arg else {
+            let mut w = crate::welcome::Welcome::new();
+            // for screenshots: MOD_HELPER_WELCOME=new|import opens the form
+            match std::env::var("MOD_HELPER_WELCOME").as_deref() {
+                Ok("new") => w.new_project(false, &app.game_dir()),
+                Ok("import") => w.new_project(true, &app.game_dir()),
+                _ => {}
             }
-        } else {
-            log::info!("no project at {}, creating default layer set", project_path.display());
-            project::default_project(project::find_maps_dir().as_deref())
+            app.welcome = Some(w);
+            return app;
         };
-        app.apply_project(pf, &cc.egui_ctx);
+        if project::is_legacy(&path) {
+            app.welcome = Some(crate::welcome::Welcome::new());
+            app.convert = Some(path);
+            return app;
+        }
+        if let Err(e) = app.load_project(&path, &cc.egui_ctx) {
+            app.error(format!("{e:#}"));
+            app.welcome = Some(crate::welcome::Welcome::new());
+            return app;
+        }
+        if app.screenshot.is_none() {
+            let _ = project::remember_project(&app.project_path);
+        }
         match start {
             Start::Project => {}
             Start::Editor => app.set_mode(Mode::Editor, &cc.egui_ctx),
@@ -176,7 +209,274 @@ impl App {
         if let Ok(name) = std::env::var("MOD_HELPER_LAYER") {
             app.selected = app.layers.iter().find(|l| l.cfg.name == name).map(|l| l.id);
         }
+        // for screenshots: MOD_HELPER_PROJECTION=1 opens the Map projection window
+        if std::env::var_os("MOD_HELPER_PROJECTION").is_some() {
+            app.open_projection_window();
+        }
         app
+    }
+
+    /// The game's folder the editor uses.
+    fn game_dir(&self) -> PathBuf {
+        self.editor.settings.game_dir.clone().unwrap_or_else(crate::modbuild::default_game_dir)
+    }
+
+    /// Unsaved map or content changes.
+    fn unsaved(&self) -> bool {
+        self.editor.is_dirty() || self.content.is_dirty()
+    }
+
+    /// Open a project (after asking about unsaved changes).
+    fn open_project(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if self.unsaved() {
+            self.pending_open = Some(path);
+        } else {
+            self.switch_project(path, ctx);
+        }
+    }
+
+    /// Close what is open (its project file is saved, as on exit) and open
+    /// the project at `path` (one of the old format is converted first).
+    fn switch_project(&mut self, path: PathBuf, ctx: &egui::Context) {
+        if project::is_legacy(&path) {
+            self.convert = Some(path);
+            return;
+        }
+        self.sync_project(true);
+        match self.load_project(&path, ctx) {
+            Ok(()) => {
+                if let Err(e) = project::remember_project(&self.project_path) {
+                    log::warn!("could not update the recent projects: {e:#}");
+                }
+                self.info(format!("Opened {}", self.project_path.display()));
+            }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+    }
+
+    /// Open the project file at `path` in place of what is open (saved
+    /// before, or not to be).
+    fn load_project(&mut self, path: &Path, ctx: &egui::Context) -> anyhow::Result<()> {
+        let (p, pf) = bundle::Project::open(path)?;
+        // a fresh editor and content screen: the old map closes
+        self.editor = Editor::new(editor::Settings::default());
+        self.editor.project = Some(p.path.clone());
+        self.content = crate::content::ui::Screen::new(Default::default());
+        self.tiles.remove_layer(editor::OVERLAY_LAYER);
+        self.proj_win = None;
+        self.project_path = p.path.clone();
+        let recovered = p.map_changed();
+        self.project = Some(p);
+        self.synced_writes = bundle::writes();
+        self.welcome = None;
+        self.cam = Camera::default();
+        self.apply_project(pf, ctx);
+        if recovered && self.screenshot.is_none() {
+            // saved in the working folder, then the app ended before packing
+            self.sync_project(false);
+            self.info("Changes saved before the app last closed are in the project file now");
+        }
+        Ok(())
+    }
+
+    /// Pack the project's changes into its file: the map's always, the
+    /// settings (layers, view…) when `settings`.
+    fn sync_project(&mut self, settings: bool) {
+        if self.screenshot.is_some() {
+            return;
+        }
+        self.synced_writes = bundle::writes();
+        let pf = self.project_file();
+        let Some(p) = &mut self.project else { return };
+        if let Err(e) = p.save(&pf, settings) {
+            self.error(format!("the project file could not be written: {e:#}"));
+        }
+    }
+
+    /// The old project waiting to be converted: ask where its file goes.
+    fn convert_dialog(&mut self, ctx: &egui::Context) {
+        let Some(old) = self.convert.clone() else { return };
+        let map = ProjectFile::load_legacy(&old).ok().and_then(|pf| pf.editor.and_then(|e| e.map_dir));
+        let mut choice = None;
+        egui::Modal::new(egui::Id::unique("convert_project")).show(ctx, |ui| {
+            ui.set_max_width(560.0);
+            ui.heading("A project of the old format");
+            ui.label(format!(
+                "{} holds the settings of a project whose map is in a folder of its own{}.",
+                geo::file_name(&old),
+                map.as_ref().map(|m| format!(" ({})", m.display())).unwrap_or_default()
+            ));
+            ui.label(
+                "A project is one file now. Converting puts the map's own files in it (provinces, nation content, painted terrain, adjacency rules); \
+                 the layers' rasters and OSM extracts, the elevation and the land cover stay where they are and the project refers to them.",
+            );
+            ui.label(RichText::new("The old files are only read; the map's backups stay in its folder.").small().weak());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Convert…").on_hover_text("Choose where the project file goes").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(false);
+                }
+            });
+        });
+        match choice {
+            Some(true) => {
+                let file = old.file_name().map(|n| n.to_string_lossy().trim_end_matches(&format!(".{}", project::LEGACY_EXT)).to_string()).unwrap_or_default();
+                let mut dlg = rfd::FileDialog::new().add_filter("mod-helper project", &[bundle::EXT]).set_file_name(format!("{file}.{}", bundle::EXT));
+                if let Some(d) = old.parent() {
+                    dlg = dlg.set_directory(d);
+                }
+                let Some(dest) = dlg.save_file() else { return };
+                let dest = with_ext(dest);
+                match bundle::convert(&old, &dest) {
+                    Ok((p, report)) => {
+                        self.convert = None;
+                        self.report = Some((format!("Converted {}", geo::file_name(&old)), report));
+                        let _ = project::forget_project(&old);
+                        self.switch_project(p.path, ctx);
+                    }
+                    Err(e) => self.error(format!("cannot convert {}: {e:#}", old.display())),
+                }
+            }
+            Some(false) => self.convert = None,
+            None => {}
+        }
+    }
+
+    fn show_welcome(&mut self, new: Option<bool>) {
+        let game = self.game_dir();
+        let w = self.welcome.get_or_insert_with(crate::welcome::Welcome::new);
+        if let Some(import) = new {
+            w.new_project(import, &game);
+        }
+    }
+
+    /// Ask about unsaved changes before another project opens.
+    fn pending_open_dialog(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.pending_open.clone() else { return };
+        let mut choice = None;
+        egui::Modal::new(egui::Id::unique("pending_open")).show(ctx, |ui| {
+            ui.heading("Unsaved changes");
+            ui.label("The open map or nation content has changes that are not saved.");
+            ui.label(RichText::new(format!("Then open {}", path.display())).small().weak());
+            ui.horizontal(|ui| {
+                if ui.button("Save and open").clicked() {
+                    choice = Some(0);
+                }
+                if ui.button("Open without saving").clicked() {
+                    choice = Some(1);
+                }
+                if ui.button("Cancel").clicked() {
+                    choice = Some(2);
+                }
+            });
+        });
+        match choice {
+            Some(0) => {
+                if self.content.is_dirty() {
+                    self.content.save(&mut self.editor);
+                }
+                if self.editor.is_dirty() {
+                    self.editor.save();
+                }
+                self.pending_open = None;
+                if self.unsaved() {
+                    self.error("could not save everything; the project stays open");
+                } else {
+                    self.switch_project(path, ctx);
+                }
+            }
+            Some(1) => {
+                self.pending_open = None;
+                self.switch_project(path, ctx);
+            }
+            Some(_) => self.pending_open = None,
+            None => {}
+        }
+    }
+
+    /// The open map's projection, size and unsaved state.
+    fn map_projection(&self) -> Option<(crate::mapproj::Projection, u32, u32, bool)> {
+        let d = self.editor.doc.as_ref()?;
+        Some((crate::mapproj::Projection::of_map(&d.geo, d.w, d.h, d.data.pixel_m), d.w, d.h, self.editor.is_dirty()))
+    }
+
+    fn open_projection_window(&mut self) {
+        let cur = self.map_projection().map(|m| m.0);
+        self.proj_win = Some(crate::welcome::ProjWindow::new(cur, self.crs));
+    }
+
+    fn projection_window(&mut self, ctx: &egui::Context) {
+        let map = self.map_projection();
+        let Some(win) = &mut self.proj_win else { return };
+        let mut open = true;
+        let act = win.ui(ctx, &mut open, map);
+        if !open {
+            self.proj_win = None;
+        }
+        match act {
+            Some(crate::welcome::ProjAction::Display(c)) => {
+                self.set_crs(c, ctx);
+                self.info(format!("The layers are shown in {}", if c == Crs::UNKNOWN { "no projection".into() } else { c.name() }));
+            }
+            Some(crate::welcome::ProjAction::Map(p)) => {
+                if self.content.is_dirty() {
+                    self.content.save(&mut self.editor);
+                }
+                if self.editor.is_dirty() {
+                    self.editor.save();
+                    if self.editor.is_dirty() {
+                        self.error("the map could not be saved; its projection is unchanged");
+                        return;
+                    }
+                }
+                let Some(d) = self.editor.doc.as_ref() else { return };
+                let (dir, w, h) = (d.dir.clone(), d.w, d.h);
+                match crate::mapproj::apply(&dir, w, h, &p) {
+                    Ok(backup) => {
+                        self.set_crs(p.crs(), ctx);
+                        // read again with its new georeference
+                        self.editor.open(dir, ctx);
+                        self.proj_win = None;
+                        self.info(format!("The map is now a {}; the old georeference is in {}", p.describe(w, h), backup.display()));
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Show the layers in another CRS: the OSM layers are projected again.
+    fn set_crs(&mut self, crs: Crs, ctx: &egui::Context) {
+        if crs == self.crs {
+            return;
+        }
+        self.crs = crs;
+        let osm: Vec<u64> = self.layers.iter().filter(|l| l.cfg.kind == LayerKind::OsmBoundaries).map(|l| l.id).collect();
+        for id in osm {
+            self.apply_action(LayerAction::Reload(id), ctx);
+        }
+        self.pending_fit = true;
+        self.user_moved_view = false;
+    }
+
+    fn report_window(&mut self, ctx: &egui::Context) {
+        let Some((title, lines)) = &self.report else { return };
+        let mut open = true;
+        egui::Window::new(title.as_str()).open(&mut open).default_width(620.0).collapsible(false).show(ctx, |ui| {
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for l in lines {
+                    let c = if l.starts_with("not imported") || l.starts_with("left out") { Color32::from_rgb(255, 190, 90) } else { ui.visuals().text_color() };
+                    ui.label(RichText::new(l).color(c));
+                }
+            });
+        });
+        if !open {
+            self.report = None;
+        }
     }
 
     // ---------------------------------------------------------------- state
@@ -208,6 +508,9 @@ impl App {
             self.add_layer(cfg, ctx);
         }
         let mut settings = pf.editor.unwrap_or_default();
+        if let Some(p) = &self.project {
+            settings.map_dir = Some(p.map_dir());
+        }
         if self.editor.doc.is_some() {
             // keep the open map
             settings.map_dir = self.editor.settings.map_dir.clone();
@@ -251,10 +554,21 @@ impl App {
         }
     }
 
+    /// Save all: the map and the content when they have changes, then the
+    /// project file.
     fn save_project(&mut self) {
-        match self.project_file().save(&self.project_path) {
-            Ok(()) => self.info(format!("Saved project {}", self.project_path.display())),
-            Err(e) => self.error(format!("{e:#}")),
+        if self.project.is_none() {
+            return;
+        }
+        if self.content.is_dirty() {
+            self.content.save(&mut self.editor);
+        }
+        if self.editor.is_dirty() {
+            self.editor.save();
+        }
+        self.sync_project(true);
+        if self.message.as_ref().is_none_or(|m| !m.1 || m.2.elapsed() > Duration::from_secs(1)) {
+            self.info(format!("Saved {}", self.project_path.display()));
         }
     }
 
@@ -402,6 +716,10 @@ impl App {
     fn import_paths(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
         for p in paths {
             let cfg = LayerConfig::new(p);
+            if cfg.kind == LayerKind::OsmBoundaries && !self.crs.is_supported() {
+                self.error(format!("{}: OSM data needs a map projection (File → Map projection…)", cfg.name));
+                continue;
+            }
             self.info(format!("Importing {}", cfg.name));
             let id = self.add_layer(cfg, ctx);
             self.selected = Some(id);
@@ -410,13 +728,9 @@ impl App {
     }
 
     fn import_dialog(&mut self, kind: LayerKind, ctx: &egui::Context) {
-        let dir = project::find_maps_dir();
         let mut dlg = rfd::FileDialog::new();
-        if let Some(d) = &dir {
-            dlg = dlg.set_directory(match kind {
-                LayerKind::Raster => d.join("processed maps"),
-                LayerKind::OsmBoundaries => d.join("osm regions"),
-            });
+        if let Some(d) = self.project_path.parent().filter(|d| d.is_dir()) {
+            dlg = dlg.set_directory(d);
         }
         dlg = match kind {
             LayerKind::Raster => dlg.add_filter("Rasters (BMP, TIFF, PNG, JPEG)", RASTER_EXTS),
@@ -428,32 +742,49 @@ impl App {
     }
 
     fn open_project_dialog(&mut self, ctx: &egui::Context) {
-        let mut dlg = rfd::FileDialog::new().add_filter("mod-helper project", &["json"]);
-        if let Some(dir) = self.project_path.parent() {
+        let mut dlg = rfd::FileDialog::new().add_filter("mod-helper projects", &[bundle::EXT, "json"]);
+        if let Some(dir) = self.project_path.parent().filter(|d| d.is_dir()) {
             dlg = dlg.set_directory(dir);
         }
         if let Some(p) = dlg.pick_file() {
-            match ProjectFile::load(&p) {
-                Ok(pf) => {
-                    self.project_path = p;
-                    self.apply_project(pf, ctx);
-                    self.info(format!("Opened {}", self.project_path.display()));
-                }
-                Err(e) => self.error(format!("{e:#}")),
-            }
+            self.open_project(p, ctx);
         }
     }
 
-    fn save_as_dialog(&mut self) {
-        let mut dlg = rfd::FileDialog::new()
-            .add_filter("mod-helper project", &["json"])
-            .set_file_name(format!("mod-helper.{PROJECT_EXT}"));
+    /// Save the project as another file, which is the project from then on.
+    fn save_as_dialog(&mut self, ctx: &egui::Context) {
+        if self.project.is_none() {
+            return;
+        }
+        let mut dlg = rfd::FileDialog::new().add_filter("mod-helper project", &[bundle::EXT]).set_file_name(geo::file_name(&self.project_path));
         if let Some(dir) = self.project_path.parent() {
             dlg = dlg.set_directory(dir);
         }
-        if let Some(p) = dlg.save_file() {
-            self.project_path = p;
-            self.save_project();
+        let Some(dest) = dlg.save_file() else { return };
+        let dest = with_ext(dest);
+        // what is not saved goes in too
+        if self.content.is_dirty() {
+            self.content.save(&mut self.editor);
+        }
+        if self.editor.is_dirty() {
+            self.editor.save();
+        }
+        let pf = self.project_file();
+        let Some(p) = self.project.as_mut() else { return };
+        match p.save_as(&dest, &pf) {
+            Ok(()) => {
+                let path = p.path.clone();
+                self.synced_writes = bundle::writes();
+                // the working folder moved: open it again from there
+                match self.load_project(&path, ctx) {
+                    Ok(()) => {
+                        let _ = project::remember_project(&path);
+                        self.info(format!("Saved as {}", path.display()));
+                    }
+                    Err(e) => self.error(format!("{e:#}")),
+                }
+            }
+            Err(e) => self.error(format!("{e:#}")),
         }
     }
 
@@ -496,6 +827,12 @@ impl App {
     // ---------------------------------------------------------------- input
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.welcome.is_some() {
+            if ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O))) {
+                self.open_project_dialog(ctx);
+            }
+            return;
+        }
         if self.content.settings.active {
             // the content screen has its own keys (Ctrl+S saves the content and the map)
             let saving = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::S));
@@ -599,14 +936,28 @@ impl App {
         let ctx = ui.ctx().clone();
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
+                if ui.button("Welcome screen").clicked() {
+                    self.show_welcome(None);
+                }
+                if ui.button("New project…").clicked() {
+                    self.show_welcome(Some(false));
+                }
+                if ui.button("Import a mod or the base game…").clicked() {
+                    self.show_welcome(Some(true));
+                }
                 if ui.button("Open project…  (Ctrl+O)").clicked() {
                     self.open_project_dialog(&ctx);
                 }
-                if ui.button("Save project  (Ctrl+S)").clicked() {
+                let open = self.project.is_some();
+                if ui.add_enabled(open, egui::Button::new("Save project  (Ctrl+S)")).on_hover_text("The map, the nation content and the settings, into the project file").clicked() {
                     self.save_project();
                 }
-                if ui.button("Save project as…").clicked() {
-                    self.save_as_dialog();
+                if ui.add_enabled(open, egui::Button::new("Save project as…")).clicked() {
+                    self.save_as_dialog(&ctx);
+                }
+                ui.separator();
+                if ui.add_enabled(open, egui::Button::new("Map projection…")).on_hover_text("Where the map lies on the Earth: a plain raster or a map projection").clicked() {
+                    self.open_projection_window();
                 }
                 ui.separator();
                 if ui.button("Import raster (BMP/TIFF/PNG)…  (Ctrl+I)").clicked() {
@@ -640,6 +991,12 @@ impl App {
                 }
             });
             ui.separator();
+            if self.welcome.is_some() {
+                if self.project.is_some() && ui.button(format!("← Back to {}", geo::file_name(&self.project_path))).clicked() {
+                    self.welcome = None;
+                }
+                return;
+            }
             let mode = self.mode();
             let editing = mode == Mode::Editor;
             if ui.selectable_label(mode == Mode::Viewer, "🗺 Viewer").on_hover_text("Tool #1: layers of maps and boundaries").clicked() {
@@ -677,16 +1034,35 @@ impl App {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if let Some(w) = self.hover {
-                ui.monospace(format!("E {:>10.1}  N {:>10.1}", w[0], w[1]));
+            let plain = self.crs == Crs::UNKNOWN;
+            if let Some(w) = self.hover.filter(|_| self.welcome.is_none()) {
+                if plain {
+                    ui.monospace(format!("x {:>10.1}  y {:>10.1}", w[0], -w[1]));
+                } else {
+                    ui.monospace(format!("E {:>10.1}  N {:>10.1}", w[0], w[1]));
+                }
                 if let Some((lon, lat)) = self.crs.to_lonlat(w[0], w[1]) {
                     ui.monospace(geo::fmt_lonlat(lon, lat));
                 }
+                if let Some(p) = self.editor.placement(self.crs).filter(|_| self.editor.settings.active).and_then(|pl| pl.world_to_pixel(w)) {
+                    ui.monospace(format!("px {:.0}, {:.0}", p[0].floor(), p[1].floor()));
+                }
+            } else if self.project.is_none() {
+                ui.label("no project open");
             } else {
-                ui.monospace(self.crs.name());
+                ui.monospace(if plain { "plain raster".to_string() } else { self.crs.name() });
+            }
+            if self.project.is_none() || self.welcome.is_some() {
+                if let Some((msg, err, t)) = self.message.as_ref().filter(|m| m.2.elapsed() < Duration::from_secs(12)) {
+                    ui.separator();
+                    let _ = t;
+                    ui.label(RichText::new(msg).color(if *err { Color32::from_rgb(255, 110, 110) } else { ui.visuals().text_color() }));
+                }
+                return;
             }
             ui.separator();
-            ui.label(format!("{} / screen px", util::fmt_dist(self.cam.mpp / ui.ctx().pixels_per_point() as f64)));
+            let per_px = self.cam.mpp / ui.ctx().pixels_per_point() as f64;
+            ui.label(format!("{} / screen px", crate::welcome::fmt_world(per_px, self.crs, self.cam.center[1])));
             ui.separator();
             let (n, bytes, pending) = self.tiles.stats();
             ui.label(format!("{n} tiles ({})", util::fmt_bytes(bytes)))
@@ -965,7 +1341,7 @@ impl App {
                 self.tiles.warm_overview(&ctx, l.id, r);
             }
         }
-        view::draw_scale_bar(&dc);
+        view::draw_scale_bar(&dc, crate::welcome::metres_per_unit(self.crs, self.cam.center[1]));
 
         if self.layers.is_empty() && !editing {
             painter.text(
@@ -1317,6 +1693,27 @@ impl eframe::App for App {
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        let (game, unsaved) = (self.game_dir(), self.unsaved());
+        if let Some(w) = &mut self.welcome {
+            let act = egui::CentralPanel::default().show(ui, |ui| w.ui(ui, &game, unsaved)).inner;
+            match act {
+                Some(crate::welcome::Action::Open(p)) => self.open_project(p, &ctx),
+                Some(crate::welcome::Action::OpenDialog) => self.open_project_dialog(&ctx),
+                Some(crate::welcome::Action::Created(c)) => {
+                    let title = format!("New project {}", geo::file_name(&c.project));
+                    let mut lines = c.report;
+                    lines.push(format!("project file {}", c.project.display()));
+                    self.report = Some((title, lines));
+                    self.open_project(c.project, &ctx);
+                }
+                None => {}
+            }
+            self.pending_open_dialog(&ctx);
+            self.convert_dialog(&ctx);
+            self.report_window(&ctx);
+            self.screenshot_hook(&ctx);
+            return;
+        }
         match self.mode() {
             Mode::Content => {
                 let (content, editor) = (&mut self.content, &mut self.editor);
@@ -1333,6 +1730,10 @@ impl eframe::App for App {
             }
         }
         self.help_window(&ctx);
+        self.projection_window(&ctx);
+        self.pending_open_dialog(&ctx);
+        self.convert_dialog(&ctx);
+        self.report_window(&ctx);
         self.editor.windows(&ctx);
         // the build copies the nation content from disk: what is not saved goes in first
         if self.editor.take_build_wanted() {
@@ -1342,6 +1743,10 @@ impl eframe::App for App {
             self.editor.start_build(&ctx);
         }
 
+        // a save wrote the working folder: into the project file with it
+        if self.project.is_some() && bundle::writes() != self.synced_writes {
+            self.sync_project(false);
+        }
         self.tiles.end_frame();
         if self.layers.iter().any(|l| l.is_loading()) {
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -1350,13 +1755,15 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
-        if self.screenshot.is_some() {
+        if self.screenshot.is_some() || self.project.is_none() {
             return;
         }
-        if let Err(e) = self.project_file().save(&self.project_path) {
-            log::error!("could not save project: {e:#}");
-        } else {
-            log::info!("saved project to {}", self.project_path.display());
-        }
+        self.sync_project(true);
+        log::info!("saved the project {}", self.project_path.display());
     }
+}
+
+/// `path` ending in `.hoi4proj`.
+fn with_ext(path: PathBuf) -> PathBuf {
+    if path.to_string_lossy().ends_with(&format!(".{}", bundle::EXT)) { path } else { PathBuf::from(format!("{}.{}", path.display(), bundle::EXT)) }
 }

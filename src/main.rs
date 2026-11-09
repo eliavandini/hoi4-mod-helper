@@ -2,12 +2,15 @@
 //! Trentino. The first tool is a layer viewer for rasters and OSM boundaries.
 
 mod app;
+mod bundle;
 mod content;
 mod editor;
 mod geo;
 mod modbuild;
 mod layers;
+mod mapproj;
 mod models;
+mod newproject;
 mod osm;
 mod project;
 mod raster;
@@ -15,6 +18,8 @@ mod tiles;
 mod util;
 mod vector;
 mod view;
+mod welcome;
+mod zip;
 
 use std::path::PathBuf;
 
@@ -22,18 +27,25 @@ use eframe::egui;
 
 const USAGE: &str = "\
 usage:
-  mod-helper [PROJECT.project.json]     open the map viewer (default project next to the crate)
-  mod-helper --editor [PROJECT]         open with the map editor (maps/processed maps/suedtirol)
-  mod-helper --content [PROJECT]        open with the nation content screen (focus trees, events...)
+  mod-helper                            the welcome screen: recent projects, new projects, imports
+  mod-helper PROJECT.hoi4proj           open a project (an old PROJECT.project.json is converted first)
+  mod-helper --editor PROJECT           open it with the map editor
+  mod-helper --content PROJECT          open it with the nation content screen (focus trees, events...)
   mod-helper --info FILE...             print size, format and georeference of rasters
   mod-helper --extract-osm FILE.pbf...  extract (and cache) admin boundaries, rivers and lakes from OSM extracts
   mod-helper --export-geojson IN OUT.geojson [LON0,LAT0,LON1,LAT1]
                                         write boundary and water lines and area labels of an OSM extract
                                         (.osm.pbf or a cache .bin) as GeoJSON, optionally clipped
                                         to ways and labels touching a lon/lat box
-  mod-helper --build-mod [MAP_DIR] [--game DIR] [--mods DIR]
-                                        build the HOI4 mod from a saved map (default the editor's
-                                        map) into the game's mod folder, then check it
+  mod-helper --build-mod PROJECT|MAP_DIR [--game DIR] [--mods DIR]
+                                        build the HOI4 mod of a project (or of a map folder) into the
+                                        game's mod folder, then check it
+  mod-helper --import-map OUT.hoi4proj [--mod MOD_DIR] [--game DIR] [--name NAME]
+                                        a new project with the map of the base game (or of a mod
+                                        over it), on a plain raster
+  mod-helper --convert OLD.project.json NEW.hoi4proj
+                                        make a project file of a project of the old format (its
+                                        settings and map folder; those are only read)
   mod-helper --validate-mod MOD_DIR [GAME_DIR]
                                         check a built mod against the game's rules";
 
@@ -53,6 +65,8 @@ fn main() -> anyhow::Result<()> {
         Some("--export-geojson") => cli_export_geojson(&args[1..]),
         Some("--build-mod") => cli_build_mod(&args[1..]),
         Some("--validate-mod") => cli_validate_mod(&args[1..]),
+        Some("--import-map") => cli_import_map(&args[1..]),
+        Some("--convert") => cli_convert(&args[1..]),
         Some("--editor") => run_gui(args.get(1).map(PathBuf::from), app::Start::Editor),
         Some("--content") => run_gui(args.get(1).map(PathBuf::from), app::Start::Content),
         Some(a) if a.starts_with("--") => anyhow::bail!("unknown option {a}\n{USAGE}"),
@@ -108,18 +122,31 @@ fn cli_info(files: &[String]) -> anyhow::Result<()> {
 }
 
 fn cli_build_mod(args: &[String]) -> anyhow::Result<()> {
-    let mut dirs = modbuild::Dirs::default();
-    let mut map_dir = None;
+    let (mut game, mut mods, mut target) = (None, None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--game" => dirs.game = it.next().ok_or_else(|| anyhow::anyhow!("--game needs a folder"))?.into(),
-            "--mods" => dirs.mods = it.next().ok_or_else(|| anyhow::anyhow!("--mods needs a folder"))?.into(),
+            "--game" => game = Some(PathBuf::from(it.next().ok_or_else(|| anyhow::anyhow!("--game needs a folder"))?)),
+            "--mods" => mods = Some(PathBuf::from(it.next().ok_or_else(|| anyhow::anyhow!("--mods needs a folder"))?)),
             x if x.starts_with("--") => anyhow::bail!("unknown option {x}\n{USAGE}"),
-            x => map_dir = Some(PathBuf::from(x)),
+            x => target = Some(PathBuf::from(x)),
         }
     }
-    let map_dir = map_dir.or_else(editor::default_map_dir).ok_or_else(|| anyhow::anyhow!("no map folder given or found"))?;
+    let target = target.ok_or_else(|| anyhow::anyhow!("--build-mod needs a project\n{USAGE}"))?;
+    let mut dirs = modbuild::Dirs::default();
+    let map_dir = if target.is_dir() {
+        target
+    } else {
+        // the project's own settings: its game, mods folder and real-world data
+        let (p, pf) = bundle::Project::open(&target)?;
+        let ed = pf.editor.unwrap_or_default();
+        dirs.game = ed.game_dir.clone().unwrap_or(dirs.game);
+        dirs.mods = ed.mods_dir.clone().unwrap_or(dirs.mods);
+        dirs.sources = modbuild::bitmaps::Sources { dem: ed.dem, cover: ed.landcover };
+        p.map_dir()
+    };
+    dirs.game = game.unwrap_or(dirs.game);
+    dirs.mods = mods.unwrap_or(dirs.mods);
     let log = |l: &str| println!("{l}");
     let mod_dir = modbuild::build(&map_dir, &dirs, &log)?;
     println!();
@@ -127,6 +154,45 @@ fn cli_build_mod(args: &[String]) -> anyhow::Result<()> {
     if !errors.is_empty() {
         anyhow::bail!("{} checks failed", errors.len());
     }
+    Ok(())
+}
+
+fn cli_import_map(args: &[String]) -> anyhow::Result<()> {
+    let (mut out, mut game, mut mod_dir, mut name) = (None, modbuild::default_game_dir(), None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = |what: &str| it.next().cloned().ok_or_else(|| anyhow::anyhow!("{what} needs a value"));
+        match a.as_str() {
+            "--game" => game = val("--game")?.into(),
+            "--mod" => mod_dir = Some(PathBuf::from(val("--mod")?)),
+            "--name" => name = Some(val("--name")?),
+            x if x.starts_with("--") => anyhow::bail!("unknown option {x}\n{USAGE}"),
+            x => out = Some(PathBuf::from(x)),
+        }
+    }
+    let out = out.ok_or_else(|| anyhow::anyhow!("--import-map needs OUT.{}\n{USAGE}", bundle::EXT))?;
+    let src = newproject::hoi4::Source { game: game.clone(), mod_dir };
+    let size = project::bmp_size(&src.mod_dir.as_ref().map(|m| m.join("map/provinces.bmp")).filter(|p| p.is_file()).unwrap_or_else(|| src.game.join("map/provinces.bmp")));
+    let pixel_m = size.map_or(7000.0, |(w, _)| 40_075_000.0 / w as f64);
+    let name = name.unwrap_or_else(|| if src.mod_dir.is_some() { "Imported mod".into() } else { "Imported base game".into() });
+    let t0 = std::time::Instant::now();
+    let game_dir = Some(game).filter(|g| *g != modbuild::default_game_dir());
+    let req = newproject::Request { name, file: out, start: newproject::Start::Import(src), proj: mapproj::Projection::Plain { pixel_m }, game_dir };
+    let (_, c) = newproject::create(&req, &util::Progress::default())?;
+    for l in c.report {
+        println!("{l}");
+    }
+    println!("wrote {} in {:.1} s", c.project.display(), t0.elapsed().as_secs_f32());
+    Ok(())
+}
+
+fn cli_convert(args: &[String]) -> anyhow::Result<()> {
+    let [old, new] = args else { anyhow::bail!("--convert needs OLD.project.json and NEW.{}\n{USAGE}", bundle::EXT) };
+    let (p, report) = bundle::convert(old.as_ref(), new.as_ref())?;
+    for l in report {
+        println!("{l}");
+    }
+    println!("wrote {}", p.path.display());
     Ok(())
 }
 

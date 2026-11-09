@@ -509,6 +509,9 @@ impl Store {
             }
         }
         // undo steps hold bodies; binary ones written to disk stay valid as bytes
+        if n > 0 {
+            crate::bundle::touched();
+        }
         Ok(n)
     }
 

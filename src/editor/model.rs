@@ -1055,6 +1055,7 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json).with_context(|| format!("cannot write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("cannot write {}", path.display()))?;
+    crate::bundle::touched();
     Ok(report)
 }
 

@@ -2,13 +2,11 @@
 //! from the user's height and slope rules, with smaller provinces on
 //! built-up land.
 
-use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::raster::{self, Pixels};
 use crate::util::Progress;
 
 /// Land cover class "sealed" (built-up) in landcover_smooth.bmp (CLC+ Backbone).
@@ -128,23 +126,10 @@ impl From<StoredDensity> for DensityParams {
     }
 }
 
-/// Load dem_section.tif and landcover_smooth.bmp from the map folder.
-pub fn load_terrain(dir: &Path, w: u32, h: u32, pixel_m: f64, progress: &Progress) -> Result<Terrain> {
-    let (dem_r, _) = raster::load(&dir.join("dem_section.tif"), progress)?;
-    let (lc_r, _) = raster::load(&dir.join("landcover_smooth.bmp"), progress)?;
-    if (dem_r.width, dem_r.height) != (w, h) || (lc_r.width, lc_r.height) != (w, h) {
-        bail!("dem_section.tif / landcover_smooth.bmp are not {w} x {h} like provinces.bmp");
-    }
-    let dem: Vec<f32> = match dem_r.pixels {
-        Pixels::GrayF32(v) => v,
-        Pixels::Gray16(v) => v.into_iter().map(|x| x as f32).collect(),
-        Pixels::Gray8(v) => v.into_iter().map(|x| x as f32).collect(),
-        _ => bail!("dem_section.tif is not a single-band height map"),
-    };
-    let lc: Vec<u8> = match lc_r.pixels {
-        Pixels::Indexed8 { data, .. } | Pixels::Gray8(data) => data,
-        _ => bail!("landcover_smooth.bmp is not an 8-bit class map"),
-    };
+/// Load dem_section.tif and landcover_smooth.bmp from the map folder (or
+/// what stands in for them, see [`crate::modbuild::bitmaps::inputs`]).
+pub fn load_terrain(src: &crate::modbuild::bitmaps::Sources, w: u32, h: u32, pixel_m: f64, heights: Option<&[u8]>, progress: &Progress) -> Result<Terrain> {
+    let crate::modbuild::bitmaps::Inputs { dem, cover: lc, .. } = crate::modbuild::bitmaps::inputs(src, w as usize, h as usize, heights, progress)?;
     progress.set_stage("slopes");
     // the build's slope uses the map's pixel size as it is (f64)
     let build_px_m = pixel_m;

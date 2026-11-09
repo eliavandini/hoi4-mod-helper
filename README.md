@@ -2,9 +2,10 @@
 
 Map tools for the Tyrol / Trentino HOI4 total conversion:
 
-1. a **layer viewer**: the rasters in `../maps/processed maps` and the
-   administrative boundaries, rivers and lakes in `../maps/osm regions`, stacked as layers that
-   can be toggled, reordered, moved, restyled and imported;
+1. a **layer viewer**: rasters (BMP, GeoTIFF, PNG, JPEG) and the
+   administrative boundaries, rivers and lakes of OpenStreetMap extracts,
+   stacked as layers that can be toggled, reordered, moved, restyled and
+   imported;
 2. a **map editor** for the mod's map: provinces, states, nations, air and sea
    zones, adjacencies, state and nation properties, inaccessible zones, and
    the 3D objects on the map, with an animated model preview (see
@@ -17,24 +18,29 @@ Map tools for the Tyrol / Trentino HOI4 total conversion:
    content and checks it (see [Building the mod](#building-the-mod)). No
    Python needed.
 
+All of it belongs to a **project**: one file, made blank or imported from
+the base game or a mod, on a plain raster or a map projection (see
+[Projects](#projects)).
+
 ## Running
 
 ```sh
-cargo run --release                     # opens mod-helper.project.json (created on first run)
-cargo run --release -- other.project.json
-cargo run --release -- --editor         # start in the map editor
-cargo run --release -- --content        # start in the nation content screen
-cargo run --release -- --info "../maps/processed maps/provinces.bmp"   # headless file info
-cargo run --release -- --extract-osm "../maps/osm regions/austria-latest.osm.pbf"
-cargo run --release -- --build-mod      # build the mod from the editor's map, then check it
+cargo run --release                                   # the welcome screen: recent projects, new, import, open
+cargo run --release -- "My map.hoi4proj"              # open a project
+cargo run --release -- --editor "My map.hoi4proj"     # start in the map editor
+cargo run --release -- --content "My map.hoi4proj"    # start in the nation content screen
+cargo run --release -- --info dem.tif                 # headless file info
+cargo run --release -- --extract-osm austria-latest.osm.pbf
+cargo run --release -- --build-mod "My map.hoi4proj"  # build the project's mod, then check it
+cargo run --release -- --import-map "Base game.hoi4proj" [--mod MOD_DIR] [--name NAME]
+cargo run --release -- --convert mod-helper.project.json "My map.hoi4proj"
 cargo run --release -- --validate-mod ~/.local/share/Paradox\ Interactive/Hearts\ of\ Iron\ IV/mod/suedtirol_test
 ```
 
-On first start, every BMP/TIFF/PNG in `../maps/processed maps` and every
-`.osm.pbf` in `../maps/osm regions` is added. The height map and the province
-map (45 % opacity) are visible; the other layers start hidden. The layer stack,
-styles, offsets and view are saved to `mod-helper.project.json` on exit or
-with Ctrl+S. Paths are stored relative to the project file.
+Rasters and OSM extracts are added with File → Import (Ctrl+I) or by
+dropping them on the window. The layer stack, styles, offsets and view are
+saved in the project file with Ctrl+S and on exit. Their paths are stored
+relative to the project file (absolute when they share no folder with it).
 
 The first time an `.osm.pbf` is loaded, its boundaries, rivers and lakes are
 extracted, which takes about 10 s for the 600–800 MB extracts. The result is
@@ -53,6 +59,113 @@ An OSM layer draws:
 
 The layer's Display section has a row per admin level and per kind of water
 (show, colour); "Line width" scales all of them.
+
+## Projects
+
+A project is **one file**, `<name>.hoi4proj`: a ZIP archive (any zip tool
+opens it) of
+- its settings, `project.json`: the layers, the view, the editor's and the
+  content screen's settings;
+- its map, `map/`: `provinces.bmp`, `provinces.json`, the georeference, the
+  painted terrain and imported heightmap, `adjacency_rules.txt`, and the
+  nations' content in `content/`.
+
+What a project only uses stays where it is, and the project refers to it
+(relative to the project file): the rasters and OSM extracts of the layers,
+the elevation and land cover the map was made from (map editor → Mod
+details → Real-world data), the game and the mods folder.
+
+**Working folder.** While a project is open, its map is unpacked into
+`~/.local/share/mod-helper/projects/<name>-<hash>/map`. The editor, the
+content screen and the build work on that folder.
+- Every save packs what changed into the project file: the map, the
+  content, a new projection, Ctrl+S, quitting. It writes a new file next to
+  the project, then renames it over the old one. Unchanged files are copied
+  as they are, so a save of the 4608 × 2816 map adds about 0.1 s.
+- The editor's and the content screen's backups stay in the working folder,
+  not in the project.
+- The folder is used again while the project file is the one it was
+  unpacked from. A project file changed elsewhere (copied over, restored) is
+  unpacked again; the backups stay.
+- If the app ended before packing changes it had saved, they are packed the
+  next time the project opens.
+
+**The welcome screen** opens when no project is given, or with File →
+Welcome screen. It lists the projects opened before, with the mod's name,
+the map's size and its projection, and makes new ones:
+- **New project…**: a name, the file, and the map. A **blank** map is one
+  land province (in a state, a nation and an air zone) or one sea province
+  (in a sea zone). Its size is a preset (from vanilla's 5632 × 2048) or any
+  size the game takes: multiples of 256, at most 13.2 million pixels.
+- **Import a mod or the base game…**: the map of the base game, of a mod in
+  the game's mod folder, or of any mod folder (see
+  [Importing a map](#importing-a-map)).
+
+**Where the map lies.** A map lies on either
+- a **plain raster**: a size per pixel and no place on the Earth, for maps
+  not made from geographic data, like vanilla's; or
+- a **map projection** (LAEA Europe, UTM, Web Mercator or
+  longitude/latitude, with its centre and pixel size), which places it on the
+  Earth so that true geographic files (GeoTIFFs, OSM extracts) line up with it.
+
+**File → Map projection…** changes it later. The map's pixels stay as they
+are; only where they lie on the Earth changes, and the pixel size that areas
+and slopes use. The old georeference is kept with the backups. The layers
+are shown in the map's projection, and OSM layers need one.
+
+**Old projects** (`mod-helper.project.json`, with the map in a folder of its
+own such as `maps/processed maps/suedtirol`) are converted when opened. You
+choose where the project file goes.
+- The map's own files go into the project file.
+- The map folder's `dem_section.tif` and `landcover_smooth.bmp` become the
+  project's elevation and land cover references.
+- The old files are only read, and the map's backups stay in its folder.
+
+`--convert OLD NEW` does the same from the command line.
+
+### Importing a map
+
+The importer reads the game's files the way the game does: the mod's own
+files first, then the game's, following the mod's `replace_path`s. A mod
+packed in a `.zip` has to be unpacked first. Imports take about a second,
+and a report lists what came over and what did not.
+
+**What comes over:**
+- provinces: colour, type, terrain, and the name of their victory point;
+- states: owner, provinces, manpower, category, buildings, resources,
+  victory points, impassable;
+- the countries that own them: name, colour, capital, ruling party;
+- strategic regions, adjacencies and their rules;
+- rivers (traced back into lines), railways, supply hubs, naval bases and 3D
+  objects;
+- `terrain.bmp` (as painted terrain) and `heightmap.bmp` (as the imported
+  heightmap).
+
+**Fixed on the way.** A few things in the game's files break the editor's
+rules or the build's checks:
+- Strategic regions with both land and sea are split in two, "(land)" and
+  "(sea)".
+- Straits get crossing points inside their provinces.
+- Straits between provinces that touch, impassable borders between provinces
+  that do not, and adjacencies listed twice are dropped.
+- Points where four provinces meet are fixed (about 20 px for vanilla).
+- A state with more factories than its category has slots gets a bigger
+  category.
+- Canals (Kiel, Panama, Suez) stay: a `sea` adjacency between two sea
+  provinces through land. The checks know them.
+- Land and sea that touch only diagonally (vanilla has 155 such points) are
+  a warning in the editor's checks, not an error.
+
+**Not imported:** cores and claims (the build gives each owner its states as
+cores), dated history, province buildings other than naval bases, the
+weather of strategic regions (the build writes its own), and sea provinces
+listed in states.
+
+Countries keep the game's tags as `source_tag`; the build gives them new
+ones. Without real-world data, the heights come from the imported heightmap
+(30 m per step above the water plane), or the land is flat (200 m); land
+cover is grass wherever no terrain is painted. The imported base game builds
+and passes all of the build's checks.
 
 ## Controls
 
@@ -73,19 +186,25 @@ The side panel shows the layer list, the selected layer's properties, and an
 inspector with the pixel coordinates and raw values (palette index, RGB,
 height…) of every visible raster under the cursor.
 
-Tests: `cargo test` runs the unit tests; `cargo test --release -- --include-ignored`
-also checks the palette-TIFF decoder against the BMP export of the same data,
-and runs the map editor on a copy of the real map (load / save round trip;
-every edit operation followed by the checks, undo and redo). The copy goes to
-`$MOD_HELPER_TEST_OUT` or the system temp folder.
+Tests: `cargo test` runs the unit tests. `MOD_HELPER_TEST_MAPS=<the mod's
+maps folder> cargo test --release -- --include-ignored` also runs the tests
+on the real data:
+- it checks the palette-TIFF decoder against the BMP export of the same
+  data;
+- it runs the map editor on a copy of the real map: a load / save round trip,
+  and every edit operation followed by the checks, undo and redo;
+- it imports and builds the base game.
+
+The copies go to `$MOD_HELPER_TEST_OUT` or the system temp folder. Tests
+never touch mod-helper's own data folder.
 
 ## Map editor
 
 Switch with **✏ Map editor** in the menu bar (or start with `--editor`). It
-edits the map project in `../maps/processed maps/suedtirol`: `provinces.bmp`
-plus `provinces.json` (names, types, states, nations, strategic regions,
-adjacencies, overrides), as written by `make_provinces.py`. The viewer's
-layers stay underneath ("Background layers" at the bottom of the panel).
+edits the project's map: `provinces.bmp` plus `provinces.json` (names,
+types, states, nations, strategic regions, adjacencies, overrides). The
+viewer's layers stay underneath ("Background layers" at the bottom of the
+panel).
 
 **Levels** (keys `1`–`9`, `0`, `G`): what clicks select and what the actions work on.
 
@@ -277,7 +396,7 @@ draw; click one to go there.
 - The selected river can be renamed, reversed (the other end becomes the
   source), simplified, and given widths that grow evenly from one value at
   the source to another at the mouth.
-- *From the heights* follows the water down `dem_section.tif` to the sea or
+- *From the heights* follows the water down the elevation to the sea or
   the map's edge, filling hollows on the way. A river starts where the water
   of at least the set area gathers (*km² drained at least*: less makes more
   and longer rivers), each junction keeps the river with the larger
@@ -361,7 +480,7 @@ the terrain units fight in is the province's (Mod details → Terrain types).
   in its colours. Pixels of an imported `terrain.bmp` that differ from the
   build's terrain become painted; the others stay the build's, so they keep
   following the land cover and the coast. An imported heightmap (BMP, PNG or
-  TIFF, grey) is used instead of the one from `dem_section.tif`. The build
+  TIFF, grey) is used instead of the one from the elevation. The build
   fits it to the sea: land at or under the water plane (95) goes to 96, and
   sea and lakes at or above it take the build's depth. The shading (`world_normal.bmp`)
   adds what it changed to the measured heights. "Use the build's" drops it.
@@ -452,18 +571,17 @@ to go there.
 
 **Saving and building.** Ctrl+S (or 💾) writes `provinces.bmp` and
 `provinces.json` (and the Terrain level's `terrain_paint.bmp` and
-`heightmap_import.bmp` when there are any). The previous files are copied to `backups/<time>/` first
+`heightmap_import.bmp` when there are any) into the project file. The
+previous files are first copied to `backups/<time>/` in the working folder
 (UTC time of the save); the last 10 are kept. Ids are renumbered 1..n on save
 if anything was removed. "Backups…" lists them with their age and province
 count; "Load" puts one in the editor as one edit (Undo goes back). Nothing is
 written until you save. The mod details and the map frame setting stay as they are.
-Reload and Open… ask before they drop unsaved changes.
+Reload asks before it drops unsaved changes.
 "Build mod" saves, builds the mod and checks it (see
 [Building the mod](#building-the-mod)), and opens the "Build mod and play"
 window with the log and the game launcher (also "▶ Play…").
-`make_provinces.py` refuses to overwrite a map changed in the editor unless
-run with `--force` (it then keeps a copy in `backups/`). Adjacency rules go in
-`adjacency_rules.txt` next to `provinces.json`.
+Adjacency rules go in `adjacency_rules.txt` next to `provinces.json`.
 
 Edits that move pixels (divide, generate, merge, paint) carry impassable
 borders along: where a walled-off province gives pixels to another, the new
@@ -671,10 +789,12 @@ Until then, checks and imports that need it wait.
 
 ## Building the mod
 
-"Build mod" in the editor (or `--build-mod [MAP_DIR] [--game DIR] [--mods
-DIR]`) makes the mod from the saved map in about 4 s. Inputs in the map
-folder: `provinces.bmp` + `provinces.json`, `dem_section.tif` (heights) and
-`landcover_smooth.bmp` (land cover classes). Palettes, texture sizes, name
+"Build mod" in the editor (or `--build-mod PROJECT [--game DIR] [--mods
+DIR]`) makes the mod from the saved map in about 4 s. Its inputs are the
+project's `provinces.bmp` and `provinces.json`, and the elevation (heights in
+metres) and land cover (CLC+ Backbone classes) it refers to. Without them,
+the heights come from the imported heightmap or are flat, and the land is
+grass where no terrain is painted. Palettes, texture sizes, name
 lists and the game version come from the HOI4 install. The terrain colours,
 tree type and city look are sampled from the vanilla Alps around Innsbruck.
 
@@ -753,8 +873,8 @@ playsets and writes `dlc_load.json` again when it starts the game.
 
 ## How layers are placed
 
-All layers are drawn in one world CRS, **EPSG:3035 (LAEA Europe)**, the CRS
-of the processed maps. A raster's georeference is read in GDAL's order:
+All layers are drawn in one world CRS, the map's projection (EPSG:3035, LAEA
+Europe, for the Tyrol map). On a plain raster, nothing is reprojected. A raster's georeference is read in GDAL's order:
 `.aux.xml` GeoTransform/SRS, then internal GeoTIFF tags, then a world file
 (`.wld`, `.tfw`, `.bpw`, …) and a `.prj` file. Rasters in another supported CRS
 (EPSG:4326/4258, UTM 258xx/326xx/327xx, 3857) are reprojected on the fly by
@@ -779,7 +899,12 @@ top, in metres.
 | `layers.rs` | layer config (persisted) and runtime state, pixel ↔ world placement |
 | `view.rs` | camera, raster/vector drawing, scale bar |
 | `app.rs` | UI (egui/eframe 0.37, wgpu) |
-| `project.rs` | project files and default layer discovery |
+| `project.rs` | the project's settings (`project.json`), old project files, the recent projects |
+| `bundle.rs` | project files: the ZIP of settings and map, the working folder, packing what changed, converting old projects |
+| `zip.rs` | ZIP archives: stored and deflated entries, raw copies, no zip64 |
+| `mapproj.rs` | where a map lies: plain raster or map projection, sizes HOI4 takes, changing the projection |
+| `newproject/` | new projects: blank maps; imports of the base game or a mod (`hoi4.rs`) |
+| `welcome.rs` | the welcome screen, the new project form, the Map projection window |
 | `editor/model.rs` | map data (id tables, label bitmap, per-province statistics and borders), load / save with backups |
 | `editor/doc.rs` | open map with transactions and undo / redo (data snapshots + pixel change logs) |
 | `editor/ops.rs` | all edit operations: paint, merge, divide, generate, dissolve, states, nations, zones, adjacencies, inaccessible zones |
@@ -811,7 +936,7 @@ top, in metres.
 | `content/focus.rs`, `drawio.rs` | focus trees: layout, checks, play, edits; trees from draw.io |
 | `content/docs.rs`, `wizard.rs` | the game's documentation of effects, triggers and modifiers; the wizards' catalog, roles of fields, and how built script is merged in |
 | `content/validate.rs`, `errlog.rs` | the content checks; the game's `error.log` |
-| `content/refactor.rs`, `gfx.rs`, `zip.rs`, `build.rs` | renames, deletes, find & replace; sprites and pictures; bundles; the content in the built mod |
+| `content/refactor.rs`, `gfx.rs`, `zip.rs`, `build.rs` | renames, deletes, find & replace; sprites and pictures; bundles (in memory, with `zip.rs`); the content in the built mod |
 | `content/ui/` | the screen: nations, forms and code editor, wizards and the sprite picker, the focus tree canvas, check, import / export, test play, tools |
 | `editor/content_link.rs` | what the content screen asks of the map: nations, tags, states, the build |
 | `models/pdxbin.rs`, `mesh.rs`, `anim.rs` | the game's binary `.mesh` and `.anim` files: meshes, skeletons, skinning, locators, animation samples |
@@ -827,8 +952,15 @@ the affected tiles.
 
 ## Limitations
 
-- The map editor edits one map project at a time and keeps it in memory
-  (about 0.3 GB for the 4608 × 2816 map with undo).
+- The app has one project open at a time and keeps its map in memory
+  (about 0.3 GB for the 4608 × 2816 map with undo). Two copies of the app
+  must not open the same project file (they share its working folder).
+- Project files are ZIP archives without zip64: each file in them and the
+  whole archive must stay under 4 GB.
+- A plain raster has no place on the Earth: OSM layers stay empty on it,
+  and rasters only line up by their pixel size. HOI4's own maps are not true
+  projections, so an imported vanilla map stays a plain raster unless you
+  give it one.
 - "Remove from play" (lake provinces) and "Make lake" are untested in the
   game (the built files pass the checks and match vanilla's lakes).
 - Ambient objects are only partly tested in the game (the turn's direction

@@ -516,7 +516,7 @@ impl Screen {
                 match Store::load(dir) {
                     Ok(st) => {
                         let n: usize = st.packages.values().map(|p| p.files.len()).sum();
-                        self.info(format!("content of {}: {} nations, {n} files", dir.display(), st.packages.len()));
+                        self.info(format!("the nations' content: {} nations, {n} files", st.packages.len()));
                         self.store = Some(st);
                         self.check.stale();
                         self.gfx.clear();
@@ -557,7 +557,7 @@ impl Screen {
         match st.save() {
             Ok(0) => self.info("the content has no changes"),
             Ok(n) => {
-                let m = format!("saved the content: {n} files in {}", st.root.display());
+                let m = format!("saved the content: {n} files");
                 self.info(m);
             }
             Err(e) => self.error(format!("saving the content failed: {e:#}")),

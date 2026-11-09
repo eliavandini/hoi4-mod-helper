@@ -2,8 +2,9 @@
 //! adjacencies, state properties and inaccessible zones of the mod's map,
 //! edited on top of the viewer's layers.
 //!
-//! It edits the map project in `maps/processed maps/suedtirol`
-//! (provinces.bmp + provinces.json, see [`model`]); "Build mod" makes the
+//! It edits the open project's map, unpacked in its working folder
+//! (provinces.bmp + provinces.json, see [`model`] and [`crate::bundle`]);
+//! "Build mod" makes the
 //! HOI4 mod from it and checks it (see [`crate::modbuild`]), with the mod's
 //! name, version, tags... from "Mod details".
 
@@ -271,6 +272,12 @@ pub struct Settings {
     pub game_dir: Option<PathBuf>,
     /// Where mods are built (None: the game's mod folder in the user's documents).
     pub mods_dir: Option<PathBuf>,
+    /// The heights (m) the map was made from: a raster of the map's size
+    /// outside the project (None: from the imported heightmap, or flat).
+    pub dem: Option<PathBuf>,
+    /// The land cover (CLC+ Backbone classes) the map was made from (None:
+    /// grass where no terrain is painted).
+    pub landcover: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -296,6 +303,8 @@ impl Default for Settings {
             auto_check: true,
             game_dir: None,
             mods_dir: None,
+            dem: None,
+            landcover: None,
         }
     }
 }
@@ -318,7 +327,6 @@ enum Act {
     Undo,
     Redo,
     Reload,
-    Open,
     SetLevel(Level),
     Select(Level, Vec<Id>),
     ZoomProvince(Id),
@@ -414,6 +422,8 @@ type RuleShares = ((u64, Vec<TerrainRule>), Vec<f32>);
 
 pub struct Editor {
     pub settings: Settings,
+    /// The project file the map is in (shown in place of its working folder).
+    pub project: Option<PathBuf>,
     pub doc: Option<Doc>,
     loading: Option<(Arc<Progress>, Receiver<Result<Doc, String>>)>,
     /// The "Backups" window (open with the list), and a backup being read.
@@ -528,15 +538,12 @@ fn version(doc: &Doc) -> u64 {
     doc.meta_version.wrapping_mul(1_000_003) ^ doc.pixel_version
 }
 
-pub fn default_map_dir() -> Option<PathBuf> {
-    crate::project::find_maps_dir().map(|m| m.join("processed maps").join("suedtirol"))
-}
-
 
 impl Editor {
     pub fn new(settings: Settings) -> Self {
         Editor {
             settings,
+            project: None,
             doc: None,
             loading: None,
             backups: None,
@@ -680,14 +687,19 @@ impl Editor {
         self.settings.map_dir = Some(dir);
     }
 
-    /// Open the default (or last) map if nothing is open yet.
+    /// Open the project's map if nothing is open yet.
     pub fn ensure_open(&mut self, ctx: &egui::Context) {
         if self.doc.is_none() && self.loading.is_none() && self.load_err.is_none() {
-            match self.settings.map_dir.clone().or_else(default_map_dir) {
+            match self.settings.map_dir.clone() {
                 Some(d) => self.open(d, ctx),
-                None => self.load_err = Some("no map folder found; use \"Open map…\"".into()),
+                None => self.load_err = Some("no project is open (File → Open or New project)".into()),
             }
         }
+    }
+
+    /// The real-world data the map was made from.
+    pub fn sources(&self) -> modbuild::bitmaps::Sources {
+        modbuild::bitmaps::Sources { dem: self.settings.dem.clone(), cover: self.settings.landcover.clone() }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -698,13 +710,13 @@ impl Editor {
                     Ok(doc) => {
                         self.info(format!(
                             "opened {}: {} provinces, {} states, {} nations, {} zones",
-                            doc.dir.display(),
+                            self.project.as_deref().unwrap_or(&doc.dir).display(),
                             doc.data.provinces.count(),
                             doc.data.states.count(),
                             doc.data.nations.count(),
                             doc.data.regions.count()
                         ));
-                        let (dir, w, h, pm) = (doc.dir.clone(), doc.w, doc.h, doc.data.pixel_m);
+                        let (w, h) = (doc.w, doc.h);
                         self.doc = Some(doc);
                         self.sel.clear();
                         self.sel_adj = None;
@@ -719,15 +731,7 @@ impl Editor {
                         self.issues.clear();
                         self.issues_for = 0;
                         self.zoom_to = Some([0.0, 0.0, w as f64, h as f64]);
-                        let (tx, rx) = crossbeam_channel::bounded(1);
-                        let c = ctx.clone();
-                        std::thread::spawn(move || {
-                            let r = density::load_terrain(&dir, w, h, pm, &Progress::default()).map_err(|e| format!("{e:#}"));
-                            let _ = tx.send(r);
-                            c.request_repaint();
-                        });
-                        self.terrain_rx = Some(rx);
-                        self.terrain_msg = Some("loading terrain…".into());
+                        self.load_terrain(ctx);
                     }
                     Err(e) => {
                         self.error(format!("cannot open map: {e}"));
@@ -785,6 +789,22 @@ impl Editor {
         self.launcher.poll();
     }
 
+    /// Read the heights and land cover (for generating by terrain) in the
+    /// background.
+    fn load_terrain(&mut self, ctx: &egui::Context) {
+        let Some(doc) = &self.doc else { return };
+        let (src, w, h, pm, heights) = (self.sources(), doc.w, doc.h, doc.data.pixel_m, doc.heights.clone());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let r = density::load_terrain(&src, w, h, pm, heights.as_deref().map(|v| v.as_slice()), &Progress::default()).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(r);
+            c.request_repaint();
+        });
+        self.terrain_rx = Some(rx);
+        self.terrain_msg = Some("loading terrain…".into());
+    }
+
     fn start_check(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else { return };
         let snap = validate::Snapshot::of(doc);
@@ -803,8 +823,15 @@ impl Editor {
 
     pub fn placement(&self, crs: Crs) -> Option<Placement> {
         let doc = self.doc.as_ref()?;
-        let (gt, _) = doc.geo.transform.clone()?;
-        let lcrs = doc.geo.crs.as_ref().map(|c| c.0).unwrap_or(Crs::UNKNOWN);
+        let (gt, lcrs) = match &doc.geo.transform {
+            Some((gt, _)) => (*gt, doc.geo.crs.as_ref().map(|c| c.0).unwrap_or(Crs::UNKNOWN)),
+            // a plain raster without a world file: as one with its top-left
+            // corner at 0, 0 (see crate::mapproj)
+            None => {
+                let pm = if doc.data.pixel_m > 0.0 { doc.data.pixel_m } else { 1.0 };
+                (crate::geo::GeoTransform::north_up(0.0, 0.0, pm, pm), Crs::UNKNOWN)
+            }
+        };
         Placement::new(gt, lcrs, crs, [0.0, 0.0], doc.w, doc.h)
     }
 
@@ -1020,19 +1047,11 @@ impl Editor {
                     self.after_edit();
                 }
             }
-            Act::Reload | Act::Open if self.is_dirty() => self.ask_discard = Some(act),
+            Act::Reload if self.is_dirty() => self.ask_discard = Some(act),
             Act::Reload => {
                 if let Some(dir) = self.doc.as_ref().map(|d| d.dir.clone()).or(self.settings.map_dir.clone()) {
                     self.doc = None;
                     self.open(dir, ctx);
-                }
-            }
-            Act::Open => {
-                if let Some(f) = rfd::FileDialog::new().set_title("Open map: provinces.json").add_filter("provinces.json", &["json"]).pick_file() {
-                    if let Some(dir) = f.parent() {
-                        self.doc = None;
-                        self.open(dir.to_path_buf(), ctx);
-                    }
                 }
             }
             Act::SetLevel(l) => self.set_level(l),
@@ -2196,9 +2215,6 @@ impl Editor {
         }
         if self.doc.is_none() {
             ui.horizontal(|ui| {
-                if ui.button("Open map…").on_hover_text("Pick the provinces.json of a map folder").clicked() {
-                    acts.push(Act::Open);
-                }
                 if self.load_err.is_some() && ui.button("Retry").clicked() {
                     self.load_err = None;
                 }
@@ -2247,7 +2263,8 @@ impl Editor {
     fn header_ui(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let dirty = self.is_dirty();
         let doc = self.doc.as_ref().unwrap();
-        ui.label(RichText::new(doc.dir.display().to_string()).small().weak());
+        ui.label(RichText::new(self.project.as_deref().unwrap_or(&doc.dir).display().to_string()).small().weak())
+            .on_hover_text(format!("unpacked in {} while it is open; every save goes into the project file", doc.dir.display()));
         ui.label(format!(
             "{} provinces · {} states · {} nations · {} zones · {} adjacencies{}",
             doc.data.provinces.count(),
@@ -2278,11 +2295,8 @@ impl Editor {
             if ui.add_enabled(redo.is_some(), egui::Button::new("Redo")).on_hover_text(format!("Redo {} (Ctrl+Shift+Z)", redo.unwrap_or_default())).clicked() {
                 acts.push(Act::Redo);
             }
-            if ui.button("Reload").on_hover_text("Discard unsaved changes and read the files again").clicked() {
+            if ui.button("Reload").on_hover_text("Discard unsaved changes and read the map as it was last saved").clicked() {
                 acts.push(Act::Reload);
-            }
-            if ui.button("Open…").clicked() {
-                acts.push(Act::Open);
             }
             if ui.button("Backups…").on_hover_text("The map as it was before each of the last saves; load one into the editor").clicked() {
                 self.backups = Some(model::backups(&doc.dir));
@@ -2562,11 +2576,13 @@ impl Editor {
         }
     }
 
-    /// Where the HOI4 install is and where mods are built.
+    /// Where the HOI4 install is and where mods are built, and the map's
+    /// real-world data.
     fn dirs(&self) -> modbuild::Dirs {
         modbuild::Dirs {
             game: self.settings.game_dir.clone().unwrap_or_else(modbuild::default_game_dir),
             mods: self.settings.mods_dir.clone().unwrap_or_else(modbuild::default_mods_dir),
+            sources: self.sources(),
         }
     }
 
@@ -2614,6 +2630,8 @@ impl Editor {
         let mut act: Option<Act> = None;
         let mut close = false;
         let (mut game_dir, mut mods_dir) = (self.settings.game_dir.clone(), self.settings.mods_dir.clone());
+        let (mut dem, mut landcover) = (self.settings.dem.clone(), self.settings.landcover.clone());
+        let map_size = self.doc.as_ref().map(|d| (d.w, d.h));
         let mut browse_picture = false;
         egui::Window::new("Mod details").open(&mut open).default_width(620.0).default_height(640.0).show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(ctx.content_rect().height() * 0.75).show(ui, |ui| {
@@ -2760,6 +2778,49 @@ impl Editor {
                     }
                 });
                 ui.add_space(6.0);
+                ui.heading("Real-world data");
+                ui.label(
+                    RichText::new("Rasters of the map's size the project refers to (they stay where they are): the build makes the heightmap and the terrain from them, the editor generates provinces by them.")
+                        .small()
+                        .weak(),
+                );
+                egui::Grid::new("meta_sources").num_columns(2).min_col_width(118.0).spacing([12.0, 6.0]).show(ui, |ui| {
+                    for (label, file, none, tip) in [
+                        ("Elevation", &mut dem, "none: from the imported heightmap, else flat", "Heights in metres, one band (e.g. a GeoTIFF of a DEM)"),
+                        ("Land cover", &mut landcover, "none: grass where no terrain is painted", "CLC+ Backbone classes, 8-bit"),
+                    ] {
+                        ui.label(label).on_hover_text(tip);
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                match file.as_ref() {
+                                    Some(p) => ui.label(RichText::new(p.display().to_string()).monospace().small()),
+                                    None => ui.label(RichText::new(none).small().weak()),
+                                };
+                                if ui.button("Browse…").clicked() {
+                                    let mut dlg = rfd::FileDialog::new().add_filter("Rasters", crate::project::RASTER_EXTS);
+                                    if let Some(d) = file.as_ref().and_then(|p| p.parent()) {
+                                        dlg = dlg.set_directory(d);
+                                    }
+                                    if let Some(p) = dlg.pick_file() {
+                                        *file = Some(p);
+                                    }
+                                }
+                                if file.is_some() && ui.button("None").clicked() {
+                                    *file = None;
+                                }
+                            });
+                            if let Some(p) = file.as_ref() {
+                                match (crate::project::raster_size(p), map_size) {
+                                    (None, _) => ui.colored_label(ERR, "missing or not a raster"),
+                                    (Some(s), Some(m)) if s != m => ui.colored_label(ERR, format!("{} × {} px, the map {} × {}", s.0, s.1, m.0, m.1)),
+                                    _ => ui.label(""),
+                                };
+                            }
+                        });
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(6.0);
                 egui::CollapsingHeader::new("descriptor.mod").id_salt("meta_desc_preview").show(ui, |ui| {
                     let text = m.descriptor(&version, thumb.as_ref().is_some_and(|t| t.is_ok()));
                     ui.add(egui::Label::new(RichText::new(text).monospace().small()).wrap_mode(egui::TextWrapMode::Extend));
@@ -2799,6 +2860,11 @@ impl Editor {
         }
         self.settings.game_dir = game_dir;
         self.settings.mods_dir = mods_dir;
+        if (&dem, &landcover) != (&self.settings.dem, &self.settings.landcover) {
+            self.settings.dem = dem;
+            self.settings.landcover = landcover;
+            self.load_terrain(ctx);
+        }
         if (!open || close) && e.m != e.orig && act.is_none() {
             // closing keeps the changes: apply them, or stay open while they are invalid
             match e.m.check() {
@@ -3383,7 +3449,7 @@ impl Editor {
     pub fn windows(&mut self, ctx: &egui::Context) {
         self.objects_window(ctx);
         if let Some(act) = self.ask_discard.clone() {
-            let what = if matches!(act, Act::Open) { "Open another map" } else { "Read the files again" };
+            let what = "Read the map as it was saved";
             let mut choice = None;
             egui::Window::new("Discard unsaved changes?").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
                 ui.label(format!("The map has changes that are not saved. {what} and lose them?"));
