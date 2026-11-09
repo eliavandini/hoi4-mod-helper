@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use anim::Anim;
-use catalog::{AttachDef, Catalog, EntityDef, Pick};
+use catalog::{AttachDef, Catalog, EntityDef, Pick, StateDef};
 use math::{Affine, V3, v3};
 use mesh::Mesh;
 use render::{Camera, Frame, Proj, Texture, Vert};
@@ -65,7 +65,63 @@ struct Chosen<'a> {
     looping: bool,
 }
 
+/// Whether the mesh of `pick`, or of an entity it attaches, is skinned (its
+/// vertices follow bones). The game draws such a model right only while it
+/// is animated: standing still (`use_animation = no`), its bones are never
+/// posed and its triangles fly across the screen.
+pub fn is_skinned(cat: &Catalog, pick: &Pick) -> bool {
+    fn go(cat: &Catalog, pick: &Pick, depth: usize) -> bool {
+        let (mesh, attach): (Option<&str>, Vec<&str>) = match pick {
+            Pick::Entity(e) => match cat.entity(e) {
+                Some(d) => (d.pdxmesh.as_deref(), d.attach.iter().map(|a| a.entity.as_str()).collect()),
+                None => return false,
+            },
+            Pick::Mesh(m) => (Some(m.as_str()), Vec::new()),
+        };
+        let own = mesh
+            .and_then(|n| cat.mesh(n))
+            .and_then(|md| cat.find(&md.file, Some(md.root)))
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|b| Mesh::parse(&b).ok())
+            .is_some_and(|m| m.parts.iter().any(|p| p.skin.is_some()));
+        own || (depth < 4 && attach.iter().any(|e| go(cat, &Pick::Entity(e.to_string()), depth + 1)))
+    }
+    go(cat, pick, 0)
+}
+
+/// What a skinned model placed standing still plays instead (see
+/// [`is_skinned`]): its default state, else its "idle" state, else its
+/// first state with an animation, else its mesh's "idle" or first
+/// animation (for an entity, the build adds a state of that name). None:
+/// there is nothing to play.
+pub fn still_animation(cat: &Catalog, pick: &Pick) -> Option<String> {
+    let mesh_anim = |name: &str| {
+        let md = cat.mesh(name)?;
+        md.anims.iter().find(|a| a.0.eq_ignore_ascii_case("idle")).or(md.anims.first()).map(|a| a.0.clone())
+    };
+    match pick {
+        Pick::Entity(e) => {
+            let d = cat.entity(e)?;
+            let playable = |s: &&StateDef| s.animation.is_some();
+            d.default_state
+                .as_deref()
+                .and_then(|n| d.state(n))
+                .filter(playable)
+                .or_else(|| d.state("idle").filter(playable))
+                .or_else(|| d.states.iter().find(playable))
+                .map(|s| s.name.clone())
+                .or_else(|| d.pdxmesh.as_deref().and_then(mesh_anim))
+        }
+        Pick::Mesh(m) => mesh_anim(m),
+    }
+}
+
 impl Model {
+    /// See [`is_skinned`].
+    pub fn skinned(&self) -> bool {
+        self.mesh.as_ref().is_some_and(|m| m.parts.iter().any(|p| p.skin.is_some())) || self.attach.iter().any(|(_, m)| m.skinned())
+    }
+
     pub fn state_names(&self) -> Vec<String> {
         self.entity.as_ref().map(EntityDef::state_names).unwrap_or_default()
     }

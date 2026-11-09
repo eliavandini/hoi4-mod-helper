@@ -422,8 +422,16 @@ clockwise from north), scale, animation, visibility and name. In the build:
   entity of its own. These go in `gfx/entities/mod_helper_ambient.asset`;
 - a DLC's model gets `dlc_allowed`, so it shows only to players with the
   DLC;
-- the height is the ground's (or the water plane on the sea and lakes)
-  plus the lift;
+- a skinned model (its bones move its vertices: planes, ships, soldiers)
+  set standing still plays its default state instead, else "idle", else its
+  first animation. The game draws such models only animated; with
+  `use_animation = no` their triangles fly across the screen. The panel
+  warns when this happens, and the build log lists them;
+- the game sets each object on the terrain and takes its y as a height
+  above it, so the build writes the lift. On the sea and lakes it adds the
+  depth up to the water plane, so the model stands on the water. Written
+  with the ground's own height (as older mods' landmarks are), objects float
+  that high: the first builds of this feature did;
 - the rotation is turned into the game's: the editor turns clockwise like
   a compass (90° faces east), but the game's `rotation` y turns
   counter-clockwise, so the build writes the negative (a turn of 336° is
@@ -823,13 +831,17 @@ the affected tiles.
   (about 0.3 GB for the 4608 × 2816 map with undo).
 - "Remove from play" (lake provinces) and "Make lake" are untested in the
   game (the built files pass the checks and match vanilla's lakes).
-- Ambient objects are only partly tested in the game. Tilt and roll are
-  mirrored like the turn, and the order of the three rotations is a guess;
-  whether `use_animation` plays a clone's `default_state`, and the height
-  of objects on the water follow vanilla's files. All of these need a look
-  in the game. The preview is a
-  software renderer: no normal maps, specular or shadows, and textures at
-  most 512 px.
+- Ambient objects are only partly tested in the game (the turn's direction
+  and the height above the ground are checked). Still to check:
+  - tilt and roll, taken to be mirrored like the turn, and the order of
+    the three rotations (a guess);
+  - whether `use_animation` plays a clone's `default_state` (vanilla never
+    sets one on a clone);
+  - whether, under the sea and lakes, the game's terrain is the seabed (as
+    the build assumes) or the water plane. If it is the water plane, ships
+    stand up to one unit too high; lower them with the lift.
+- The model preview is a software renderer: no normal maps, specular or
+  shadows, and textures at most 512 px.
 - The supply estimate leaves out motorization, damage, weather and fleets;
   the game's numbers will differ somewhat.
 - Rasters are loaded fully into RAM in their native format. The 40000² CLC+

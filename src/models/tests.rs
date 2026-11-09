@@ -90,6 +90,73 @@ fn cutout_textures() {
 
 // ------------------------------------------------------------ real game
 
+/// The test mesh without its skin.
+fn without_skin(b: &[u8]) -> Vec<u8> {
+    fn strip(n: &mut pdxbin::Node) {
+        n.children.retain(|c| c.name != "skin");
+        n.children.iter_mut().for_each(strip);
+    }
+    let mut root = pdxbin::parse(b).unwrap();
+    strip(&mut root);
+    pdxbin::write(&root)
+}
+
+#[test]
+fn skinned_models_never_stand_still() {
+    use crate::editor::model::Ambient;
+    let g = fake_game("skin");
+    write(&g, "gfx/models/test/rock.mesh", &without_skin(&two_bone_mesh()));
+    write(
+        &g,
+        "gfx/entities/more.asset",
+        b"pdxmesh = { name = \"rock_mesh\" file = \"gfx/models/test/rock.mesh\" }\n\
+          entity = { name = \"rock_entity\" pdxmesh = \"rock_mesh\" }\n\
+          entity = { name = \"stateless_entity\" pdxmesh = \"bar_mesh\" }\n",
+    );
+    let cat = Catalog::load(Catalog::roots(&g, None));
+    let bar = Pick::Entity("bar_entity".into());
+    assert!(is_skinned(&cat, &bar));
+    assert!(is_skinned(&cat, &Pick::Mesh("bar_mesh".into())));
+    assert!(!is_skinned(&cat, &Pick::Entity("rock_entity".into())));
+    assert!(!is_skinned(&cat, &Pick::Entity("broken_entity".into())));
+    // the default state (idle) plays nothing: the first state that does
+    assert_eq!(still_animation(&cat, &bar).as_deref(), Some("bend"));
+    assert_eq!(still_animation(&cat, &Pick::Mesh("bar_mesh".into())).as_deref(), Some("bend"));
+    // no states: the mesh's animation
+    assert_eq!(still_animation(&cat, &Pick::Entity("stateless_entity".into())).as_deref(), Some("bend"));
+    assert_eq!(still_animation(&cat, &Pick::Entity("rock_entity".into())), None);
+
+    let obj = |e: &str, mesh: bool| Ambient {
+        entity: e.into(),
+        mesh,
+        at: [1.0, 1.0],
+        lift: 0.0,
+        rotation: [0.0; 3],
+        scale: 1.0,
+        animation: None,
+        always_visible: false,
+        name: String::new(),
+    };
+    let objs = [obj("bar_entity", false), obj("rock_entity", false), obj("bar_mesh", true), obj("stateless_entity", false)];
+    let b = crate::modbuild::ambient::objects(&objs, 10, &|_, _| 10.0, Some(&cat));
+    let t = &b.blocks;
+    assert!(t.contains("type=\"mh_ambient_bar_entity__bend\"\n\tuse_animation=yes"), "{t}");
+    assert!(t.contains("type=\"rock_entity\"\n\tuse_animation=no"), "{t}");
+    assert!(t.contains("type=\"mh_ambient_bar_mesh__bend\"\n\tuse_animation=yes"), "{t}");
+    assert!(t.contains("type=\"mh_ambient_stateless_entity__bend\"\n\tuse_animation=yes"), "{t}");
+    let a = b.asset.unwrap();
+    // bend is one of bar_entity's states; stateless_entity gets one
+    assert!(a.contains("clone = \"bar_entity\"\n\tdefault_state = \"bend\"\n}"), "{a}");
+    assert!(a.contains("clone = \"stateless_entity\"\n\tdefault_state = \"bend\"\n\tstate = { name = \"bend\" animation = \"bend\""), "{a}");
+    assert_eq!(b.animated.len(), 3, "{:?}", b.animated);
+    assert!(b.warnings.is_empty(), "{:?}", b.warnings);
+
+    let l = Loader::new(Arc::new(cat));
+    assert!(l.model(&bar).skinned());
+    assert!(!l.model(&Pick::Entity("rock_entity".into())).skinned());
+    let _ = std::fs::remove_dir_all(&g);
+}
+
 fn game() -> PathBuf {
     crate::modbuild::default_game_dir()
 }

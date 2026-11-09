@@ -239,6 +239,19 @@ fn animation_of(p: &Play, mesh: bool) -> Option<String> {
     }
 }
 
+/// A warning when a skinned model is set to stand still: the build makes it
+/// play (see `models::is_skinned`).
+fn still_note(ui: &mut egui::Ui, loader: &Loader, m: &models::Model, pick: &Pick, play: &Play) {
+    if *play != Play::Still || !m.skinned() {
+        return;
+    }
+    let text = match models::still_animation(&loader.cat, pick) {
+        Some(a) => format!("Its bones move its vertices, and the game draws such models only animated: the build makes it play {a}."),
+        None => "Its bones move its vertices, but it has nothing to play: the game may draw it as stray triangles.".into(),
+    };
+    ui.label(RichText::new(text).small().color(WARN));
+}
+
 pub fn pick_of(o: &Ambient) -> Pick {
     if o.mesh { Pick::Mesh(o.entity.clone()) } else { Pick::Entity(o.entity.clone()) }
 }
@@ -888,7 +901,7 @@ impl Editor {
                 self.preview_ui(ui, &loader, vec2(w, (w * 0.72).clamp(140.0, 320.0)), "panel");
             }
         });
-        egui::CollapsingHeader::new(RichText::new("New objects").strong()).default_open(true).show(ui, |ui| self.new_objects_ui(ui));
+        egui::CollapsingHeader::new(RichText::new("New objects").strong()).default_open(true).show(ui, |ui| self.new_objects_ui(ui, &loader));
         if !self.ob.sel.is_empty() {
             egui::CollapsingHeader::new(RichText::new(format!("Selected ({})", self.ob.sel.len())).strong()).default_open(true).show(ui, |ui| self.selected_ui(ui, &loader));
         }
@@ -1294,11 +1307,12 @@ impl Editor {
         }
     }
 
-    fn new_objects_ui(&mut self, ui: &mut egui::Ui) {
+    fn new_objects_ui(&mut self, ui: &mut egui::Ui, loader: &Arc<Loader>) {
         let ob = &mut self.ob;
         match &ob.pick {
             Some(p) => {
                 ui.label(format!("The Place tool (A) puts down {} {}, {}.", if matches!(p, Pick::Mesh(_)) { "mesh" } else { "entity" }, p.name(), play_label(&ob.pv.play)));
+                still_note(ui, loader, &loader.model(p), p, &ob.pv.play);
             }
             None => {
                 ui.label(RichText::new("Pick a model above; the Place tool (A) then puts it on the map.").weak());
@@ -1423,6 +1437,9 @@ impl Editor {
                     }
                 });
             });
+            if !mixed {
+                still_note(ui, loader, &m, &pick_of(&first), &cur);
+            }
         }
         let mut vis = first.always_visible;
         let mixed_vis = objs.iter().any(|o| o.always_visible != vis);

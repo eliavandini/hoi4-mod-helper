@@ -906,27 +906,37 @@ fn build_into(
         })
         .collect();
     let mut ambient_txt = ambient_objects(&dirs.game, d.map_frame(), &water)?;
-    // the 3D objects placed in the editor, on the ground (or the water) as built
+    // the 3D objects placed in the editor, on the ground (or the water) as built;
+    // the game takes their y as a height above the terrain
     let mut ambient_line = None;
     if !d.ambient.is_empty() {
         log("ambient objects: reading the game's models");
         let cat = crate::models::catalog::Catalog::load(crate::models::catalog::Catalog::roots(&dirs.game, Some(&map_dir.join("content"))));
-        let ground = |x: f32, y: f32| {
+        let surface = |x: f32, y: f32| {
             let (c, r) = ((x.max(0.0) as usize).min(w - 1), (y.max(0.0) as usize).min(h - 1));
             let i = r * w + c;
-            if water_mask[i] { WATER as f64 / 10.0 } else { height[i].max(WATER) as f64 / 10.0 }
+            // the water plane over the sea and lakes, the ground elsewhere
+            if water_mask[i] { WATER.saturating_sub(height[i]) as f64 / 10.0 } else { 0.0 }
         };
-        let b = ambient::objects(&d.ambient, h, &ground, Some(&cat));
+        let b = ambient::objects(&d.ambient, h, &surface, Some(&cat));
         ambient_txt += &b.blocks;
         if let Some(a) = &b.asset {
             write(&out.join("gfx/entities/mod_helper_ambient.asset"), a)?;
         }
         warnings.extend(b.warnings);
         ambient_line = Some(format!(
-            "{} ambient objects in {} types{}",
+            "{} ambient objects in {} types{}{}",
             d.ambient.len(),
             b.types,
-            if b.asset.is_some() { " (entities made in gfx/entities/mod_helper_ambient.asset)" } else { "" }
+            if b.asset.is_some() { " (entities made in gfx/entities/mod_helper_ambient.asset)" } else { "" },
+            if b.animated.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; skinned models set standing still play an animation (the game draws them only animated): {}",
+                    b.animated.iter().map(|(e, a)| format!("{e} plays {a}")).collect::<Vec<_>>().join(", ")
+                )
+            }
         ));
     }
     write(&mapdir.join("ambient_object.txt"), &ambient_txt)?;

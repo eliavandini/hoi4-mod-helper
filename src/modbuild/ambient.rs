@@ -10,7 +10,8 @@
 use std::collections::BTreeMap;
 
 use crate::editor::model::Ambient;
-use crate::models::catalog::{Catalog, Origin};
+use crate::models::catalog::{Catalog, Origin, Pick};
+use crate::models::{is_skinned, still_animation};
 
 /// What the build writes for the objects.
 #[derive(Debug, Default)]
@@ -21,6 +22,9 @@ pub struct Built {
     pub asset: Option<String>,
     pub types: usize,
     pub warnings: Vec<String>,
+    /// Skinned models placed standing still, and what they play instead
+    /// (the game draws them only animated).
+    pub animated: Vec<(String, String)>,
 }
 
 fn fmt(v: f64) -> String {
@@ -60,19 +64,49 @@ struct Key {
     always_visible: bool,
 }
 
-/// The blocks for `objs`. `ground(x, y)` is the height (game units) of the
-/// ground or water at a map pixel; `h` the map's height (the game counts z
-/// from the bottom). `cat` tells which entities exist, what they play by
-/// default and which DLC they need.
-pub fn objects(objs: &[Ambient], h: usize, ground: &dyn Fn(f32, f32) -> f64, cat: Option<&Catalog>) -> Built {
+/// The blocks for `objs`. `h` is the map's height (the game counts z from
+/// the bottom). `cat` tells which entities exist, what they play by default
+/// and which DLC they need.
+///
+/// The game sets each object on the terrain and takes its y as a height
+/// above it: written with the ground's own height (as Kaiserreich's
+/// landmarks are), objects float that high above it. The Fire Rises' city
+/// blocks sit around y = 0, and this is what objects built with absolute
+/// heights did in the game. So y is the lift, plus on the sea and lakes the
+/// depth up to the water plane: `surface(x, y)`, in game units at a map
+/// pixel (0 on land).
+pub fn objects(objs: &[Ambient], h: usize, surface: &dyn Fn(f32, f32) -> f64, cat: Option<&Catalog>) -> Built {
     let mut out = Built::default();
     // groups in order of first appearance
     let mut groups: Vec<(Key, Vec<usize>)> = Vec::new();
+    // per model: None if it may stand still, else what it plays instead
+    let mut still: BTreeMap<(bool, String), Option<Option<String>>> = BTreeMap::new();
     for (i, o) in objs.iter().enumerate() {
+        let mut animation = o.animation.clone().filter(|a| !a.is_empty());
+        if animation.is_none()
+            && let Some(c) = cat
+        {
+            let pick = if o.mesh { Pick::Mesh(o.entity.clone()) } else { Pick::Entity(o.entity.clone()) };
+            let instead = still.entry((o.mesh, o.entity.to_lowercase())).or_insert_with(|| {
+                let instead = is_skinned(c, &pick).then(|| still_animation(c, &pick));
+                match &instead {
+                    Some(Some(a)) => out.animated.push((o.entity.clone(), a.clone())),
+                    Some(None) => out.warnings.push(format!(
+                        "ambient objects: {} is skinned (bones move its vertices) but has no animation to play; the game may draw it as stray triangles",
+                        o.entity
+                    )),
+                    None => {}
+                }
+                instead
+            });
+            if let Some(Some(a)) = instead {
+                animation = Some(a.clone());
+            }
+        }
         let k = Key {
             entity: o.entity.clone(),
             mesh: o.mesh,
-            animation: o.animation.clone().filter(|a| !a.is_empty()),
+            animation,
             scale: (o.scale as f64 * 1000.0).round() as i64,
             always_visible: o.always_visible,
         };
@@ -123,6 +157,10 @@ pub fn objects(objs: &[Ambient], h: usize, ground: &dyn Fn(f32, f32) -> f64, cat
                 asset += &format!("\tclone = \"{}\"\n", k.entity);
                 if let Some(a) = &k.animation {
                     asset += &format!("\tdefault_state = \"{a}\"\n");
+                    // an animation of the mesh that no state plays: a state for it
+                    if def.is_some_and(|d| d.state(a).is_none()) {
+                        asset += &format!("\tstate = {{ name = \"{a}\" animation = \"{a}\" animation_blend_time = 0.3 }}\n");
+                    }
                 }
             }
             asset += "}\n\n";
@@ -142,7 +180,7 @@ pub fn objects(objs: &[Ambient], h: usize, ground: &dyn Fn(f32, f32) -> f64, cat
         }
         for &i in members {
             let o = &objs[i];
-            let y = ground(o.at[0], o.at[1]) + o.lift as f64;
+            let y = surface(o.at[0], o.at[1]) + o.lift as f64;
             let rot = game_rotation(o.rotation);
             let oname = if o.name.trim().is_empty() {
                 let n = numbered.entry(k.entity.as_str()).or_default();
@@ -198,13 +236,14 @@ mod tests {
         tree.animation = Some("sway".into());
         tree.name = "Old \"oak\"".into();
         objs.push(tree);
-        let b = objects(&objs, 100, &|x, _| if x > 20.0 { 12.0 } else { 9.5 }, None);
+        // on the water left of x = 20 (0.7 deep), on land right of it
+        let b = objects(&objs, 100, &|x, _| if x > 20.0 { 0.0 } else { 0.7 }, None);
         assert_eq!(b.types, 4);
         let t = &b.blocks;
         assert!(t.starts_with("type={\n\ttype=\"tank_entity\"\n\tuse_animation=no\n\tscale=1.000000\n"), "{t}");
-        assert!(t.contains("\t\tname=\"tank_1\"\n\t\tposition={\n\t\t\t10.5 9.5 80 \n"), "{t}");
+        assert!(t.contains("\t\tname=\"tank_1\"\n\t\tposition={\n\t\t\t10.5 0.7 80 \n"), "{t}");
         // the editor's 90° (clockwise, east) is the game's -90
-        assert!(t.contains("\t\t\t30 12.5 60 \n\t\t}\n\t\trotation={\n\t\t\t0 -90 0 \n"), "{t}");
+        assert!(t.contains("\t\t\t30 0.5 60 \n\t\t}\n\t\trotation={\n\t\t\t0 -90 0 \n"), "{t}");
         assert!(t.contains("type=\"mh_ambient_tank_entity_2\"\n\tuse_animation=no\n\tscale=2.000000\n\talways_visible=yes\n"), "{t}");
         // numbered on from the first block
         assert!(t.contains("name=\"tank_3\"") && t.contains("name=\"tank_4\"") && !t.contains("name=\"tank_5\""), "{t}");
