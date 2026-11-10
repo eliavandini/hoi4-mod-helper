@@ -15,6 +15,7 @@
 //! | [`source`] | the base game, mods, folders, nations and bundles to import from |
 //! | [`import`] | importing (what comes, renames, localisation, pictures), bundles |
 //! | [`validate`] | the checks of the content against the game and the map |
+//! | [`units`] | battalions, equipment and technologies for the division designer: what a nation can use, checks, stats |
 //! | [`zip`] | bundles |
 //! | [`refactor`] | renames, deletes, find & replace, tag renames across the project |
 //! | [`errlog`] | the game's error.log, pointed back to the content |
@@ -37,6 +38,7 @@ pub mod script;
 pub mod source;
 pub mod store;
 pub mod ui;
+pub mod units;
 pub mod validate;
 pub mod zip;
 

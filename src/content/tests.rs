@@ -78,3 +78,39 @@ fn import_german_tree_from_the_base_game() {
     st.save().unwrap();
     assert!(dir.join("content/TYR/common/national_focus").is_dir());
 }
+
+#[test]
+#[ignore]
+fn units_of_the_base_game() {
+    use super::script::Script;
+    use super::units::{Template, UnitDb};
+    let base = source::index("base game", Origin::Base, source::base_files(&game()), &|_| {}).unwrap();
+    let t0 = std::time::Instant::now();
+    let db = UnitDb::of_index(&base);
+    eprintln!("read in {:.0} ms: {} battalions, {} equipment, {} modules, {} technologies", t0.elapsed().as_secs_f64() * 1000.0, db.subunits.len(), db.equipment.len(), db.modules.len(), db.techs.len());
+    let start = db.have(crate::modbuild::START_TECHS.iter().map(|s| s.to_string()).collect());
+    let can: Vec<&str> = db.subunits.values().filter(|u| u.section().is_some() && start.units.contains(&u.id)).map(|u| u.id.as_str()).collect();
+    eprintln!("at the start: {can:?}");
+    assert!(start.units.contains("infantry") && start.units.contains("engineer") && !start.units.contains("motorized") && !start.units.contains("recon"));
+    let name = |s: &str| base.loc.get(s).cloned().unwrap_or_else(|| s.to_string());
+    for (label, text) in [
+        ("9 infantry", "division_template = { name = A regiments = { infantry = { x = 0 y = 0 } infantry = { x = 0 y = 1 } infantry = { x = 0 y = 2 } infantry = { x = 1 y = 0 } infantry = { x = 1 y = 1 } infantry = { x = 1 y = 2 } infantry = { x = 2 y = 0 } infantry = { x = 2 y = 1 } infantry = { x = 2 y = 2 } } }"),
+        ("7/2 with engineers and artillery", "division_template = { name = B regiments = { infantry = { x = 0 y = 0 } infantry = { x = 0 y = 1 } infantry = { x = 0 y = 2 } infantry = { x = 1 y = 0 } infantry = { x = 1 y = 1 } infantry = { x = 1 y = 2 } infantry = { x = 1 y = 3 } artillery_brigade = { x = 2 y = 0 } artillery_brigade = { x = 2 y = 1 } } support = { engineer = { x = 0 y = 0 } artillery = { x = 0 y = 1 } } }"),
+        ("light tanks", "division_template = { name = C regiments = { light_armor = { x = 0 y = 0 } light_armor = { x = 0 y = 1 } motorized = { x = 1 y = 0 } } support = { recon = { x = 0 y = 0 } } }"),
+    ] {
+        let s = Script::parse(text);
+        let t = Template::read(s.root.block("division_template").unwrap());
+        for (lbl, have) in [("start", start.clone()), ("1940", db.have(db.up_to(&start.techs, 1940)))] {
+            let d = db.division(&t, &have);
+            let g = |k: &str| d.get(k);
+            eprintln!(
+                "{label} ({lbl}): width {} HP {:.1} org {:.1} rec {:.2} speed {:.1} soft {:.1} hard {:.1} def {:.1} brk {:.1} armor {:.1} pierce {:.1} hard% {:.0} supply {:.2} manpower {} train {} IC {:.0} recon {} entrench {}",
+                g("combat_width"), g("max_strength"), g("max_organisation"), g("default_morale"), g("maximum_speed"), g("soft_attack"), g("hard_attack"), g("defense"), g("breakthrough"), g("armor_value"), g("ap_attack"), g("hardness") * 100.0, g("supply_consumption"), g("manpower"), g("training_time"), g("build_cost_ic"), g("recon"), g("entrenchment")
+            );
+            eprintln!("   equipment {:?}", d.equipment);
+        }
+        for p in db.check(&t, &start, "TYR", &name) {
+            eprintln!("   {} {}", p.severity.label(), p.message);
+        }
+    }
+}

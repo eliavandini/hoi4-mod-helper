@@ -91,6 +91,9 @@ pub const CATEGORY_SLOTS: [(&str, u32); 13] = [
 /// State buildings that take a building slot (shares_slots = yes).
 pub const SLOT_BUILDINGS: [&str; 7] = ["industrial_complex", "arms_factory", "dockyard", "synthetic_refinery", "fuel_silo", "rocket_site", "nuclear_reactor"];
 pub const IDEOLOGIES: [&str; 4] = ["democratic", "fascism", "communism", "neutrality"];
+/// The technologies every nation starts with, as a vanilla minor
+/// (Luxembourg); a nation's own history in the content adds to them.
+pub const START_TECHS: [&str; 7] = ["infantry_weapons", "infantry_weapons1", "tech_trucks", "gw_artillery", "tech_support", "tech_engineers", "basic_train"];
 /// State category by the sealed (urban) km² of the state: (below, category, slots).
 const STATE_CATEGORIES: [(f64, &str, u32); 7] = [
     (0.15, "pastoral", 1),
@@ -1123,14 +1126,7 @@ fn build_into(
 {oob}
 # Starting tech, as a vanilla minor (Luxembourg)
 set_technology = {{
-\tinfantry_weapons = 1
-\tinfantry_weapons1 = 1
-\ttech_trucks = 1
-\tgw_artillery = 1
-\ttech_support = 1
-\ttech_engineers = 1
-\tbasic_train = 1
-}}
+{techs}}}
 IF = {{
 \tlimit = {{
 \t\tNOT = {{ has_dlc = \"By Blood Alone\" }}
@@ -1161,7 +1157,8 @@ set_popularities = {{
                 pop["democratic"],
                 pop["fascism"],
                 pop["communism"],
-                pop["neutrality"]
+                pop["neutrality"],
+                techs = START_TECHS.iter().map(|t| format!("\t{t} = 1\n")).collect::<String>()
             ),
         )?;
         if nat.no_units {

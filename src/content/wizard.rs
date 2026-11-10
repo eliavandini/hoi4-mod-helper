@@ -33,9 +33,11 @@ pub enum Role {
     ResearchBonus,
     /// A focus's `search_filters`.
     SearchFilters,
-    /// A division template's battalions and support companies.
+    /// A division template's battalions, support companies and regimental
+    /// support companies.
     Regiments,
     Support,
+    RegimentalSupport,
     /// Fields built whole from a form of their own ([`super::shapes`]):
     /// named parts, words, weights, quoted texts, yes / no rules, a colour,
     /// equipment bonuses.
@@ -67,6 +69,7 @@ impl Role {
             Role::SearchFilters => "Search filters",
             Role::Regiments => "Battalions",
             Role::Support => "Support companies",
+            Role::RegimentalSupport => "Regimental support",
             Role::Values => "Form",
             Role::Words => "List",
             Role::Weights => "Weights",
@@ -112,6 +115,7 @@ pub fn role_of(kind: Kind, key: &str) -> Option<Role> {
         "search_filters" => Role::SearchFilters,
         "regiments" if kind == Kind::DivisionTemplate => Role::Regiments,
         "support" if kind == Kind::DivisionTemplate => Role::Support,
+        "regimental_support" if kind == Kind::DivisionTemplate => Role::RegimentalSupport,
         "modifier" | "modifiers" | "faction_modifiers" | "targeted_modifier" => Role::Modifier,
         "immediate" | "complete_effect" | "remove_effect" | "timeout_effect" | "on_add" | "on_remove" | "select_effect" | "completion_reward" | "effect" | "option" | "on_cancel" | "on_completion" | "complete_tooltip" => Role::Effect,
         "trigger" | "allowed" | "visible" | "available" | "cancel_trigger" | "target_trigger" | "cancel" | "enable" | "abort" | "remove_trigger" | "allow" | "allow_branch" | "bypass" | "allowed_civil_war" | "show_major" | "limit" | "can_be_removed" | "is_good" => Role::Trigger,

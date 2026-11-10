@@ -799,6 +799,52 @@ The nations are down the left. For the one picked:
     the states in their nation's colour, the nation's own bright and the
     picked one lit up, named when zoomed in; the wheel zooms, dragging
     moves, a click picks.
+- **Division designer** (at the top of a division template's form): the
+  template on the game's grid, five columns of five battalions, the
+  support companies beside them and a regimental support company on top of
+  each column, each with its icon from the game.
+  - Click a place to pick what goes there. The list shows only what the
+    nation can use at the start, which is what every nation has plus what
+    the build's starting technologies and the nation's own `set_technology`
+    unlock. It shows only what fits that place: one group per column, each
+    support company once, and regimental support on the columns it
+    supports. Tick "all" to see the rest greyed out, with why: "needs
+    Motorized Infantry", "column 2 is of infantry". Click a battalion again
+    to change or remove it; right-click fills or empties its column. Each
+    change is one undo step and edits only that line, so comments stay.
+  - The checks, with the battalions they are about framed in red or
+    yellow:
+    - battalions the nation cannot use at the start, and the technology
+      that unlocks them;
+    - places off the grid, or two battalions in one place;
+    - a support company among the battalions, or a battalion among the
+      support companies;
+    - army headquarters units;
+    - a support company twice, or two of a kind (two recon companies);
+    - regimental support on a column without battalions, or of a group it
+      does not support;
+    - columns mixing groups;
+    - equipment the nation has no model of at the start;
+    - no battalions at all.
+
+    The same checks run in **Check** for every template of the project.
+  - Stats, with the nation's research at the start or with all research up
+    to a year (technologies of focuses and events left out):
+    - speed, HP, organisation, recovery, recon, suppression, weight, supply
+      use, entrenchment;
+    - combat width, soft, hard and air attack, defence, breakthrough,
+      armour, piercing, hardness;
+    - manpower, training time, production cost, and the equipment with the
+      model it gets.
+
+    Also how many divisions fit each terrain's combat width, and terrain
+    bonuses. Hover a stat for how it is worked out. A battalion's attacks
+    come from the newest equipment model the nation has, scaled by the
+    battalion's own bonuses and the technologies'. The division then sums,
+    averages, or takes 40% of the highest plus 60% of the average, as the
+    game does. Doctrines, national spirits, generals, experience and the
+    nation's own tank designs are left out (tanks use the game's tank
+    models without a design).
 - **Wizards** (🪄 next to a script field, and "Insert…" on the code tab):
   build script without writing it by hand. What they add goes into the
   field where the cursor was (or replaces it, for fields that are a list),
@@ -815,8 +861,10 @@ The nations are down the left. For the one picked:
     then factors or additions when conditions hold), the focus tree's
     `country`, prerequisites and mutually exclusive focuses (tick them),
     a country's politics, popularities (sliders), technologies, ideas,
-    research bonus, search filters, and the battalions of a division
-    template (placed in the free slots, with a grid preview).
+    research bonus, search filters, and the battalions, support and
+    regimental support companies of a division template (only those the
+    nation can use at the start, placed in the free slots, with a grid
+    preview).
   - Every other block of the forms is built whole from a form of its own,
     filled from what the field has (what the form does not know is kept and
     written back after it):
@@ -859,6 +907,7 @@ For the whole project:
     category.
   - Tags no nation or base-game country has; states and provinces the map
     does not have.
+  - Division templates: what the division designer checks.
   - Missing localisation, icons, pictures and texture files; script that
     does not parse.
 
@@ -1053,8 +1102,9 @@ top, in metres.
 | `content/focus.rs`, `drawio.rs` | focus trees: layout, checks, play, edits; trees from draw.io |
 | `content/docs.rs`, `wizard.rs`, `shapes.rs` | the game's documentation of effects, triggers and modifiers; the wizards' catalog, roles of fields, and how built script is merged in; the forms of the fields built whole (read, write, what is missing) |
 | `content/validate.rs`, `errlog.rs` | the content checks; the game's `error.log` |
+| `content/units.rs` | land units of the game and the mod (battalions, equipment, modules, technologies, terrain widths): what a nation can use at the start, the checks of a division template, its stats |
 | `content/refactor.rs`, `gfx.rs`, `zip.rs`, `build.rs` | renames, deletes, find & replace; sprites and pictures; bundles (in memory, with `zip.rs`); the content in the built mod |
-| `content/ui/` | the screen: nations, forms and code editor, wizards, the sprite picker and the state map, the focus tree canvas, check, import / export, test play, tools |
+| `content/ui/` | the screen: nations, forms and code editor, wizards, the sprite picker and the state map, the division designer, the focus tree canvas, check, import / export, test play, tools |
 | `editor/content_link.rs` | what the content screen asks of the map: nations, tags, states, the build |
 | `models/pdxbin.rs`, `mesh.rs`, `anim.rs` | the game's binary `.mesh` and `.anim` files: meshes, skeletons, skinning, locators, animation samples |
 | `models/catalog.rs` | the game's, the DLCs' and the mod's `pdxmesh`, `animation` and `entity` definitions (clones, states, attachments), where they come from, case-blind file lookup |

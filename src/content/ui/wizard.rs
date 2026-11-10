@@ -462,6 +462,7 @@ fn init(cx: &Cx, ws: &mut WizardState, t: &Target) {
         Role::ResearchBonus => ws.category = "infantry_weapons".into(),
         Role::Regiments => ws.battalion = "infantry".into(),
         Role::Support => ws.battalion = "engineer".into(),
+        Role::RegimentalSupport => ws.battalion = "field_guns".into(),
         _ => {}
     }
     ws.first = if t.role.is_shape() { ws.form.words.clone() } else { ws.picks.clone() };
@@ -1094,7 +1095,7 @@ fn own_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, t: &Target, ro
             let line = format!("{} = {}", ws.category.trim(), ws.bonus.trim());
             add_button(ui, ws, &line, (!ok).then(|| "a category and a number".to_string()));
         }
-        Role::Regiments | Role::Support => battalion_page(ui, cx, ws, t, role == Role::Support),
+        Role::Regiments | Role::Support | Role::RegimentalSupport => battalion_page(ui, cx, ws, t, role),
         _ => {}
     }
 }
@@ -1178,19 +1179,42 @@ fn weight_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, role: Role)
 }
 
 /// Battalions of a division template, put into free places.
-fn battalion_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, t: &Target, support: bool) {
-    ui.label(RichText::new(if support { "Support companies: one column of up to 5." } else { "Battalions: 5 columns of up to 5. New ones go into the column with their kind, else the first empty one." }).weak());
+fn battalion_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, t: &Target, role: Role) {
+    use crate::content::units::Section;
+    let section = match role {
+        Role::Support => Section::Support,
+        Role::RegimentalSupport => Section::RegimentalSupport,
+        _ => Section::Regiments,
+    };
+    ui.label(
+        RichText::new(match section {
+            Section::Support => "Support companies: one column of up to 5, each kind once.",
+            Section::RegimentalSupport => "Regimental support: one company on top of a column of battalions. New ones go on the columns it can support that have none yet.",
+            Section::Regiments => "Battalions: 5 columns of up to 5. New ones go into the column with their kind, else the first empty one.",
+        })
+        .weak(),
+    );
+    ui.label(RichText::new("Only what the nation can use at the start is listed. The division designer at the top of the form shows the template with icons, checks and stats.").weak().small());
+    let mut bad = None;
     ui.horizontal(|ui| {
         ui.label("Kind");
         let mut v = std::mem::take(&mut ws.battalion);
-        param_ui(ui, cx, &mut ws.lists, egui::Id::unique("battalion_kind"), Param::Ref(Kind::SubUnit), &mut v);
+        bad = super::division::unit_combo(ui, cx, &t.key.pkg, section, &mut v);
         ws.battalion = v;
         ui.label("How many");
         ui.add(egui::TextEdit::singleline(&mut ws.count).desired_width(40.0));
     });
     let have = wz::append(&current(cx, t).unwrap_or_default(), &ws.built);
     let n = ws.count.trim().parse::<usize>().unwrap_or(0);
-    let placed = if n == 0 || ws.battalion.trim().is_empty() { Err("a kind and how many".to_string()) } else { wz::place(&have, ws.battalion.trim(), n, support) };
+    let placed = if let Some(e) = bad {
+        Err(e)
+    } else if n == 0 || ws.battalion.trim().is_empty() {
+        Err("a kind and how many".to_string())
+    } else if section == Section::RegimentalSupport {
+        super::division::place_regimental(cx, &t.key, &have, ws.battalion.trim(), n)
+    } else {
+        wz::place(&have, ws.battalion.trim(), n, section == Section::Support)
+    };
     match placed {
         Ok(lines) => {
             if ui.button(RichText::new("Add ↓").strong()).clicked() {
@@ -1201,11 +1225,15 @@ fn battalion_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, t: &Targ
             ui.label(RichText::new(e).color(WARN).small());
         }
     }
-    // the template as it will be
+    // the field as it will be
     let slots = wz::slots(&have);
-    let cols = if support { 1 } else { 5 };
+    let (cols, rows) = match section {
+        Section::Support => (1, 5),
+        Section::RegimentalSupport => (5, 1),
+        Section::Regiments => (5, 5),
+    };
     egui::Grid::new("battalion_grid").striped(true).show(ui, |ui| {
-        for y in 0..5 {
+        for y in 0..rows {
             for x in 0..cols {
                 let s = slots.iter().find(|s| s.1 == x && s.2 == y).map(|s| s.0.as_str()).unwrap_or("·");
                 ui.add_sized([120.0, 18.0], egui::Label::new(RichText::new(s).small()).truncate());

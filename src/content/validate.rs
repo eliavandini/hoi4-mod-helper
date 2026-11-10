@@ -88,6 +88,9 @@ struct Ctx<'a> {
     ideologies: BTreeSet<String>,
     /// Advisors' idea tokens of the content.
     tokens: BTreeSet<String>,
+    /// The game's and the content's land units (with the base game only:
+    /// without it battalions of the game would count as unknown).
+    units: Option<std::sync::Arc<super::units::UnitDb>>,
     out: Vec<Issue>,
 }
 
@@ -152,7 +155,8 @@ pub fn validate(st: &Store, base: Option<&Index>, facts: &Facts) -> Vec<Issue> {
             }
         }
     }
-    let mut c = Ctx { st, base, facts, ids, loc, sprites, ideologies, tokens, out: Vec::new() };
+    let units = base.map(|b| super::units::db(Some(b), st));
+    let mut c = Ctx { st, base, facts, ids, loc, sprites, ideologies, tokens, units, out: Vec::new() };
     packages(&mut c);
     syntax(&mut c);
     duplicates(&mut c);
@@ -354,6 +358,8 @@ fn trees(c: &mut Ctx) {
 
 fn definitions(c: &mut Ctx) {
     let keys: Vec<DefKey> = c.st.defs().collect();
+    // what each nation has at the start, for its division templates
+    let mut have: HashMap<String, super::units::Have> = HashMap::new();
     // event namespaces declared in each file
     for k in &keys {
         let Some((d, text, s)) = c.st.def(k) else { continue };
@@ -488,7 +494,23 @@ fn definitions(c: &mut Ctx) {
                     }
                 }
             }
-            Kind::DivisionTemplate => {}
+            Kind::DivisionTemplate => {
+                let Some(b) = b else { continue };
+                if let Some(p) = b.num("priority")
+                    && !(0.0..=2.0).contains(&p)
+                {
+                    c.add(Severity::Error, "divisions", &k.pkg, &k.file, line, Some(k), format!("division template {}: priority is 0, 1 or 2 (reinforcement: low, normal, high)", d.id));
+                }
+                let Some(db) = c.units.clone() else { continue };
+                let h = have.entry(k.pkg.clone()).or_insert_with(|| db.have(super::units::start_techs(c.st, &k.pkg)));
+                let base = c.base;
+                let name = |id: &str| base.and_then(|b| b.loc.get(id)).map(|t| super::loc::plain(t)).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| id.to_string());
+                let t = super::units::Template::read(b);
+                for p in db.check(&t, h, &k.pkg, &name) {
+                    let at = p.slot.map(|i| script::line_of(text, t.slots[i].span.start)).unwrap_or(line);
+                    c.out.push(Issue { severity: p.severity, category: "divisions", pkg: k.pkg.clone(), file: k.file.clone(), line: at, def: Some(k.clone()), message: format!("division template {}: {}", d.id, p.message) });
+                }
+            }
             _ => {}
         }
         // localisation of what has a name
@@ -691,6 +713,41 @@ pub fn summary(issues: &[Issue]) -> (usize, usize, usize) {
 mod tests {
     use super::*;
     use crate::content::loc;
+
+    /// Division templates: battalions the nation cannot use at the start are
+    /// errors until its history gives the technology.
+    #[test]
+    fn division_templates_use_what_the_nation_has() {
+        use crate::content::source::{self, Files, Origin};
+        let files: std::collections::BTreeMap<String, std::sync::Arc<Vec<u8>>> = [
+            ("common/units/infantry.txt", "sub_units = {\n\tinfantry = { group = infantry active = yes combat_width = 2 need = { infantry_equipment = 100 } }\n\tmotorized = { group = mobile active = no combat_width = 2 need = { infantry_equipment = 100 } }\n}\n"),
+            ("common/units/equipment/infantry.txt", "equipments = {\n\tinfantry_equipment = { is_archetype = yes active = yes soft_attack = 3 }\n\tinfantry_equipment_0 = { archetype = infantry_equipment active = yes }\n}\n"),
+            ("common/technologies/infantry.txt", "technologies = {\n\tmotorised_infantry = { folder = { name = infantry_folder } start_year = 1938 enable_subunits = { motorized } }\n}\n"),
+            ("localisation/english/units_l_english.yml", "\u{feff}l_english:\n motorized: \"Motorized Infantry\"\n motorised_infantry: \"Motorised Infantry\"\n"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), std::sync::Arc::new(v.as_bytes().to_vec())))
+        .collect();
+        let base = source::index("base", Origin::Base, Files::Memory(std::sync::Arc::new(files.into_iter().collect())), &|_| {}).unwrap();
+        let mut st = Store::empty(std::env::temp_dir().join("mh-validate-divisions"));
+        st.begin("x");
+        st.set_text("TYR", "history/units/TYR_army.txt", "division_template = {\n\tname = \"Mot\"\n\tpriority = 5\n\tregiments = {\n\t\tinfantry = { x = 0 y = 0 }\n\t\tmotorized = { x = 1 y = 0 }\n\t}\n}\n".into());
+        st.commit();
+        let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1].into()))].into(), provinces: 10, states: [1].into(), unpinned: 0 };
+        let msgs = |st: &Store| -> Vec<String> { validate(st, Some(&base), &facts).into_iter().filter(|i| i.category == "divisions").map(|i| format!("{}:{} {}", i.file, i.line, i.message)).collect() };
+        assert_eq!(
+            msgs(&st),
+            vec![
+                "history/units/TYR_army.txt:1 division template Mot: priority is 0, 1 or 2 (reinforcement: low, normal, high)".to_string(),
+                "history/units/TYR_army.txt:6 division template Mot: Motorized Infantry is not available to TYR at the start: it comes with Motorised Infantry (give it in the nation's history: set_technology = { ... })".to_string(),
+            ]
+        );
+        st.begin("tech");
+        st.set_text("TYR", "history/units/TYR_army.txt", st.text("TYR", "history/units/TYR_army.txt").unwrap().replace("priority = 5", "priority = 2"));
+        st.set_text("TYR", "history/countries/TYR.txt", "set_technology = { motorised_infantry = 1 }\n".into());
+        st.commit();
+        assert_eq!(msgs(&st), Vec::<String>::new());
+    }
 
     #[test]
     fn finds_what_the_game_would_trip_over() {

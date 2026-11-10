@@ -8,6 +8,7 @@
 
 pub mod check;
 pub mod code;
+pub mod division;
 pub mod form;
 pub mod import_ui;
 pub mod picker;
@@ -713,6 +714,9 @@ impl Screen {
             }
         } else if p.starts_with("about:") || p.starts_with("map:") {
             self.form.start = Some(p);
+        } else if let Some(rest) = p.strip_prefix("pick:") {
+            // pick:<regiments|support|regimental_support>:<x>:<y>, the designer's list for a place
+            self.form.division.open_at(rest);
         } else if let Some(f) = p.strip_prefix("picker:") {
             let prefix = key.kind.spec().fields.iter().find(|x| x.key == f).and_then(|x| if let kinds::FieldType::Sprite(p) = x.ty { Some(p) } else { None }).unwrap_or("");
             self.form.picker = Some(form::PickTarget { key, field: f.to_string(), prefix: prefix.to_string() });

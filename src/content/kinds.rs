@@ -358,6 +358,7 @@ pub const SPECS: &[Spec] = &[
             f("division_names_group", Word, "Name list for divisions of this template"),
             f("regiments", Block, "Battalions: infantry = { x = 0 y = 0 } (x: column 0-4, y: row)"),
             f("support", Block, "Support companies: engineer = { x = 0 y = 0 }"),
+            f("regimental_support", Block, "Regimental support: field_guns = { x = column y = 0 }"),
             f("priority", Number, "Reinforcement priority 0-2"),
             f("is_locked", Bool, "Cannot be edited in game"),
         ],

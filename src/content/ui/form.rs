@@ -48,6 +48,8 @@ pub struct FormState {
     /// Script from the wizard for the code tab (at its cursor).
     code_insert: Option<String>,
     jump: Option<usize>,
+    /// The division designer of a division template.
+    pub division: super::division::DesignerState,
 }
 
 /// The field a picture is picked for.
@@ -688,6 +690,9 @@ pub fn def_editor(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, st: &mut FormSta
     ui.separator();
     egui::ScrollArea::vertical().id_salt(("def_scroll", st.tab as u8)).auto_shrink([false, false]).show(ui, |ui| match st.tab {
         Tab::Form => {
+            if key.kind == Kind::DivisionTemplate {
+                super::division::designer(ui, cx, key, &mut st.division);
+            }
             preview(ui, cx, key);
             ui.add_space(6.0);
             fields(ui, cx, key, spec.fields, &[], st);
