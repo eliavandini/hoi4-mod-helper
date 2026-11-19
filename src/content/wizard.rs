@@ -38,6 +38,9 @@ pub enum Role {
     Regiments,
     Support,
     RegimentalSupport,
+    /// `add_equipment_to_stockpile` of a country's history: a model, how
+    /// many, who made it.
+    Stockpile,
     /// Fields built whole from a form of their own ([`super::shapes`]):
     /// named parts, words, weights, quoted texts, yes / no rules, a colour,
     /// equipment bonuses.
@@ -70,6 +73,7 @@ impl Role {
             Role::Regiments => "Battalions",
             Role::Support => "Support companies",
             Role::RegimentalSupport => "Regimental support",
+            Role::Stockpile => "Stockpile",
             Role::Values => "Form",
             Role::Words => "List",
             Role::Weights => "Weights",
@@ -87,7 +91,7 @@ impl Role {
 
     /// What it builds replaces the field (else it is added to it).
     pub fn replaces(self) -> bool {
-        matches!(self, Role::Prerequisite | Role::Exclusive | Role::Politics | Role::Popularities | Role::Technologies | Role::Ideas | Role::SearchFilters) || self.is_shape()
+        matches!(self, Role::Prerequisite | Role::Exclusive | Role::Politics | Role::Popularities | Role::Technologies | Role::Ideas | Role::SearchFilters | Role::Stockpile) || self.is_shape()
     }
 
     /// Built from a form of its own ([`super::shapes`]).
@@ -116,6 +120,7 @@ pub fn role_of(kind: Kind, key: &str) -> Option<Role> {
         "regiments" if kind == Kind::DivisionTemplate => Role::Regiments,
         "support" if kind == Kind::DivisionTemplate => Role::Support,
         "regimental_support" if kind == Kind::DivisionTemplate => Role::RegimentalSupport,
+        "add_equipment_to_stockpile" if kind == Kind::CountryHistory => Role::Stockpile,
         "modifier" | "modifiers" | "faction_modifiers" | "targeted_modifier" => Role::Modifier,
         "immediate" | "complete_effect" | "remove_effect" | "timeout_effect" | "on_add" | "on_remove" | "select_effect" | "completion_reward" | "effect" | "option" | "on_cancel" | "on_completion" | "complete_tooltip" => Role::Effect,
         "trigger" | "allowed" | "visible" | "available" | "cancel_trigger" | "target_trigger" | "cancel" | "enable" | "abort" | "remove_trigger" | "allow" | "allow_branch" | "bypass" | "allowed_civil_war" | "show_major" | "limit" | "can_be_removed" | "is_good" => Role::Trigger,
@@ -295,7 +300,7 @@ pub const TRIGGERS: &[Item] = &[
     it("The country", "Has a character", "has_character", &[("Character", Ref(Kind::Character), "")], "has_character = {0}"),
     it("The country", "Is a major", "is_major", NONE, "is_major = yes"),
     it("The country", "Is played by the AI", "is_ai", NONE, "is_ai = yes"),
-    it("The country", "Has a DLC", "has_dlc", &[("DLC name", Text, "La Resistance")], "has_dlc = {0}"),
+    it("The country", "Has a DLC", "has_dlc", &[("DLC", Of(&super::dlc::NAMES), "La Resistance")], "has_dlc = {0}"),
     it("The country", "A variable at least", "check_variable", &[("Variable", Word, "my_var"), ("Value", Number, "1")], "check_variable = { {0} > {1} }"),
     // war and diplomacy
     it("War and diplomacy", "Is at war", "has_war", NONE, "has_war = yes"),
@@ -359,8 +364,10 @@ pub fn render(item: &Item, values: &[String]) -> String {
     out
 }
 
-/// Every value an entry needs is there, and numbers are numbers.
-pub fn missing(item: &Item, values: &[String]) -> Option<String> {
+/// Every value an entry needs is there, numbers are numbers, and those
+/// the game allows ([`super::limits`]: a share from 0 to 1, a building level
+/// up to its cap, ...).
+pub fn missing(item: &Item, values: &[String], caps: &crate::modbuild::buildings::Caps) -> Option<String> {
     for (i, (label, p, _)) in item.params.iter().enumerate() {
         let v = values.get(i).map(|s| s.trim()).unwrap_or("");
         if v.is_empty() && *p != Text {
@@ -373,7 +380,8 @@ pub fn missing(item: &Item, values: &[String]) -> Option<String> {
             return Some(format!("{label}: a date is year.month.day (1936.1.1)"));
         }
     }
-    None
+    let s = Script::parse(&render(item, values));
+    super::limits::script_problems(&s.root, caps).into_iter().next().map(|p| p.message)
 }
 
 pub fn is_date(v: &str) -> bool {
@@ -567,10 +575,24 @@ mod tests {
         assert_eq!(render(i, &["TYR_spirit".into(), "180".into()]), "add_timed_idea = {\n\tidea = TYR_spirit\n\tdays = 180\n}");
         let l = EFFECTS.iter().find(|i| i.key == "load_oob").unwrap();
         assert_eq!(render(l, &["TYR_1936".into()]), "load_oob = \"TYR_1936\"");
-        assert_eq!(missing(i, &["x".into(), "soon".into()]).as_deref(), Some("Days is not a number"));
-        assert_eq!(missing(i, &["".into(), "1".into()]).as_deref(), Some("Idea is empty"));
+        let caps = crate::modbuild::buildings::Caps::vanilla();
+        assert_eq!(missing(i, &["x".into(), "soon".into()], &caps).as_deref(), Some("Days is not a number"));
+        assert_eq!(missing(i, &["".into(), "1".into()], &caps).as_deref(), Some("Idea is empty"));
+        assert_eq!(missing(i, &["x".into(), "0".into()], &caps).as_deref(), Some("add_timed_idea days = 0: a whole number, 1 or more"));
         let d = TRIGGERS.iter().find(|i| i.key == "date").unwrap();
-        assert!(missing(d, &["1936.1.1".into()]).is_none() && missing(d, &["1936".into()]).is_some());
+        assert!(missing(d, &["1936.1.1".into()], &caps).is_none() && missing(d, &["1936".into()], &caps).is_some());
+        // what the game allows
+        let b = EFFECTS.iter().find(|i| i.key == "add_building_construction").unwrap();
+        assert_eq!(missing(b, &["12".into(), "infrastructure".into(), "5".into()], &caps), None);
+        assert_eq!(
+            missing(b, &["12".into(), "infrastructure".into(), "6".into()], &caps).as_deref(),
+            Some("add_building_construction level = 6: infrastructure goes to 5 at most in a state")
+        );
+        let st = EFFECTS.iter().find(|i| i.key == "add_stability").unwrap();
+        assert_eq!(missing(st, &["0.1".into()], &caps), None);
+        assert_eq!(missing(st, &["10".into()], &caps).as_deref(), Some("add_stability = 10: from -1 to 1"));
+        let hs = TRIGGERS.iter().find(|i| i.key == "has_stability").unwrap();
+        assert_eq!(missing(hs, &["50".into()], &caps).as_deref(), Some("has_stability > 50: from 0 to 1"));
         // every template uses its values
         for i in EFFECTS.iter().chain(TRIGGERS) {
             for n in 0..i.params.len() {

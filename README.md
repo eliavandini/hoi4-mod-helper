@@ -61,6 +61,25 @@ An OSM layer draws:
 The layer's Display section has a row per admin level and per kind of water
 (show, colour); "Line width" scales all of them.
 
+## Releases
+
+Publishing a GitHub release (`gh release create v0.1.0 --generate-notes`)
+runs `.github/workflows/release.yml`, which builds the app and attaches it
+to the release; nothing else runs it:
+
+- Linux: `mod-helper-<tag>-linux-x86_64.AppImage` (needs glibc 2.39 or
+  newer: Ubuntu 24.04, Fedora 40, Arch …). `chmod +x` it, then run it.
+- Windows: `mod-helper-<tag>-windows-x86_64.exe`. It is not signed, so
+  SmartScreen asks first (More info → Run anyway); a console window opens
+  with it (the command line options print there).
+- macOS: `mod-helper-<tag>-macos.zip`, the app for Apple silicon and Intel
+  (macOS 11 or newer). It is not notarized: the first time, macOS refuses to
+  open it; System Settings → Privacy & Security → Open Anyway.
+
+On Windows and macOS the game is looked for where Steam puts it and the mods
+go to `Documents/Paradox Interactive/Hearts of Iron IV/mod`; other folders
+are set in the map editor's Mod details, under "Folders on this computer".
+
 ## Projects
 
 A project is **one file**, `<name>.hoi4proj`: a ZIP archive (any zip tool
@@ -188,6 +207,14 @@ The side panel shows the layer list, the selected layer's properties, and an
 inspector with the pixel coordinates and raw values (palette index, RGB,
 height…) of every visible raster under the cursor.
 
+Only the layers that are shown are in memory. A raster is decoded whole (a
+20,000 × 12,000 px float GeoTIFF takes a gigabyte, an OSM extract some
+50–70 MB), so a hidden layer is not read when the project opens: it is read
+when ticked, and dropped again when unticked, its memory handed back. Once
+read, its size and georeference are kept, so a hidden layer can still be
+framed ("Zoom to", "Fit all") and lend its georeference to a raster of the
+same size; "Zoom to" on one never read shows it and frames it once read.
+
 Tests: `cargo test` runs the unit tests. `MOD_HELPER_TEST_MAPS=<the mod's
 maps folder> cargo test --release -- --include-ignored` also runs the tests
 on the real data:
@@ -291,6 +318,30 @@ action, undo, save, build) and counts as unsaved. The fields:
   buildings (infrastructure, factories, dockyards, air base, anti-air,
   refinery, silo, radar, rocket site, reactor), resources, victory points,
   cores and "occupied by":
+  - **population** (`manpower` of the state file): "auto" shows what the
+    build gives it (the manpower base of Mod details › Build, a quarter
+    outside the nation's capital state, plus the manpower per km² of
+    built-up land, to the hundred; "at least" the base until the built-up
+    land is read). Untick it to set the number yourself; it starts from the
+    auto value. Below it, about how many soldiers the nation recruits from
+    it under Volunteer Only (1.5%, the game's default law) and Limited
+    Conscription (2.5%): where divisions without `start_manpower_factor`
+    get their men.
+  - **buildings** go only as high as the game allows. The caps come from
+    the game's `common/buildings` and `common/state_category` (vanilla's
+    values when the game is not installed): infrastructure 0-5, factories
+    and dockyards 0-20, air base 0-10, anti-air 0-5, refinery 0-3, radar
+    0-6, rocket site 0-3, reactor 0-1. Islands lower the air base cap. Air
+    wings are stationed at the air bases (200 planes per level; the Air page
+    of the nation content). The
+    range is shown beside each building. A value over the cap, read from a
+    file, stays as it is and is marked "at most 5" in red. A dockyard in a
+    state that does not touch the sea is marked "needs a coast". The
+    category shows its building slots ("town (4 slots)", or "auto: town"
+    when it follows the built-up area). The line under the buildings counts
+    the slots the ticked factories, dockyards, refineries, silos, rocket
+    sites and reactors take, in red when there are more than the category
+    has.
   - **cores:** the owner's alone (the default, "the owner (automatic)"),
     other nations' as well or instead, or nobody's. A core is a nation's
     own land: full manpower and factories from it, and the right to claim
@@ -300,13 +351,16 @@ action, undo, save, build) and counts as unsaved. The fields:
     occupier's colour. The base game only starts occupations between
     countries at war, so pair it with a war in the nations' history (or
     expect the state to go back to its owner). A capital that starts
-    occupied is a warning: the owner's starting divisions are placed there.
+    occupied is a warning.
 
   So a state cored by nobody but held by an occupier is owner X, cores
   "nobody", occupied by Y.
 - Nation: name, tag, colour, language (name lists), ruling ideology,
-  settlement rank, capital, whether it starts with a militia.
-- Zone: name. Adjacency: name, type, sea province crossed, rule, ends.
+  settlement rank, capital. (Its divisions are made on the Army page of
+  its content: the build places none.)
+- Zone: name. Adjacency: name, type, sea province crossed (an id of the
+  map; marked in red when it is not a sea province touching both ends, or
+  for a canal not a land province), rule, ends.
 
 Anything left on "auto" is decided by the mod builder.
 
@@ -452,6 +506,7 @@ the default here).
   (`N`): click a province on the sea to add one (with the slider's level),
   or to remove the one there. "One per coastal state" puts one in the most
   built-up coastal province of each state on the sea that has none.
+  Fleets are stationed at them (the Navy page of the nation content).
 - The *estimate* follows the game's supply rules (`NSupply` in
   `common/defines`). Supply starts at 5 in the capital, and at 2.8 in hubs
   joined to it by railway or river (+0.34 per level of the weakest railway on
@@ -644,15 +699,23 @@ limit, separate pieces, crossings, provinces without state or zone, zone
 type, contiguity of states and zones, capitals, tags, straits, rivers cut
 short at the sea or another river (or too short to draw), railway stops off
 passable land or without a way between them, hubs off passable land, ports
-not on a coast. Click an issue
-to go there.
+not on a coast. A state's buildings are checked against the game's caps,
+including a building over its cap, a dockyard inland, two that exclude each
+other (rocket site and mega gun), and a building or category the game does
+not have (all errors). More buildings that take slots than the category has
+is a warning; the automatic category counts once the terrain is loaded.
+Click an issue to go there.
 
 **Saving and building.** Ctrl+S (or 💾) writes `provinces.bmp` and
 `provinces.json` (and the Terrain level's `terrain_paint.bmp` and
 `heightmap_import.bmp` when there are any) into the project file. The
 previous files are first copied to `backups/<time>/` in the working folder
-(UTC time of the save); the last 10 are kept. Ids are renumbered 1..n on save
-if anything was removed. "Backups…" lists them with their age and province
+(UTC time of the save); the last 10 are kept. Ids stay as they are when
+something is removed (the gap stays), so what the nation content names by
+number (a division's province, a capital state) keeps naming the same place,
+and the id of something deleted is never given to something new
+(`provinces.json` keeps `next_ids`); the build numbers them 1..n for the game and changes the content's numbers
+along (see [Building the mod](#building-the-mod)). "Backups…" lists them with their age and province
 count; "Load" puts one in the editor as one edit (Undo goes back). Nothing is
 written until you save. The mod details and the map frame setting stay as they are.
 Reload asks before it drops unsaved changes.
@@ -751,7 +814,7 @@ laid out like a mod (`common/`, `events/`, `history/`, `localisation/`,
 `gfx/`, `interface/`). It is read into memory when the screen opens, edited
 there with its own undo / redo, and written by Save (Ctrl+S, which also
 saves the map). A file that is overwritten or deleted goes to
-`content/.backups/<time>/` first. Packages are named by tag, so a nation
+`content/.backups/<time>/` first (the last 10 backups are kept, model imports included). Packages are named by tag, so a nation
 with content gets the tag the build gives it fixed in the map. The map then
 has unsaved changes.
 
@@ -795,6 +858,17 @@ The nations are down the left. For the one picked:
     sharing group have a list to pick from beside them and show what the
     value names (the nation, the state, a missing localisation text, a
     file that is not there).
+  - Number fields take only what the game allows, for example:
+    - stability and war support 0 to 1;
+    - a template's priority 0 to 2;
+    - an idea's `removal_cost` -1 or 0 and more;
+    - whole numbers of days, slots and convoys;
+    - a subject's freedom 0 to 1.
+
+    A value outside the range is not applied. The field is framed in red,
+    and hovering it says what the game takes. A value already in the file
+    that is outside the range is framed the same way. A value that is not
+    a number (`@cost`, a variable) is left alone.
   - States are also picked on a map (🗺, in the forms and the wizards):
     the states in their nation's colour, the nation's own bright and the
     picked one lit up, named when zoomed in; the wheel zooms, dragging
@@ -803,15 +877,17 @@ The nations are down the left. For the one picked:
   template on the game's grid, five columns of five battalions, the
   support companies beside them and a regimental support company on top of
   each column, each with its icon from the game.
-  - Click a place to pick what goes there. The list shows only what the
-    nation can use at the start, which is what every nation has plus what
-    the build's starting technologies and the nation's own `set_technology`
-    unlock. It shows only what fits that place: one group per column, each
-    support company once, and regimental support on the columns it
-    supports. Tick "all" to see the rest greyed out, with why: "needs
-    Motorized Infantry", "column 2 is of infantry". Click a battalion again
-    to change or remove it; right-click fills or empties its column. Each
-    change is one undo step and edits only that line, so comments stay.
+  - Click a place to pick what goes there. The list shows only what the nation
+    can use at the start, which is what every nation has plus what the
+    build's starting technologies and the nation's own `set_technology`
+    unlock (for players with the DLCs picked, when the history gives some
+    only inside `has_dlc` checks). It shows only what fits that place: one
+    group per column, each support company once, and regimental support on
+    the columns it supports. Tick "all" to see the rest greyed out, with
+    why: "needs Motorized Infantry", "column 2 is of infantry". Click a
+    battalion again to change or remove it; right-click fills or empties its
+    column. Each change is one undo step and edits only that line, so
+    comments stay.
   - The checks, with the battalions they are about framed in red or
     yellow:
     - battalions the nation cannot use at the start, and the technology
@@ -824,18 +900,29 @@ The nations are down the left. For the one picked:
     - regimental support on a column without battalions, or of a group it
       does not support;
     - columns mixing groups;
-    - equipment the nation has no model of at the start;
+    - equipment the nation has no model of at the start (nor in its
+      stockpile);
     - no battalions at all.
 
-    The same checks run in **Check** for every template of the project.
-  - Stats, with the nation's research at the start or with all research up
-    to a year (technologies of focuses and events left out):
+    When the nation's history gives technologies or equipment inside
+    `has_dlc` checks, the template is checked for players with and without
+    each of those DLCs, and a problem only some of them have says whom:
+    "players without No Step Back: Light Tank is not available …". The same
+    checks run in **Check** for every template of the project.
+  - Stats, with the nation's research and stockpile at the start or with
+    all research up to a year (technologies of focuses and events left
+    out), for players with every DLC, none, those installed with the game,
+    or those ticked (the focus tree view uses the same choice). Research by
+    year keeps to the technologies those players see: No Step Back and By
+    Blood Alone have their own tank and plane technologies, so light tanks
+    of 1940 are the old models without No Step Back and the chassis with
+    it.
     - speed, HP, organisation, recovery, recon, suppression, weight, supply
       use, entrenchment;
     - combat width, soft, hard and air attack, defence, breakthrough,
       armour, piercing, hardness;
     - manpower, training time, production cost, and the equipment with the
-      model it gets.
+      model it gets and how much of it the stockpile has.
 
     Also how many divisions fit each terrain's combat width, and terrain
     bonuses. Hover a stat for how it is worked out. A battalion's attacks
@@ -845,6 +932,198 @@ The nations are down the left. For the one picked:
     game does. Doctrines, national spirits, generals, experience and the
     nation's own tank designs are left out (tanks use the game's tank
     models without a design).
+- **Stockpile** (at the top of a country history's form): the equipment the
+  nation has at the start, besides what its divisions carry
+  (`add_equipment_to_stockpile`), also the lines inside `has_dlc` checks.
+  Each line shows the model with its family's icon, how many (drag to
+  change), who made it and which players get it. It also says whether the
+  nation can make the model itself, or which technology it would need.
+  Divisions draw from the stockpile, so a model the nation cannot make yet
+  still equips them, and the division designer counts it. A row adds a
+  model picked from every model of the game and the mod (with its family,
+  year and DLC). A model only some players get goes inside
+  `if = { limit = { has_dlc = ... } }` by itself. A line that gives such a
+  model to every player is marked, with a button that puts it inside that
+  check. ✖ removes a line. The 🪄 of the field opens a page for one line:
+  model, how many, who made it, a design (`variant_name`).
+- **Army** (🪖, below Division templates): the divisions a nation starts
+  with. The build places none of its own (it once gave every nation a
+  militia): a nation starts with the divisions of the order of battle its
+  history loads with `oob = "..."`.
+  - **Order of battle**: the page shows the file and its line. Without
+    one, a button loads a file of the nation's templates
+    (`oob = "TAG_content"`), or makes `history/units/TAG_army.txt` and the
+    line (after `capital`).
+  - **Templates**: those of the file, with their battalions and how many
+    divisions are of each. "✏ designer" opens one in the division
+    designer, and the designer's "🪖 Place divisions of it on the map"
+    comes back with it ready to place. A new template (three infantry
+    battalions and engineers) goes into the file and opens in the
+    designer. Templates of the nation's other files, which nothing loads,
+    are listed with a button that moves them into the order of battle.
+  - **Map**: the provinces of the open map, the nation's states bright and
+    the rest faded, state borders dark and province borders faint; it
+    opens on the nation with its neighbours (wheel: zoom, drag: move).
+    Each province with divisions shows how many. Pick a template, then
+    click provinces: each click places that many divisions (× 1 to 24),
+    named "1. <template>", "2. <template>" ... with 20% experience
+    (Trained), 70% of their equipment and all their men
+    (`start_manpower_factor = 1`). With no template picked a click (or a
+    right-click) lists the divisions of the province.
+  - **How a division starts**, as the game does it:
+    `start_experience_factor` (0 to 1, else 0) is shown as the game's
+    level: Green, Trained from 10%, Regular from 30%, Seasoned from 75%,
+    Veterans from 90%. `start_equipment_factor` (else all) is the share of
+    its equipment it gets at the start, not from the stockpile; it takes
+    the rest from the stockpile when the stockpile has it.
+    `start_manpower_factor` is the share of its men it gets; without it
+    (as the game's own files are) the men come out of the nation's
+    reserves, only as many as there are. A nation of a few villages has a
+    few thousand at most, so such divisions start far below strength, and
+    the soldiers that fill them up later bring no experience: weaker and
+    greener than the file says. New divisions have all three.
+  - **Equipment and men the army needs**, above the list: for each kind
+    of equipment, the model the divisions get (the newest the nation has
+    at the start, with the DLCs picked in the division designer), what
+    all the divisions use at full strength, what they are given, what
+    they lack (taken from the stockpile) and what the stockpile has
+    (orange: not enough). The same for the men (given, or out of the
+    reserves). "➕ Add what they lack to the stockpile" puts the shortfall
+    in the nation's history (`add_equipment_to_stockpile`, added to a
+    plain line of the model when there is one; a model of a DLC inside
+    `if = { limit = { has_dlc = ... } }`); "➕ Add a whole army's worth"
+    puts in as much again as the whole army uses, for losses and new
+    divisions; "Give every division its men" writes
+    `start_manpower_factor = 1` where it is missing. Each is one undo step.
+  - **Divisions**, by province, in columns: each can be renamed, given
+    another template, experience, equipment and men (drag, one undo step),
+    moved (📍, then click a province) or removed; "✖ all" clears a
+    province. "reserves" marks a division without `start_manpower_factor`
+    (click: all its men). Hover a province on the map for its divisions.
+  - Checks: a template that is not in the file (the game takes only the
+    file's), no template or no location, a location at sea or in a lake,
+    in no nation's state or in another nation's, experience, equipment or
+    men outside 0 to 1, two divisions of one name, divisions without
+    `start_manpower_factor`.
+- **Navy** (⚓, below Division templates): the ship designer and the
+  fleets a nation starts with.
+  - **Ship designer**, as the game's: a design is a hull with a module in
+    each slot. Designs are the `create_equipment_variant` lines of the
+    nation's history. Pick a hull (those the nation cannot build yet are
+    greyed out, with the technology), name the design, and it starts with
+    the hull's default modules and the best module the nation has for each
+    slot that must be filled. The slots show the module's picture and name;
+    click one to pick a module from those the slot takes. The list shows
+    only what the nation has researched at the start and what no other
+    module of the design rules out; tick "all" to see the rest greyed out,
+    with why ("needs Basic Battery", "not with Rapid Fire Guns"). The hull
+    can be changed (modules that fit are kept), and a design can be renamed
+    (its ships in the fleets follow), duplicated, made obsolete or deleted.
+    - Slots, defaults and limits come from the game's and the mod's hulls:
+      a model takes the slots of the one it follows where it says
+      `inherit`, and `mid_2_custom_slot = mid_1_custom_slot` copies a slot.
+    - Checks: a hull or module the nation cannot use at the start, with
+      the technology; a module in a slot that does not take it; a slot
+      that must be filled left empty; more modules of a kind than the hull
+      takes (one radar); modules that cannot be together (a medium battery
+      and light guns); a design that is no kind of ship (a heavy hull
+      without a battleship's or battlecruiser's armour); two designs of
+      one name. A button gives the nation the missing technologies
+      (`set_technology`, with those before them on the research screen).
+    - What the design is (destroyer, light or heavy cruiser, battleship,
+      battlecruiser, carrier, submarine), and its stats: light and heavy
+      attack and piercing, torpedoes, depth charges, anti-air; HP, armour,
+      reliability, visibility; speed, range, detection, fuel; cost,
+      manpower, resources. They are the hull's plus each module's, plus the
+      average of the guns' piercing, times the modules' multipliers.
+      Refits, design companies, doctrines and technology bonuses are left
+      out.
+  - **Fleets**: the history/units file the history loads with
+    `set_naval_oob` (a button makes `TAG_naval.txt` and the line). Each
+    fleet is stationed at a naval base, with task forces of ships. The
+    naval bases are those placed in the map editor (Supply level, port
+    tool `N`); the lists show the nation's first, then other nations'.
+    Fleets and task forces are added with a name and a base; ships are
+    added as "n × design", named after it ("Etsch 1", "Etsch 2"), with the
+    kind the design makes. Each ship can be renamed, given another design or
+    kind, made the pride of the fleet, moved to another task force or
+    removed.
+    - Checks: a fleet without a naval base; a base or a task force's place
+      that is no naval base of the map (with where to place one), or one of
+      another nation (it needs docking rights); a ship of a kind not built
+      on its hull, of a design the nation does not have (or one on another
+      hull of the family), or whose design makes another kind; ships
+      without an owner or design; two ships of one name; more than one
+      pride of the fleet; empty fleets and task forces.
+  - Man the Guns is part of the game now: its technologies, hulls and
+    modules are every player's, and the game's own `has_dlc = "Man the
+    Guns"` checks always hold.
+- **Air** (✈, below Navy): the plane designer and the air wings a nation
+  starts with. The plane designer is By Blood Alone's: players without that
+  DLC have no airframes or plane modules, but the old plane models
+  (`fighter_equipment_1`, `CAS_equipment_1` ...) with upgrades. So each
+  design can have a fallback, and the wings come in two files.
+  - **Plane designer**, as the game's: a design is an airframe (light,
+    light for carriers, medium or heavy) with a module in each slot, the
+    `create_equipment_variant` lines of the history inside
+    `if = { limit = { has_dlc = "By Blood Alone" } }` (the page puts them
+    there). Pick the airframe and the role (fighter, close air support,
+    naval bomber, tactical bomber, ...), name it, and it starts with the
+    newest main armament of that role and an engine in each slot that must
+    be filled. As in the game, the main armament makes the role: each role
+    has its own airframe of each generation (`small_plane_cas_airframe_1`),
+    and putting bombs on a fighter turns it into a close air support
+    plane (the `type` follows). Slots, pickers, "all", renaming (the wings
+    and the fallback follow), duplicating, obsolete and deleting work as on
+    the Navy page.
+    - The airframes of the roles are made by the game's
+      `duplicate_archetypes` from those of the light, medium and heavy
+      airframe; the app makes them the same way, with the names the game
+      gives them.
+    - Checks: an airframe or module the nation cannot use at the start (for
+      players with By Blood Alone), with the technology; a module a slot
+      does not take, an empty slot that must be filled, modules that cannot
+      be together; a design outside the DLC check (an error when only
+      players without the DLC get it, a warning when every player does); an
+      airframe of another role than the main armament makes (with the right
+      `type`); more weight than the engines' thrust (an error), or more on
+      one of its missions (some modules weigh more on some missions, a
+      warning); two designs of one name.
+    - Stats: air attack and defence, agility, speed, range; ground attack,
+      bombing, naval attack and targeting; thrust and weight, reliability,
+      fuel use; cost, resources. The
+      airframe's plus each module's, times the modules' multipliers;
+      doctrines and technology bonuses are left out.
+  - **Fallback**: a design of the same name on an old model, with upgrades
+    instead of modules (`type = fighter_equipment_1 upgrades = {
+    plane_gun_upgrade = 2 }`), inside `if = { limit = { NOT = { has_dlc =
+    "By Blood Alone" } } }`. "Add a fallback" picks the old model of the
+    role and generation the nation has (it says which); the model can be
+    changed and each upgrade raised or lowered. A design without one is
+    noted in the check list (its wings fall back to a plain model).
+    - Checks: a model that is no old plane, or that the nation has not
+      researched without By Blood Alone (the button gives the old
+      technologies); an upgrade the model does not take, or over its
+      highest level; a model of another role than the design; a fallback
+      outside the check.
+  - **Air wings**: two history/units files the history loads with
+    `set_air_oob`, one inside the By Blood Alone check and one in its
+    `else`, written inside the `if` as the game's histories have it (the
+    game drops an `else` that follows the `if`) (a button makes `TAG_air_bba.txt`, `TAG_air_legacy.txt` and
+    the lines, or splits a file every player gets). Wings are edited in
+    the first: each state with an air base (from the map editor) lists its
+    wings, and a wing is an amount of planes of one design, with a name.
+    Wings can be renamed, given another design or amount, moved to another
+    base or removed.
+    - The file without the DLC follows: each wing on its design's fallback,
+      or (without one) the old model of the role and generation the nation
+      has. When it was changed by hand it is left as it is and marked, with
+      a button that rewrites it.
+    - Checks: a wing in a state with no air base (with where to place
+      one), at another nation's base (it needs the right to use it), or
+      more planes at a base than its levels hold; a wing of a design the
+      nation does not have, no owner or no amount; airframes in the file
+      without the DLC (they do not exist there); a state given twice.
 - **Wizards** (🪄 next to a script field, and "Insert…" on the code tab):
   build script without writing it by hand. What they add goes into the
   field where the cursor was (or replaces it, for fields that are a list),
@@ -859,12 +1138,25 @@ The nations are down the left. For the one picked:
     chance; OR / NOT / AND for conditions.
   - Fields with their own page: AI weights and mean time to happen (a base,
     then factors or additions when conditions hold), the focus tree's
-    `country`, prerequisites and mutually exclusive focuses (tick them),
-    a country's politics, popularities (sliders), technologies, ideas,
-    research bonus, search filters, and the battalions, support and
-    regimental support companies of a division template (only those the
-    nation can use at the start, placed in the free slots, with a grid
-    preview).
+    `country`, prerequisites and mutually exclusive focuses (tick them), a
+    country's politics, popularities (sliders), technologies, ideas,
+    research bonus, search filters, a stockpile line, and the battalions,
+    support and regimental support companies of a division template (only
+    those the nation can use at the start, placed in the free slots, with a
+    grid preview).
+  - The technologies' page (`set_technology`) lists every technology of
+    the game and the mod with its year and research tab, and filters it:
+    by name or id, research tab, category (`infantry_weapons`, part of the
+    id is enough), years from and to (with or without those that have no
+    year), DLC (every player's, only with or only without a DLC, or those
+    no player gets now, like the naval tab of before Man the Guns), a
+    country (the technologies it starts with in 1936, or those it does
+    not: a nation of the mod by its history, a country of the game by the
+    game's, the dated blocks of the later starts left out), and ticked or
+    not. "Tick the shown" and "untick the shown" act on what the filters
+    leave, so "all of Austria's" or "the infantry tab up to 1936" is two
+    clicks. Hovering a technology shows its categories, DLC and what it
+    unlocks.
   - Every other block of the forms is built whole from a form of its own,
     filled from what the field has (what the form does not know is kept and
     written back after it):
@@ -908,6 +1200,54 @@ For the whole project:
   - Tags no nation or base-game country has; states and provinces the map
     does not have.
   - Division templates: what the division designer checks.
+  - Army (*army*): every order of battle's divisions, as the Army page
+    checks them (against the nation that loads the file); files of
+    templates that no `oob` or `load_oob` loads (the game never sees
+    them); and, as a note, nations whose history has no `oob` (they start
+    with no divisions).
+  - Navy (*navy*): every nation's ship designs and fleets, as the Navy page
+    checks them, and a `set_naval_oob` of a file the content does not
+    have.
+  - Air (*air*): every nation's plane designs and fallbacks (designs for
+    players with By Blood Alone, fallbacks for those without), and its air
+    wings against its designs and the map's air bases; a `set_air_oob` of
+    a file the content does not have, one of airframes that players
+    without By Blood Alone also load, and none for them at all.
+  - The stockpile: `add_equipment_to_stockpile` without a type or an
+    amount, of what is not equipment, made by a country that does not
+    exist.
+  - An `else` or `else_if` after an `if` at the top of a nation's history
+    (*history*): the game drops it there ("Else/else if not following an
+    if" in its error.log); it takes it only inside the `if`. The build
+    moves it inside, and "repair" on the Check page does so in the content
+    (one undo step).
+  - Numbers the game does not allow, as warnings (*values*):
+    - fields out of range;
+    - in effects and triggers, `set_stability` and `has_stability` 0 to 1,
+      `add_stability` and `add_popularity` -1 to 1, `set_popularities` 0
+      to 100;
+    - whole numbers of research slots, building slots, manpower, stockpile
+      amounts and event days;
+    - `add_building_construction` with a level over the building's cap
+      (infrastructure 5) or a building the game does not have.
+
+    The wizards check the same numbers before they add a line or fill a
+    form: a leader's skills, a subject's freedom, a focus's position.
+  - DLC, from the game's own files: research folders shown only with a
+    DLC or only without it (No Step Back's tanks, By Blood Alone's planes),
+    the technologies in them, and the models those technologies unlock.
+    Man the Guns is part of the game now: every player has it.
+    - `has_dlc` of a name that is no DLC (an error with the right name
+      for a near miss: "No Step back" → "No Step Back");
+    - a technology (`set_technology`) or a model (`add_equipment_to_stockpile`,
+      `create_equipment_variant`) only some players have, given outside a
+      `has_dlc` check for it;
+    - the content's technologies in a research folder that does not exist,
+      or that only some players see (a note).
+
+    The `has_dlc` checks around a line count: those of the `if`,
+    `else_if` and `else` it is in, and a focus's `allow_branch`, a
+    decision's `allowed` or `available` and the like.
   - Missing localisation, icons, pictures and texture files; script that
     does not parse.
 
@@ -976,7 +1316,8 @@ It writes `<mods>/<folder>/` and `<mods>/<folder>.mod`:
   `gfx/entities/mod_helper_ambient.asset`);
 - **history:** states (owner, occupier as `controller`, cores as
   `add_core_of`, category, manpower, buildings, victory points, the
-  editor's naval bases), countries and their militia;
+  editor's naval bases), countries (with no divisions: those are the
+  content's, from the Army page);
 - **countries:** one per nation, with tag, colour unlike its neighbours',
   procedural flag, and name lists by language;
 - **other:** the bookmark, localisation, a tutorial pointed at this map (the
@@ -984,7 +1325,8 @@ It writes `<mods>/<folder>/` and `<mods>/<folder>.mod`:
 - **content:** the files of `<map>/content/`, `shared` first, then each
   nation's.
   - A nation's `history/countries/` file goes after the history the build
-    writes for it, so what it says wins.
+    writes for it, so what it says wins. An `else` / `else_if` that follows
+    an `if` there is moved inside the `if`, where the game takes it.
   - A script or localisation file with the name of a built one is written
     under another name (`x_TYR.txt`), so both are read.
   - Any other file replaces the built one (a flag of your own), with a line
@@ -1090,6 +1432,7 @@ top, in metres.
 | `editor/supply.rs`, `editor/supply_ui.rs` | the supply network: railway routing, automatic railways and hubs, ports, the supply estimate; the Supply level |
 | `modbuild/mod.rs` | the mod build: bitmaps, positions, railways, states, countries, bookmark, localisation, tutorial |
 | `modbuild/validate.rs` | checks of a built mod |
+| `modbuild/buildings.rs` | what the game allows of buildings: level caps, shared building slots, coastal ones, those that exclude each other, the slots and island caps of each state category (from the game, else vanilla's) |
 | `modbuild/meta.rs` | mod metadata (stored in `provinces.json`), `descriptor.mod`, thumbnail |
 | `modbuild/terrain.rs` | the terrain rules: kinds of land, counting them per province, the terrain of a province |
 | `modbuild/bitmaps.rs` | `terrain.bmp` and `heightmap.bmp` as the build makes them, painted terrain and imported heightmaps, vanilla's terrain indices and palette |
@@ -1102,9 +1445,14 @@ top, in metres.
 | `content/focus.rs`, `drawio.rs` | focus trees: layout, checks, play, edits; trees from draw.io |
 | `content/docs.rs`, `wizard.rs`, `shapes.rs` | the game's documentation of effects, triggers and modifiers; the wizards' catalog, roles of fields, and how built script is merged in; the forms of the fields built whole (read, write, what is missing) |
 | `content/validate.rs`, `errlog.rs` | the content checks; the game's `error.log` |
-| `content/units.rs` | land units of the game and the mod (battalions, equipment, modules, technologies, terrain widths): what a nation can use at the start, the checks of a division template, its stats |
+| `content/units.rs` | land units of the game and the mod (battalions, equipment, modules, technologies, research folders, terrain widths): what a nation can use at the start (its stockpile too, for players with which DLCs), the checks of a division template, its stats |
+| `content/limits.rs` | the numbers the game allows: fields of the definitions, values in effects and triggers, parts of the wizards' forms, building levels |
+| `content/navy.rs` | the navy: ship hulls and their slots, modules, designs (checks, stats, what kind of ship), fleets and their checks against the designs and the map's naval bases |
+| `content/air.rs` | the air force: airframes and their role families (`duplicate_archetypes`), the role a main armament makes, plane designs (checks, stats, thrust and weight) and their fallbacks on old models with upgrades, air wings and their checks against the designs and the map's air bases, the wings without By Blood Alone |
+| `content/army.rs` | the army: a nation's `oob` line and file, its templates, the divisions (read, written, named), their checks against the file's templates and the map's provinces, the files nothing loads |
+| `content/dlc.rs` | DLC: the names `has_dlc` takes, what a player needs (or must not have) for a part of the game, the `has_dlc` checks around a line of script (an `else` inside the `if` too), DLCs every player has now |
 | `content/refactor.rs`, `gfx.rs`, `zip.rs`, `build.rs` | renames, deletes, find & replace; sprites and pictures; bundles (in memory, with `zip.rs`); the content in the built mod |
-| `content/ui/` | the screen: nations, forms and code editor, wizards, the sprite picker and the state map, the division designer, the focus tree canvas, check, import / export, test play, tools |
+| `content/ui/` | the screen: nations, forms and code editor, wizards, the sprite picker and the state map, the division designer, the stockpile, the army (with a map of the provinces), navy and air pages, the focus tree canvas, check, import / export, test play, tools |
 | `editor/content_link.rs` | what the content screen asks of the map: nations, tags, states, the build |
 | `models/pdxbin.rs`, `mesh.rs`, `anim.rs` | the game's binary `.mesh` and `.anim` files: meshes, skeletons, skinning, locators, animation samples |
 | `models/catalog.rs` | the game's, the DLCs' and the mod's `pdxmesh`, `animation` and `entity` definitions (clones, states, attachments), where they come from, case-blind file lookup |
@@ -1115,7 +1463,9 @@ top, in metres.
 | `editor/model_import_ui.rs` | the "Import a model…" window: options per material, the preview, writing into a content package |
 | `modbuild/ambient.rs` | the objects in the build: `ambient_object.txt` blocks and the entities they need |
 
-Rasters sit behind `Arc<RwLock<Raster>>` and tiles are keyed by
+A hidden layer is `LayerState::Unloaded` (`LayerState::residency` says when
+to read or drop one, each frame) and keeps its size and georeference in
+`Layer::known`. Rasters sit behind `Arc<RwLock<Raster>>` and tiles are keyed by
 `(layer, level, x, y)`, so editing tools can change pixels and invalidate only
 the affected tiles.
 

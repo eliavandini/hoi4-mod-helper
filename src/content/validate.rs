@@ -2,8 +2,11 @@
 //! files it would misread, ids it keeps only one of, references to what is
 //! not there (focuses, events, ideas, characters, traits, technologies,
 //! ideologies, sprites, pictures, localisation), focus trees that cannot
-//! be played, and what is about the map (states, provinces, capitals,
-//! tags) checked against this map.
+//! be played, division templates, the stockpile, DLC (names `has_dlc`
+//! does not know; technologies and equipment only some players have,
+//! given to all), numbers the game does not allow (a share over 1, a
+//! building level over its cap, half a day), and what is about the map
+//! (states, provinces, capitals, tags) checked against this map.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -46,15 +49,26 @@ pub struct Issue {
 pub struct Facts {
     /// Fixed tags of nations → (name, capital state, its states).
     pub nations: BTreeMap<String, (String, u32, BTreeSet<u32>)>,
-    /// Number of provinces (ids 1..=n).
+    /// The largest province id (the ids have gaps where provinces were
+    /// deleted: see `ground`).
     pub provinces: u32,
     pub states: BTreeSet<u32>,
     /// All nations of the map have no tag of their own fixed (they get one at the build).
     pub unpinned: usize,
+    /// The naval bases of the map.
+    pub ports: Vec<super::navy::Port>,
+    /// The air bases of the map.
+    pub airbases: Vec<super::air::Airfield>,
+    /// What each province of the map is (by id; empty: no map).
+    pub ground: Vec<Option<super::army::Ground>>,
 }
 
+/// How the check of an `else` after an `if` in a history starts (the Check
+/// page offers to repair it).
+pub const LOOSE_ELSE: &str = "else after an if at the top of a history file";
+
 /// Keys whose value is a state id.
-const STATE_KEYS: [&str; 11] =
+pub(crate) const STATE_KEYS: [&str; 11] =
     ["transfer_state", "set_state_controller", "add_state_core", "remove_state_core", "add_state_claim", "remove_state_claim", "owns_state", "controls_state", "has_full_control_of_state", "is_core_of", "set_capital"];
 /// Keys whose value is a tag.
 const TAG_KEYS: [&str; 14] = [
@@ -163,6 +177,12 @@ pub fn validate(st: &Store, base: Option<&Index>, facts: &Facts) -> Vec<Issue> {
     trees(&mut c);
     definitions(&mut c);
     references(&mut c);
+    dlcs(&mut c);
+    values(&mut c);
+    navy(&mut c);
+    air(&mut c);
+    army(&mut c);
+    loose_elses(&mut c);
     c.out.sort_by(|a, b| (a.severity, &a.pkg, &a.file, a.line).cmp(&(b.severity, &b.pkg, &b.file, b.line)));
     c.out
 }
@@ -358,8 +378,6 @@ fn trees(c: &mut Ctx) {
 
 fn definitions(c: &mut Ctx) {
     let keys: Vec<DefKey> = c.st.defs().collect();
-    // what each nation has at the start, for its division templates
-    let mut have: HashMap<String, super::units::Have> = HashMap::new();
     // event namespaces declared in each file
     for k in &keys {
         let Some((d, text, s)) = c.st.def(k) else { continue };
@@ -502,11 +520,10 @@ fn definitions(c: &mut Ctx) {
                     c.add(Severity::Error, "divisions", &k.pkg, &k.file, line, Some(k), format!("division template {}: priority is 0, 1 or 2 (reinforcement: low, normal, high)", d.id));
                 }
                 let Some(db) = c.units.clone() else { continue };
-                let h = have.entry(k.pkg.clone()).or_insert_with(|| db.have(super::units::start_techs(c.st, &k.pkg)));
                 let base = c.base;
                 let name = |id: &str| base.and_then(|b| b.loc.get(id)).map(|t| super::loc::plain(t)).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| id.to_string());
                 let t = super::units::Template::read(b);
-                for p in db.check(&t, h, &k.pkg, &name) {
+                for p in db.check_for_players(c.st, &t, &k.pkg, &k.pkg, &name) {
                     let at = p.slot.map(|i| script::line_of(text, t.slots[i].span.start)).unwrap_or(line);
                     c.out.push(Issue { severity: p.severity, category: "divisions", pkg: k.pkg.clone(), file: k.file.clone(), line: at, def: Some(k.clone()), message: format!("division template {}: {}", d.id, p.message) });
                 }
@@ -530,28 +547,28 @@ fn definitions(c: &mut Ctx) {
             }
         }
     }
-    // starting divisions: provinces of the map, templates that are defined
+    // provinces of the map in orders of battle (divisions: the army's checks)
     for (name, p) in &c.st.packages {
         for (path, f) in &p.files {
             if !path.starts_with("history/units/") {
                 continue;
             }
             let (Some(s), Some(text)) = (&f.script, f.text()) else { continue };
-            let templates: BTreeSet<&str> = s.root.blocks("division_template").filter_map(|b| b.atom("name")).collect();
             let mut found = Vec::new();
+            // the ids of the map have gaps where provinces were deleted or merged
+            let known = |v: u32| match c.facts.ground.get(v as usize) {
+                _ if c.facts.ground.is_empty() => (1..=c.facts.provinces).contains(&v),
+                Some(g) => g.is_some(),
+                None => false,
+            };
             s.root.walk(&mut |i, _| {
                 if (i.is("location") || i.is("naval_base") || i.is("base"))
                     && let Some(v) = i.text().and_then(|v| v.parse::<u32>().ok())
-                    && (v == 0 || v > c.facts.provinces)
                     && c.facts.provinces > 0
+                    && !known(v)
                 {
-                    found.push((script::line_of(text, i.span.start), format!("{} = {v} is not a province of this map (1 to {})", i.key(), c.facts.provinces)));
-                }
-                if i.is("division_template")
-                    && let Some(t) = i.text()
-                    && !templates.contains(t)
-                {
-                    found.push((script::line_of(text, i.span.start), format!("division_template = \"{t}\" is not defined in this file")));
+                    let why = if v == 0 || v > c.facts.provinces { format!("1 to {}", c.facts.provinces) } else { "it was deleted or merged in the map".into() };
+                    found.push((script::line_of(text, i.span.start), format!("{} = {v} is not a province of this map ({why})", i.key())));
                 }
             });
             for (line, m) in found {
@@ -703,6 +720,380 @@ fn references(c: &mut Ctx) {
     }
 }
 
+/// The navy of each nation ([`super::navy`]): its ship designs against
+/// its research at the start, its naval order of battle (the file
+/// set_naval_oob loads), and its fleets against its designs, the kinds of
+/// ship and the naval bases of the map.
+fn navy(c: &mut Ctx) {
+    use super::navy;
+    let Some(db) = c.units.clone() else { return };
+    let base = c.base;
+    let name = |id: &str| base.and_then(|b| b.loc.get(id)).map(|t| super::loc::plain(t)).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| id.to_string());
+    let mut found: Vec<Issue> = Vec::new();
+    let mut known = super::dlc::known(base.map(|b| &b.files));
+    known.extend(db.dlcs());
+    for tag in c.st.packages.keys().filter(|t| *t != SHARED) {
+        let mut owned = known.clone();
+        owned.extend(super::units::history_dlcs(c.st, tag));
+        let designs = navy::designs(&db, c.st, tag);
+        let lines = navy::naval_oobs(c.st, tag);
+        if designs.is_empty() && lines.is_empty() {
+            continue;
+        }
+        let have = db.at_start(c.st, tag, Some(&owned));
+        let text_of = |pkg: &str, file: &str| c.st.text(pkg, file).unwrap_or("").to_string();
+        for d in &designs {
+            let text = text_of(&d.pkg, &d.file);
+            for p in db.check_design(d, &have, &designs, tag, &name) {
+                found.push(Issue { severity: p.severity, category: "navy", pkg: d.pkg.clone(), file: d.file.clone(), line: script::line_of(&text, d.span.start), def: None, message: format!("ship design \"{}\": {}", d.name, p.message) });
+            }
+        }
+        for l in &lines {
+            let text = text_of(tag, &l.file);
+            let line = script::line_of(&text, l.span.start);
+            let Some((pkg, path)) = navy::oob_file(c.st, tag, &l.name) else {
+                found.push(Issue { severity: Severity::Error, category: "navy", pkg: tag.clone(), file: l.file.clone(), line, def: None, message: format!("set_naval_oob = {}: there is no history/units/{}.txt in the content", l.name, l.name) });
+                continue;
+            };
+            let Some(f) = c.st.file(&pkg, &path) else { continue };
+            let (Some(s), Some(otext)) = (&f.script, f.text()) else { continue };
+            let fleets = navy::read_fleets(&s.root);
+            if fleets.is_empty() {
+                found.push(Issue { severity: Severity::Warning, category: "navy", pkg: pkg.clone(), file: path.clone(), line: 1, def: None, message: format!("{path}: no fleets (units = {{ fleet = {{ ... }} }})") });
+            }
+            for p in navy::check_fleets(&db, &fleets, tag, &c.facts.ports, &|t| navy::designs(&db, c.st, t), &name) {
+                found.push(Issue { severity: p.severity, category: "navy", pkg: pkg.clone(), file: path.clone(), line: script::line_of(otext, p.span.start), def: None, message: p.message });
+            }
+        }
+    }
+    c.out.extend(found);
+}
+
+/// `else` / `else_if` after an `if` at the top of a nation's history: the
+/// game drops it there (the build moves it inside the `if`, where the game
+/// takes it; "repair" does so in the content).
+fn loose_elses(c: &mut Ctx) {
+    let mut found = Vec::new();
+    for (pkg, p) in &c.st.packages {
+        for (path, f) in &p.files {
+            if !path.starts_with("history/countries/") {
+                continue;
+            }
+            let (Some(s), Some(text)) = (&f.script, f.text()) else { continue };
+            for i in super::dlc::loose_elses(&s.root) {
+                found.push(Issue {
+                    severity: Severity::Warning,
+                    category: "history",
+                    pkg: pkg.clone(),
+                    file: path.clone(),
+                    line: script::line_of(text, i.span.start),
+                    def: None,
+                    message: format!("{LOOSE_ELSE}: the game takes {} only inside the if before it (the build moves it there; \"repair\" does so here)", i.key()),
+                });
+            }
+        }
+    }
+    c.out.extend(found);
+}
+
+/// The army ([`super::army`]): the divisions of each order of battle of the
+/// content (templates of their file, places on the map, as the Army page
+/// checks them), files of templates nothing loads, and nations that start
+/// with no divisions (the build places none).
+fn army(c: &mut Ctx) {
+    use super::army;
+    let loaded = army::loaded_oobs(c.st);
+    // which nation loads a file (its divisions should stand in its land)
+    let mut loader: BTreeMap<String, String> = BTreeMap::new();
+    for tag in c.st.packages.keys().filter(|t| *t != SHARED) {
+        for l in army::army_oobs(c.st, tag) {
+            loader.entry(l.name).or_insert_with(|| tag.clone());
+        }
+    }
+    let mut found: Vec<Issue> = Vec::new();
+    for (pkg, p) in &c.st.packages {
+        for (path, f) in &p.files {
+            if !path.starts_with("history/units/") {
+                continue;
+            }
+            let (Some(s), Some(text)) = (&f.script, f.text()) else { continue };
+            let name = army::oob_name(path);
+            let divs = army::read_divisions(&s.root);
+            let templates = army::templates_of(&s.root);
+            let tag = loader.get(name).cloned().unwrap_or_else(|| pkg.clone());
+            for pr in army::check_divisions(&divs, &templates, &c.facts.ground, &tag) {
+                let line = pr.span.map(|s| script::line_of(text, s.start)).unwrap_or(1);
+                found.push(Issue { severity: pr.severity, category: "army", pkg: pkg.clone(), file: path.clone(), line, def: None, message: pr.message });
+            }
+            if !templates.is_empty() && !loaded.contains(name) {
+                let what = if divs.is_empty() { "templates" } else { "templates and divisions" };
+                found.push(Issue {
+                    severity: Severity::Warning,
+                    category: "army",
+                    pkg: pkg.clone(),
+                    file: path.clone(),
+                    line: 1,
+                    def: None,
+                    message: format!("{path}: no oob or load_oob loads it, so the game does not have its {what} (load it on the Army page)"),
+                });
+            }
+        }
+    }
+    for tag in c.st.packages.keys().filter(|t| *t != SHARED) {
+        if army::army_oobs(c.st, tag).is_empty() && c.st.package(tag).is_some_and(|p| p.files.keys().any(|f| f.starts_with("history/countries/"))) {
+            let file = c.st.package(tag).and_then(|p| p.files.keys().find(|f| f.starts_with("history/countries/")).cloned()).unwrap_or_default();
+            found.push(Issue { severity: Severity::Info, category: "army", pkg: tag.clone(), file, line: 1, def: None, message: format!("{tag} starts with no divisions: its history has no oob, and the build places none (the Army page makes them)") });
+        }
+    }
+    c.out.extend(found);
+}
+
+/// The air force of each nation ([`super::air`]): its plane designs
+/// (checked for a player with By Blood Alone), their fallbacks (for one
+/// without it), and the air wings of the files its history loads, against
+/// the air bases of the map.
+fn air(c: &mut Ctx) {
+    use super::air::{self, Branch};
+    use super::navy;
+    let Some(db) = c.units.clone() else { return };
+    let base = c.base;
+    let name = |id: &str| base.and_then(|b| b.loc.get(id)).map(|t| super::loc::plain(t)).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| id.to_string());
+    let mut found: Vec<Issue> = Vec::new();
+    let mut known = super::dlc::known(base.map(|b| &b.files));
+    known.extend(db.dlcs());
+    for tag in c.st.packages.keys().filter(|t| *t != SHARED) {
+        let (ds, fs) = air::planes(&db, c.st, tag);
+        let lines = air::air_oobs(c.st, tag);
+        if ds.is_empty() && fs.is_empty() && lines.is_empty() {
+            continue;
+        }
+        let mut owned = known.clone();
+        owned.extend(super::units::history_dlcs(c.st, tag));
+        let have = db.at_start(c.st, tag, Some(&air::with_bba(&owned)));
+        let legacy = db.at_start(c.st, tag, Some(&air::without_bba(&owned)));
+        let text_of = |pkg: &str, file: &str| c.st.text(pkg, file).unwrap_or("").to_string();
+        let mut issue = |severity: Severity, pkg: &str, file: &str, at: usize, message: String| {
+            let line = script::line_of(&text_of(pkg, file), at);
+            found.push(Issue { severity, category: "air", pkg: pkg.to_string(), file: file.to_string(), line, def: None, message });
+        };
+        for d in &ds {
+            for p in db.check_plane(d, &have, &ds, tag, &name) {
+                issue(p.severity, &d.pkg, &d.file, d.span.start, format!("plane design \"{}\": {}", d.name, p.message));
+            }
+            if air::branch_of(&d.need) == Branch::Bba && !fs.iter().any(|f| f.name == d.name) {
+                issue(Severity::Info, &d.pkg, &d.file, d.span.start, format!("plane design \"{}\" has no fallback: players without {} have no plane of that name (the Air page adds one)", d.name, air::BBA));
+            }
+        }
+        for f in &fs {
+            let d = ds.iter().find(|d| d.name == f.name);
+            for p in db.check_fallback(f, &legacy, d, &fs, tag, &name) {
+                issue(p.severity, &f.pkg, &f.file, f.span.start, format!("fallback \"{}\": {}", f.name, p.message));
+            }
+        }
+        let planes_of = |t: &str| air::planes(&db, c.st, t);
+        for l in &lines {
+            let Some((pkg, path)) = navy::oob_file(c.st, tag, &l.name) else {
+                issue(Severity::Error, tag, &l.file, l.span.start, format!("set_air_oob = {}: there is no history/units/{}.txt in the content", l.name, l.name));
+                continue;
+            };
+            let Some(f) = c.st.file(&pkg, &path) else { continue };
+            let Some(s) = &f.script else { continue };
+            let bases = air::read_wings(&s.root);
+            if bases.is_empty() {
+                issue(Severity::Warning, &pkg, &path, 0, format!("{path}: no air wings (air_wings = {{ <state> = {{ ... }} }})"));
+            }
+            let branch = air::branch_of(&l.need);
+            if branch == Branch::Both && bases.iter().flat_map(|b| &b.wings).any(|w| db.is_airframe(&w.equipment)) {
+                issue(Severity::Warning, tag, &l.file, l.span.start, format!("set_air_oob = {}: loaded for players with and without {}, its wings of the designer's airframes are not for those without it; load a file of planes without modules for them (the Air page splits it)", l.name, air::BBA));
+            }
+            for p in air::check_wings(&db, &bases, tag, &c.facts.airbases, branch == Branch::Legacy, &planes_of, &name) {
+                issue(p.severity, &pkg, &path, p.span.start, p.message);
+            }
+        }
+        if !lines.is_empty() && !lines.iter().any(|l| l.need.holds(&air::without_bba(&owned))) {
+            let l = &lines[0];
+            issue(Severity::Warning, tag, &l.file, l.span.start, format!("no set_air_oob for players without {}: they start with no air wings (the Air page makes their file)", air::BBA));
+        }
+    }
+    c.out.extend(found);
+}
+
+/// Numbers the game does not allow ([`super::limits`]): in the fields of
+/// the definitions, in effects and triggers, building levels over the
+/// building's cap (the base game's, else vanilla's).
+fn values(c: &mut Ctx) {
+    use super::limits;
+    let caps = match c.base {
+        Some(b) => crate::modbuild::buildings::of_files(&b.files),
+        None => std::sync::Arc::new(crate::modbuild::buildings::Caps::vanilla()),
+    };
+    let mut seen: BTreeSet<(String, String, usize)> = BTreeSet::new();
+    let mut found: Vec<Issue> = Vec::new();
+    let keys: Vec<DefKey> = c.st.defs().collect();
+    for k in &keys {
+        let Some((d, text, s)) = c.st.def(k) else { continue };
+        let Some(b) = d.block(s) else { continue };
+        for f in k.kind.spec().fields.iter().filter(|f| f.ty == kinds::FieldType::Number) {
+            let Some(r) = limits::of_field(k.kind, f.key) else { continue };
+            for a in b.all(f.key).filter_map(|i| i.atom()) {
+                let Ok(v) = a.text.parse::<f64>() else { continue };
+                if let Err(why) = r.check(v)
+                    && seen.insert((k.pkg.clone(), k.file.clone(), a.span.start))
+                {
+                    let message = format!("{} {}: {} = {}: {why}", k.kind.spec().one, d.id, f.key, a.text);
+                    found.push(Issue { severity: Severity::Warning, category: "values", pkg: k.pkg.clone(), file: k.file.clone(), line: script::line_of(text, a.span.start), def: Some(k.clone()), message });
+                }
+            }
+        }
+    }
+    for (name, p) in &c.st.packages {
+        for (path, f) in &p.files {
+            let (Some(s), Some(text)) = (&f.script, f.text()) else { continue };
+            if !path.ends_with(".txt") {
+                continue;
+            }
+            for pr in limits::script_problems(&s.root, &caps) {
+                if !seen.insert((name.clone(), path.clone(), pr.span.start)) {
+                    continue;
+                }
+                // the definition it is in, to go to
+                let def = f.defs.iter().enumerate().rfind(|(_, d)| d.span.contains(&pr.span.start)).map(|(i, d)| DefKey {
+                    pkg: name.clone(),
+                    file: path.clone(),
+                    kind: d.kind,
+                    id: d.id.clone(),
+                    nth: f.defs[..i].iter().filter(|x| x.kind == d.kind && x.id == d.id).count(),
+                });
+                found.push(Issue { severity: Severity::Warning, category: "values", pkg: name.clone(), file: path.clone(), line: script::line_of(text, pr.span.start), def, message: pr.message });
+            }
+        }
+    }
+    c.out.extend(found);
+}
+
+/// DLC and the stockpile, through every script of the content with the
+/// `has_dlc` checks around each line ([`super::dlc::walk`]):
+/// - `has_dlc` of a name that is no DLC (the closest one said);
+/// - technologies (`set_technology`) and models of equipment
+///   (`add_equipment_to_stockpile`, `create_equipment_variant`) that only
+///   players with a DLC (or without one) have, given outside a `has_dlc`
+///   check for it: No Step Back's tanks, the old tanks of those without it;
+/// - `add_equipment_to_stockpile` without a type or an amount, of what is
+///   not equipment, made by an unknown country;
+/// - the content's technologies in a research folder that does not exist,
+///   or that only some players see.
+fn dlcs(c: &mut Ctx) {
+    use super::dlc::{self, Need};
+    let known = dlc::known(c.base.map(|b| &b.files));
+    let db = c.units.clone();
+    let mut found: Vec<Issue> = Vec::new();
+    for (name, p) in &c.st.packages {
+        for (path, f) in &p.files {
+            let (Some(s), Some(text)) = (&f.script, f.text()) else { continue };
+            if !path.ends_with(".txt") {
+                continue;
+            }
+            let mut add = |sev: Severity, cat: &'static str, at: usize, m: String| {
+                found.push(Issue { severity: sev, category: cat, pkg: name.clone(), file: path.clone(), line: script::line_of(text, at), def: None, message: m });
+            };
+            let tags = |t: &str| c.tag_known(t);
+            dlc::walk(&s.root, &Need::default(), &mut |i, need| {
+                if i.is("has_dlc")
+                    && let Some(v) = i.text()
+                    && !known.contains(v)
+                    && !v.starts_with('[')
+                {
+                    match dlc::closest(v, &known) {
+                        Some(k) => add(Severity::Error, "dlc", i.span.start, format!("has_dlc = \"{v}\": no DLC is called that; did you mean \"{k}\"? (has_dlc takes the name exactly)")),
+                        None => add(Severity::Warning, "dlc", i.span.start, format!("has_dlc = \"{v}\" is not a DLC the game names nor one installed: a typo? (has_dlc takes the name exactly, as \"No Step Back\")")),
+                    }
+                }
+                let Some(db) = &db else { return };
+                // what only some players have, given to all
+                let mut given = |id: &str, at: usize, what: &str| {
+                    let n = db.need_of(id);
+                    if !n.is_empty() && !n.within(need) {
+                        let wher = if what == "technology" {
+                            let folders = db.techs.get(id).map(|t| t.folders.join(", ")).unwrap_or_default();
+                            format!("is in the research tree only for players {} (folder {folders})", n.describe())
+                        } else {
+                            format!("is a model only players {} get", n.describe())
+                        };
+                        add(Severity::Warning, "dlc", at, format!("{what} {id} {wher}: give it inside if = {{ limit = {{ {} }} }}, and the others theirs in an else, as the game's history does", n.trigger()));
+                    }
+                };
+                if i.is("set_technology")
+                    && let Some(b) = i.block()
+                {
+                    for t in &b.items {
+                        if let Some(k) = t.key.as_ref().filter(|k| k.text != "popup") {
+                            given(&k.text, t.span.start, "technology");
+                        }
+                    }
+                }
+                if (i.is("add_equipment_to_stockpile") || i.is("create_equipment_variant"))
+                    && let Some(b) = i.block()
+                    && let Some(ty) = b.get("type")
+                    && let Some(t) = ty.text()
+                {
+                    match db.equipment.get(t) {
+                        None if !t.starts_with('[') && !t.contains(':') => add(Severity::Error, "equipment", ty.span.start, format!("{} type = {t}: not equipment of the game or the mod", i.key())),
+                        Some(_) => given(t, ty.span.start, "equipment"),
+                        _ => {}
+                    }
+                }
+                if i.is("add_equipment_to_stockpile")
+                    && let Some(b) = i.block()
+                {
+                    if b.get("type").is_none() {
+                        add(Severity::Error, "equipment", i.span.start, "add_equipment_to_stockpile without type = <model of equipment>".into());
+                    }
+                    match b.get("amount") {
+                        None => add(Severity::Error, "equipment", i.span.start, "add_equipment_to_stockpile without amount = <how many>".into()),
+                        Some(a) if a.block().is_some() => add(Severity::Error, "equipment", a.span.start, "add_equipment_to_stockpile: amount is a number".into()),
+                        _ => {}
+                    }
+                    if let Some(p) = b.atom("producer")
+                        && super::kinds::is_tag(p)
+                        && !tags(p)
+                    {
+                        add(Severity::Warning, "tags", i.span.start, format!("add_equipment_to_stockpile: producer = {p}: no nation has the fixed tag {p} and the base game has no such tag"));
+                    }
+                }
+            });
+        }
+    }
+    // the content's technologies: where they show
+    if let Some(db) = &db
+        && !db.folders.is_empty()
+    {
+        for k in c.st.defs().filter(|k| k.kind == Kind::Technology).collect::<Vec<_>>() {
+            let Some((d, text, sc)) = c.st.def(&k) else { continue };
+            let Some(b) = d.block(sc) else { continue };
+            let line = script::line_of(text, d.span.start);
+            let folders: Vec<&str> = b.blocks("folder").filter_map(|f| f.atom("name")).collect();
+            for f in &folders {
+                if !db.folders.contains_key(*f) {
+                    found.push(Issue { severity: Severity::Warning, category: "technologies", pkg: k.pkg.clone(), file: k.file.clone(), line, def: Some(k.clone()), message: format!("technology {}: folder {f} is no research folder of the game or the mod (common/technology_tags): it shows nowhere", d.id) });
+                }
+            }
+            let need = db.tech_need(&d.id);
+            if !need.is_empty() && !folders.is_empty() {
+                found.push(Issue {
+                    severity: Severity::Info,
+                    category: "dlc",
+                    pkg: k.pkg.clone(),
+                    file: k.file.clone(),
+                    line,
+                    def: Some(k.clone()),
+                    message: format!("technology {} shows only for players {} (folder {})", d.id, need.describe(), folders.join(", ")),
+                });
+            }
+        }
+    }
+    c.out.extend(found);
+}
+
 /// Counts by severity.
 pub fn summary(issues: &[Issue]) -> (usize, usize, usize) {
     let n = |s| issues.iter().filter(|i| i.severity == s).count();
@@ -733,7 +1124,7 @@ mod tests {
         st.begin("x");
         st.set_text("TYR", "history/units/TYR_army.txt", "division_template = {\n\tname = \"Mot\"\n\tpriority = 5\n\tregiments = {\n\t\tinfantry = { x = 0 y = 0 }\n\t\tmotorized = { x = 1 y = 0 }\n\t}\n}\n".into());
         st.commit();
-        let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1].into()))].into(), provinces: 10, states: [1].into(), unpinned: 0 };
+        let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1].into()))].into(), provinces: 10, states: [1].into(), unpinned: 0, ..Default::default() };
         let msgs = |st: &Store| -> Vec<String> { validate(st, Some(&base), &facts).into_iter().filter(|i| i.category == "divisions").map(|i| format!("{}:{} {}", i.file, i.line, i.message)).collect() };
         assert_eq!(
             msgs(&st),
@@ -747,6 +1138,102 @@ mod tests {
         st.set_text("TYR", "history/countries/TYR.txt", "set_technology = { motorised_infantry = 1 }\n".into());
         st.commit();
         assert_eq!(msgs(&st), Vec::<String>::new());
+    }
+
+    /// DLC: technologies and models only some players have, given to all;
+    /// names has_dlc does not know; the stockpile; templates checked for
+    /// players with and without the DLC the history checks.
+    #[test]
+    fn numbers_the_game_allows() {
+        let mut st = Store::empty(std::env::temp_dir().join("mh-validate-values"));
+        st.begin("x");
+        st.set_text("TYR", "history/countries/TYR.txt", "set_stability = 1.5\nset_research_slots = 2.5\nset_war_support = 0.3\n1 = {\n\tadd_building_construction = { type = infrastructure level = 8 instant_build = yes }\n}\n".into());
+        st.set_text("TYR", "common/decisions/tyr.txt", "TYR_cat = {\n\tTYR_build = {\n\t\tcost = -5\n\t\tcomplete_effect = { add_stability = 5 }\n\t}\n}\n".into());
+        st.set_text("TYR", "common/ideas/tyr.txt", "ideas = {\n\tcountry = {\n\t\tTYR_spirit = { removal_cost = -1 }\n\t\tTYR_law = { removal_cost = -2 cost = @law_cost }\n\t}\n}\n".into());
+        st.commit();
+        let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1].into()))].into(), provinces: 10, states: [1].into(), unpinned: 0, ..Default::default() };
+        let got: Vec<String> = validate(&st, None, &facts).into_iter().filter(|i| i.category == "values").map(|i| format!("{}:{} {} [{}]", i.file, i.line, i.message, i.def.map(|d| d.id).unwrap_or_default())).collect();
+        assert_eq!(
+            got,
+            [
+                "common/decisions/tyr.txt:3 decision TYR_build: cost = -5: a number, 0 or more [TYR_build]",
+                "common/decisions/tyr.txt:4 add_stability = 5: from -1 to 1 [TYR_build]",
+                "common/ideas/tyr.txt:4 idea TYR_law: removal_cost = -2: -1 or a number, 0 or more [TYR_law]",
+                "history/countries/TYR.txt:1 country history TYR: set_stability = 1.5: from 0 to 1 [TYR]",
+                "history/countries/TYR.txt:2 country history TYR: set_research_slots = 2.5: a whole number, 0 or more [TYR]",
+                "history/countries/TYR.txt:5 add_building_construction level = 8: infrastructure goes to 5 at most in a state [TYR]",
+            ]
+        );
+    }
+
+    #[test]
+    fn dlc_and_stockpile_checks() {
+        use crate::content::source::{self, Files, Origin};
+        let files: std::collections::BTreeMap<String, std::sync::Arc<Vec<u8>>> = [
+            ("common/technology_tags/00_technology.txt", "technology_folders = {\n\tinfantry_folder = { ledger = army }\n\tarmour_folder = { available = { NOT = { has_dlc = \"No Step Back\" } } }\n\tnsb_armour_folder = { available = { has_dlc = \"No Step Back\" } }\n}\n"),
+            ("common/units/armor.txt", "sub_units = {\n\tinfantry = { group = infantry active = yes combat_width = 2 need = { infantry_equipment = 100 } }\n\tlight_armor = { group = armor active = no combat_width = 2 need = { light_tank_chassis = 60 } }\n}\n"),
+            (
+                "common/units/equipment/tanks.txt",
+                "equipments = {\n\tinfantry_equipment = { is_archetype = yes active = yes }\n\tinfantry_equipment_0 = { archetype = infantry_equipment active = yes }\n\tlight_tank_chassis = { is_archetype = yes soft_attack = 5 }\n\tlight_tank_equipment_1 = { archetype = light_tank_chassis year = 1934 }\n\tlight_tank_chassis_1 = { archetype = light_tank_chassis year = 1934 module_slots = inherit }\n}\n",
+            ),
+            (
+                "common/technologies/armor.txt",
+                "technologies = {\n\tbasic_light_tank = { folder = { name = armour_folder } enable_subunits = { light_armor } enable_equipments = { light_tank_equipment_1 } }\n\tnsb_light_tank = { folder = { name = nsb_armour_folder } enable_subunits = { light_armor } enable_equipments = { light_tank_chassis_1 } }\n}\n",
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), std::sync::Arc::new(v.as_bytes().to_vec())))
+        .collect();
+        let base = source::index("base", Origin::Base, Files::Memory(std::sync::Arc::new(files.into_iter().collect())), &|_| {}).unwrap();
+        let mut st = Store::empty(std::env::temp_dir().join("mh-validate-dlc"));
+        st.begin("x");
+        let history = "set_technology = { basic_light_tank = 1 }
+if = {
+	limit = { has_dlc = \"No Step Back\" }
+	set_technology = { nsb_light_tank = 1 }
+	add_equipment_to_stockpile = { type = light_tank_chassis_1 amount = 20 }
+}
+else = {
+	add_equipment_to_stockpile = { type = light_tank_equipment_1 amount = 20 }
+}
+add_equipment_to_stockpile = { type = light_tank_equipment_1 amount = 10 }
+add_equipment_to_stockpile = { type = tank_of_dreams amount = 5 producer = ZZZ }
+add_equipment_to_stockpile = { type = infantry_equipment_0 }
+";
+        st.set_text("TYR", "history/countries/TYR.txt", history.into());
+        st.set_text("TYR", "history/units/TYR_army.txt", "division_template = {\n\tname = \"Tanks\"\n\tregiments = {\n\t\tlight_armor = { x = 0 y = 0 }\n\t}\n}\n".into());
+        st.set_text("TYR", "common/scripted_effects/tyr.txt", "TYR_effect = { if = { limit = { has_dlc = \"No Step back\" } add_political_power = 1 } }\n".into());
+        st.set_text("TYR", "common/technologies/tyr.txt", "technologies = {\n\tTYR_tank = { folder = { name = nsb_armour_folder } }\n\tTYR_lost = { folder = { name = no_such_folder } }\n}\n".into());
+        st.commit();
+        let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1].into()))].into(), provinces: 10, states: [1].into(), unpinned: 0, ..Default::default() };
+        let msgs = |st: &Store| -> Vec<String> {
+            validate(st, Some(&base), &facts).into_iter().filter(|i| matches!(i.category, "dlc" | "equipment" | "divisions" | "technologies") || i.message.contains("producer")).map(|i| format!("{} {}:{} {}", i.severity.label(), i.file, i.line, i.message)).collect()
+        };
+        let m = msgs(&st);
+        let want = [
+            "warning history/countries/TYR.txt:1 technology basic_light_tank is in the research tree only for players without No Step Back (folder armour_folder): give it inside if = { limit = { NOT = { has_dlc = \"No Step Back\" } } }, and the others theirs in an else",
+            "warning history/countries/TYR.txt:10 equipment light_tank_equipment_1 is a model only players without No Step Back get",
+            "error history/countries/TYR.txt:11 add_equipment_to_stockpile type = tank_of_dreams: not equipment of the game or the mod",
+            "warning history/countries/TYR.txt:11 add_equipment_to_stockpile: producer = ZZZ: no nation has the fixed tag ZZZ",
+            "error history/countries/TYR.txt:12 add_equipment_to_stockpile without amount",
+            "error common/scripted_effects/tyr.txt:1 has_dlc = \"No Step back\": no DLC is called that; did you mean \"No Step Back\"?",
+            "note common/technologies/tyr.txt:2 technology TYR_tank shows only for players with No Step Back (folder nsb_armour_folder)",
+            "warning common/technologies/tyr.txt:3 technology TYR_lost: folder no_such_folder is no research folder",
+        ];
+        for w in want {
+            assert!(m.iter().any(|x| x.starts_with(w)), "missing {w:?} in\n{}", m.join("\n"));
+        }
+        assert_eq!(m.len(), want.len(), "the guarded lines are fine, and so is the template:\n{}", m.join("\n"));
+        // without the tank technology for the others, the template is for players with No Step Back only
+        st.begin("y");
+        st.set_text("TYR", "history/countries/TYR.txt", history.replace("set_technology = { basic_light_tank = 1 }\n", ""));
+        st.commit();
+        let m = msgs(&st);
+        assert!(
+            m.iter().any(|x| x.starts_with("error history/units/TYR_army.txt:4 division template Tanks: players without No Step Back: light_armor is not available to TYR at the start: it comes with basic_light_tank (only without No Step Back) or nsb_light_tank (only with No Step Back)")),
+            "{}",
+            m.join("\n")
+        );
     }
 
     #[test]
@@ -767,7 +1254,7 @@ mod tests {
         st.set_text("TYR", "localisation/english/bad.yml", "l_english:\n".into());
         st.set_text("BAD", "events/x.txt", "x = { \n".into());
         st.commit();
-        let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1, 2].into()))].into(), provinces: 100, states: [1, 2].into(), unpinned: 0 };
+        let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1, 2].into()))].into(), provinces: 100, states: [1, 2].into(), unpinned: 0, ..Default::default() };
         let issues = validate(&st, None, &facts);
         let msgs: Vec<String> = issues.iter().map(|i| format!("{} {}", i.severity.label(), i.message)).collect();
         let want = [
@@ -783,7 +1270,8 @@ mod tests {
             "error decision TYR_d: category no_category",
             "error capital = 77: the map has no state 77",
             "error location = 70000 is not a province",
-            "error division_template = \"Other\" is not defined",
+            "error a division: its template \"Other\" is not in this file",
+            "warning history/units/TYR_1936.txt: no oob or load_oob loads it",
             "warning fires event tyr.2, which is not defined",
             "warning add_ideas = TYR_none: no such idea",
             "error transfer_state = 999: the map has no such state",

@@ -13,7 +13,7 @@ use rustc_hash::FxHashMap;
 
 use crate::editor::{self, Editor};
 use crate::geo::{self, Crs, FileGeoInfo, GeoTransform, KNOWN_CRS};
-use crate::layers::{GeorefOverride, Layer, LayerConfig, LayerData, LayerKind, LayerState, RasterLayer};
+use crate::layers::{GeorefOverride, Known, Layer, LayerConfig, LayerData, LayerKind, LayerState, RasterLayer, Residency};
 use crate::osm;
 use crate::bundle;
 use crate::project::{self, ProjectFile, RASTER_EXTS};
@@ -575,10 +575,41 @@ impl App {
     fn add_layer(&mut self, cfg: LayerConfig, ctx: &egui::Context) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let mut layer = Layer { id, cfg, state: LayerState::Failed(String::new()) };
-        self.start_load(&mut layer, ctx);
+        let mut layer = Layer { id, cfg, state: LayerState::Unloaded, known: None };
+        // a hidden layer is read only when shown
+        if layer.cfg.visible {
+            self.start_load(&mut layer, ctx);
+        }
         self.layers.push(layer);
         id
+    }
+
+    /// Reads the layers that are shown and not in memory, and drops the
+    /// hidden ones (a failed one is tried again when shown again).
+    fn sync_loaded(&mut self, ctx: &egui::Context) {
+        let mut freed = false;
+        for i in 0..self.layers.len() {
+            let (visible, id) = (self.layers[i].cfg.visible, self.layers[i].id);
+            match self.layers[i].state.residency(visible) {
+                Residency::Load => {
+                    let mut l = self.layers.remove(i);
+                    self.start_load(&mut l, ctx);
+                    self.layers.insert(i, l);
+                }
+                Residency::Drop => {
+                    // a read still running is dropped when it ends
+                    *self.load_tokens.entry(id).or_insert(0) += 1;
+                    self.tiles.remove_layer(id);
+                    self.layers[i].state = LayerState::Unloaded;
+                    freed = true;
+                }
+                Residency::Retry => self.layers[i].state = LayerState::Unloaded,
+                Residency::Keep => {}
+            }
+        }
+        if freed {
+            util::release_freed_memory();
+        }
     }
 
     fn start_load(&mut self, layer: &mut Layer, ctx: &egui::Context) {
@@ -618,7 +649,9 @@ impl App {
             let Some(layer) = self.layers.iter_mut().find(|l| l.id == done.layer) else { continue };
             match done.result {
                 Ok(JobOutput::Raster(r, g)) => {
-                    layer.state = LayerState::Ready(LayerData::Raster(RasterLayer::new(r, g, &layer.cfg.raster_style)));
+                    let data = LayerData::Raster(RasterLayer::new(r, g, &layer.cfg.raster_style));
+                    layer.known = Some(Known::of(&data));
+                    layer.state = LayerState::Ready(data);
                 }
                 Ok(JobOutput::Vector(v)) => {
                     for &lvl in v.level_counts.keys() {
@@ -627,7 +660,9 @@ impl App {
                     for &w in v.water_counts.keys() {
                         layer.cfg.vector_style.water_mut(w);
                     }
-                    layer.state = LayerState::Ready(LayerData::Vector(v));
+                    let data = LayerData::Vector(v);
+                    layer.known = Some(Known::of(&data));
+                    layer.state = LayerState::Ready(data);
                 }
                 Err(e) => {
                     let name = layer.cfg.name.clone();
@@ -664,10 +699,11 @@ impl App {
                 continue;
             }
             let size = (r.width, r.height);
+            // also of a hidden layer read before
             let matched = self.layers.iter().filter(|o| o.id != l.id).find_map(|o| {
-                let or = o.raster()?;
+                let (w, h, _) = o.shape()?;
                 let g = o.georef()?;
-                ((or.width, or.height) == size && !g.source.starts_with("placed")).then(|| (g, o.cfg.name.clone()))
+                ((w, h) == size && !g.source.starts_with("placed")).then(|| (g, o.cfg.name.clone()))
             });
             let ov = match matched {
                 Some((g, name)) => GeorefOverride { transform: g.transform, crs: g.crs, note: format!("copied from {name} (same size)") },
@@ -694,14 +730,19 @@ impl App {
         let union = |it: &mut dyn Iterator<Item = [f64; 4]>| {
             it.reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
         };
-        union(&mut self.layers.iter().filter(|l| l.raster().is_some()).filter_map(|l| l.world_bounds(self.crs)))
+        union(&mut self.layers.iter().filter(|l| l.shape().is_some()).filter_map(|l| l.world_bounds(self.crs)))
             .or_else(|| union(&mut self.layers.iter().filter_map(|l| l.world_bounds(self.crs))))
     }
 
     fn zoom_to_layer(&mut self, id: u64) {
-        if let Some(b) = self.layer_index(id).and_then(|i| self.layers[i].world_bounds(self.crs)) {
+        let Some(i) = self.layer_index(id) else { return };
+        if let Some(b) = self.layers[i].world_bounds(self.crs) {
             self.cam.fit(self.map_rect, b);
             self.user_moved_view = true;
+        } else if self.layers[i].is_unloaded() {
+            // never read: show it, and frame it once it is
+            self.layers[i].cfg.visible = true;
+            self.zoom_to_on_load = Some(id);
         }
     }
 
@@ -805,7 +846,14 @@ impl App {
                 if let Some(i) = self.layer_index(id) {
                     self.tiles.remove_layer(id);
                     let mut l = self.layers.remove(i);
-                    self.start_load(&mut l, ctx);
+                    l.known = None;
+                    if l.cfg.visible {
+                        self.start_load(&mut l, ctx);
+                    } else {
+                        // read when shown
+                        *self.load_tokens.entry(id).or_insert(0) += 1;
+                        l.state = LayerState::Unloaded;
+                    }
                     self.layers.insert(i, l);
                 }
             }
@@ -1148,7 +1196,7 @@ impl App {
                             LayerState::Failed(e) => {
                                 ui.colored_label(Color32::from_rgb(255, 110, 110), "⚠").on_hover_text(e);
                             }
-                            LayerState::Ready(_) => {}
+                            LayerState::Unloaded | LayerState::Ready(_) => {}
                         }
                     });
                 }
@@ -1242,7 +1290,7 @@ impl App {
         }
         if let Some(id) = self.zoom_to_on_load {
             match self.layer_index(id).map(|i| &self.layers[i]) {
-                Some(l) if l.is_loading() => {}
+                Some(l) if l.is_loading() || (l.is_unloaded() && l.cfg.visible) => {}
                 Some(l) => {
                     if let Some(b) = l.world_bounds(self.crs) {
                         let v = self.cam.view_bounds(rect);
@@ -1455,6 +1503,18 @@ fn layer_properties(ui: &mut egui::Ui, layer: &mut Layer, others: &[(String, Geo
         LayerState::Failed(e) => {
             ui.colored_label(Color32::from_rgb(255, 110, 110), format!("Failed to load: {e}"));
         }
+        LayerState::Unloaded => {
+            match &layer.known {
+                Some(Known::Raster { width, height, format, bytes, .. }) => {
+                    ui.label(format!("{width} × {height} px · {format} · {} when shown", util::fmt_bytes(*bytes)));
+                }
+                Some(Known::Vector { summary, .. }) => {
+                    ui.label(summary);
+                }
+                None => {}
+            }
+            ui.label(RichText::new("Hidden, so not in memory: it is read when shown and dropped again when hidden.").small().weak());
+        }
         LayerState::Ready(LayerData::Raster(r)) => {
             ui.label(format!("{} × {} px · {} · {}", r.width, r.height, r.format, util::fmt_bytes(r.bytes)));
         }
@@ -1496,7 +1556,14 @@ fn layer_properties(ui: &mut egui::Ui, layer: &mut Layer, others: &[(String, Geo
     }
 
     if layer.cfg.kind == LayerKind::Raster && !layer.is_loading() {
-        egui::CollapsingHeader::new("Georeference").default_open(true).show(ui, |ui| georef_ui(ui, layer, others, project_crs));
+        egui::CollapsingHeader::new("Georeference").default_open(true).show(ui, |ui| {
+            if layer.is_unloaded() && layer.known.is_none() && layer.cfg.georef_override.is_none() {
+                // what the file says is known once it is read
+                ui.label(RichText::new("Not read yet: its georeference (if the file has one) shows once the layer is shown.").weak());
+            } else {
+                georef_ui(ui, layer, others, project_crs);
+            }
+        });
     }
 
     let Layer { cfg, state, .. } = layer;
@@ -1572,7 +1639,7 @@ fn layer_properties(ui: &mut egui::Ui, layer: &mut Layer, others: &[(String, Geo
 }
 
 fn georef_ui(ui: &mut egui::Ui, layer: &mut Layer, others: &[(String, GeorefOverride)], project_crs: Crs) {
-    let has_file_georef = layer.raster().is_some_and(|r| r.file_geo.transform.is_some());
+    let has_file_georef = layer.shape().is_some_and(|(_, _, g)| g.transform.is_some());
     match layer.georef() {
         Some(g) => {
             egui::Grid::new("georef").num_columns(2).show(ui, |ui| {
@@ -1666,6 +1733,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_jobs();
+        self.sync_loaded(&ctx);
         self.sync_styles();
         self.resolve_missing_georefs();
         if self.editor.settings.active || self.content.settings.active {

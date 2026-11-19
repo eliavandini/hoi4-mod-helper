@@ -50,6 +50,8 @@ pub struct FormState {
     jump: Option<usize>,
     /// The division designer of a division template.
     pub division: super::division::DesignerState,
+    /// The stockpile list of a country history.
+    pub stock: super::stockpile::StockState,
 }
 
 /// The field a picture is picked for.
@@ -93,21 +95,24 @@ pub fn list_sprite(cx: &Cx, key: &DefKey) -> Option<String> {
 // ---------------------------------------------------------------- small widgets
 
 /// A one-line field that keeps what is typed while it has focus; returns the
-/// text when it changed and `ok` accepts it.
-pub fn line_field(ui: &mut egui::Ui, id: egui::Id, current: &str, width: f32, hint: &str, ok: &dyn Fn(&str) -> bool) -> Option<String> {
+/// text when it changed and `ok` accepts it (else it says why, in red). A
+/// value already there that `ok` refuses is framed in red too.
+pub fn line_field(ui: &mut egui::Ui, id: egui::Id, current: &str, width: f32, hint: &str, ok: &dyn Fn(&str) -> Result<(), String>) -> Option<String> {
     let mut s: String = ui.data(|d| d.get_temp::<String>(id)).unwrap_or_else(|| current.to_string());
     let r = ui.add(egui::TextEdit::singleline(&mut s).id(id).desired_width(width).hint_text(hint));
     let good = ok(&s);
-    if r.has_focus() {
+    let focus = r.has_focus();
+    if focus {
         ui.data_mut(|d| d.insert_temp(id, s.clone()));
-        if !good {
-            r.clone().on_hover_text(RichText::new("not applied: not a valid value").color(ERR));
-            ui.painter().rect_stroke(r.rect, 2.0, egui::Stroke::new(1.0, ERR), egui::StrokeKind::Outside);
-        }
     } else {
         ui.data_mut(|d| d.remove::<String>(id));
     }
-    (r.changed() && good && s != current).then_some(s)
+    if let Err(why) = &good {
+        let msg = if focus { format!("not applied: {why}") } else { format!("not allowed: {why}") };
+        ui.painter().rect_stroke(r.rect, 2.0, egui::Stroke::new(1.0, ERR), egui::StrokeKind::Outside);
+        r.clone().on_hover_text(RichText::new(msg).color(ERR));
+    }
+    (r.changed() && good.is_ok() && s != current).then_some(s)
 }
 
 /// A block's contents in a code editor; returns the new contents when they
@@ -133,9 +138,6 @@ pub fn block_field(ui: &mut egui::Ui, id: egui::Id, current: &str, rows: usize) 
 
 fn is_word(s: &str) -> bool {
     !s.trim().is_empty() && !s.contains(['{', '}', '=', '#']) && !s.trim().contains(char::is_whitespace)
-}
-fn is_number(s: &str) -> bool {
-    s.trim().parse::<f64>().is_ok()
 }
 
 /// The value as written in script for a field type.
@@ -255,10 +257,29 @@ pub fn fields(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, list: &[Field], skip
                             }
                             (ty, Value::Atom(a)) => {
                                 let width = if matches!(ty, FieldType::Number | FieldType::State) { 80.0 } else { (ui.available_width() - 150.0).clamp(80.0, 260.0) };
-                                let ok: &dyn Fn(&str) -> bool = match ty {
-                                    FieldType::Number | FieldType::State => &is_number,
-                                    FieldType::Text | FieldType::File(_) => &|_: &str| true,
-                                    _ => &is_word,
+                                // what is there already and is not a number (`@cost`,
+                                // a variable) stays as it is; a number is checked
+                                let range = match ty {
+                                    FieldType::Number => crate::content::limits::of_field(key.kind, f.key),
+                                    FieldType::State => Some(crate::content::limits::POSITIVE),
+                                    _ => None,
+                                };
+                                let was = a.clone();
+                                let number = move |v: &str| {
+                                    if v == was && v.trim().parse::<f64>().is_err() {
+                                        return Ok(());
+                                    }
+                                    match range {
+                                        Some(r) => r.check_text(v),
+                                        None => v.trim().parse::<f64>().map(|_| ()).map_err(|_| "not a number".to_string()),
+                                    }
+                                };
+                                let was = a.clone();
+                                let word = move |v: &str| if v == was || is_word(v) { Ok(()) } else { Err("one word: no spaces, { } = or #".to_string()) };
+                                let ok: &dyn Fn(&str) -> Result<(), String> = match ty {
+                                    FieldType::Number | FieldType::State => &number,
+                                    FieldType::Text | FieldType::File(_) => &|_: &str| Ok(()),
+                                    _ => &word,
                                 };
                                 let mut new = line_field(ui, fid, &a, width, hint(ty), ok);
                                 // picked from a list, or on the map
@@ -692,6 +713,9 @@ pub fn def_editor(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, st: &mut FormSta
         Tab::Form => {
             if key.kind == Kind::DivisionTemplate {
                 super::division::designer(ui, cx, key, &mut st.division);
+            }
+            if key.kind == Kind::CountryHistory {
+                super::stockpile::panel(ui, cx, key, &mut st.stock);
             }
             preview(ui, cx, key);
             ui.add_space(6.0);

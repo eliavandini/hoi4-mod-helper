@@ -151,6 +151,8 @@ pub fn load_boundaries(path: &Path, progress: &Progress) -> Result<OsmBoundaries
                 }
                 if let Err(e) = std::fs::write(&cache, bytes) {
                     log::warn!("could not write cache {}: {e}", cache.display());
+                } else {
+                    drop_older_caches(&cache);
                 }
             }
             Err(e) => log::warn!("could not serialise cache: {e}"),
@@ -173,18 +175,36 @@ pub fn cache_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(|| std::env::home_dir().map(|h| h.join(".cache")))
         .map(|d| d.join("mod-helper"))
 }
 
 /// Cache file keyed by path, size and modification time of the PBF.
+/// Remove the caches of earlier versions of the same file (same name, other
+/// size or date): each is as big as the file's boundaries.
+/// shortcut: two .osm.pbf files of the same name in different folders take
+/// turns removing each other's cache; key the name by folder if that happens.
+fn drop_older_caches(cache: &Path) {
+    let (Some(dir), Some(name)) = (cache.parent(), cache.file_name().and_then(|n| n.to_str())) else { return };
+    // "osm-boundaries-<stem>-<16 hex digits>.bin"
+    let Some(prefix) = name.len().checked_sub(20).map(|n| &name[..n]) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let other = e.file_name();
+        let Some(o) = other.to_str() else { continue };
+        if o != name && o.len() == name.len() && o.starts_with(prefix) && o.ends_with(".bin") && o[prefix.len()..o.len() - 4].bytes().all(|b| b.is_ascii_hexdigit()) {
+            log::info!("removing the older cache {o}");
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 fn cache_path(path: &Path) -> Option<PathBuf> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let key = format!("{}|{}|{}|{}", canon.display(), meta.len(), mtime, CACHE_VERSION);
-    // FNV-1a: stable across Rust versions, unlike DefaultHasher.
-    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3));
+    let hash = crate::util::fnv1a(key.as_bytes());
     let stem = path.file_name()?.to_string_lossy().replace(".osm.pbf", "");
     Some(cache_dir()?.join(format!("osm-boundaries-{stem}-{hash:016x}.bin")))
 }
@@ -559,6 +579,22 @@ mod tests {
 
     fn tags<'a>(t: &'a [(&'a str, &'a str)]) -> impl Iterator<Item = (&'a str, &'a str)> {
         t.iter().copied()
+    }
+
+    #[test]
+    fn older_caches_go() {
+        let d = std::env::temp_dir().join(format!("mh-osm-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let names = ["osm-boundaries-alps-00000000000000aa.bin", "osm-boundaries-alps-00000000000000bb.bin", "osm-boundaries-alps-x-00000000000000cc.bin", "osm-boundaries-italy-00000000000000dd.bin", "notes.txt"];
+        for n in names {
+            std::fs::write(d.join(n), "x").unwrap();
+        }
+        drop_older_caches(&d.join(names[1]));
+        let mut left: Vec<String> = std::fs::read_dir(&d).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, [names[4], names[1], names[2], names[3]]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

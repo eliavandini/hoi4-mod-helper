@@ -113,11 +113,7 @@ fn absolute(path: &Path) -> PathBuf {
 /// of its path>`.
 pub fn work_root(path: &Path) -> PathBuf {
     let path = absolute(path);
-    // FNV-1a: stable across runs and versions
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in path.as_os_str().as_encoded_bytes() {
-        h = (h ^ *b as u64).wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    let h = util::fnv1a(path.as_os_str().as_encoded_bytes());
     let stem = path.file_name().map(|n| n.to_string_lossy().trim_end_matches(&format!(".{EXT}")).to_string()).unwrap_or_default();
     project::data_dir().join("projects").join(format!("{}-{h:016x}", crate::newproject::slug(&stem)))
 }

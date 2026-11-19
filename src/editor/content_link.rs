@@ -33,6 +33,9 @@ pub struct NationInfo {
 
 /// By province: sea or a lake of water (in [`StatePixels::province_state`]).
 pub const WATER: Id = Id::MAX;
+/// By province: no province has this id (it was deleted or merged; the map
+/// keeps its ids, see [`super::model::compact`]).
+pub const GONE: Id = Id::MAX - 1;
 
 /// What the state map of the content screen draws: the map's pixels and,
 /// by province, the state it is in.
@@ -40,10 +43,13 @@ pub const WATER: Id = Id::MAX;
 pub struct StatePixels {
     /// Province ids per pixel (the editor's: as the pixels are now).
     pub labels: Option<Arc<RwLock<Labels>>>,
-    /// By province id: its state, 0 for none, [`WATER`] for water.
+    /// By province id: its state, 0 for none, [`WATER`] for water, [`GONE`]
+    /// for an id with no province.
     pub province_state: Vec<Id>,
     /// By state: its nation.
     pub state_nation: BTreeMap<Id, Id>,
+    /// By province id: its name ("" for none).
+    pub province_names: Vec<String>,
 }
 
 impl std::fmt::Debug for StatePixels {
@@ -62,8 +68,35 @@ pub struct MapFacts {
     /// Why the tags could not be made (a bad tag of a nation).
     pub tag_error: Option<String>,
     pub pixels: StatePixels,
+    /// The naval bases of the map (the port tool of the supply level), by
+    /// province.
+    pub ports: Vec<PortInfo>,
+    /// The states with an air base (a building of the state).
+    pub airbases: Vec<AirbaseInfo>,
     /// The edit of the map these are of (it changes with every edit).
     pub version: u64,
+}
+
+/// A state with an air base: where air wings are.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AirbaseInfo {
+    pub state: Id,
+    pub level: u32,
+    pub name: String,
+    /// The tag of the nation that owns the state ("" for none).
+    pub tag: String,
+}
+
+/// A naval base of the map: where fleets are stationed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortInfo {
+    pub province: u32,
+    pub level: u8,
+    /// The province's name, else its state's.
+    pub name: String,
+    pub state: Id,
+    /// The tag of the nation that owns the state ("" for none).
+    pub tag: String,
 }
 
 impl Editor {
@@ -97,9 +130,10 @@ impl Editor {
             out.states.insert(id);
             out.state_names.insert(id, s.name.clone());
         }
-        let mut px = StatePixels { labels: Some(doc.labels.clone()), province_state: vec![0; d.provinces.cap()], ..Default::default() };
+        let mut px = StatePixels { labels: Some(doc.labels.clone()), province_state: vec![GONE; d.provinces.cap()], province_names: vec![String::new(); d.provinces.cap()], ..Default::default() };
         for (p, pr) in d.provinces.iter() {
             px.province_state[p as usize] = if pr.is_water() { WATER } else { pr.state };
+            px.province_names[p as usize] = pr.name.trim().to_string();
         }
         px.state_nation = d.states.iter().filter_map(|(id, s)| s.nation.map(|n| (id, n))).collect();
         out.pixels = px;
@@ -116,6 +150,23 @@ impl Editor {
                 language: n.language.clone(),
                 colour: n.color.unwrap_or_else(|| super::render::id_colour(id, 2)),
             });
+        }
+        for (id, s) in d.states.iter() {
+            let Some(level) = s.buildings.get("air_base").copied().filter(|l| *l > 0) else { continue };
+            let tag = s.nation.and_then(|n| out.nations.iter().find(|x| x.id == n)).map(|x| x.tag.clone()).unwrap_or_default();
+            out.airbases.push(AirbaseInfo { state: id, level, name: s.name.clone(), tag });
+        }
+        if !d.ports.is_empty() {
+            let lab = doc.labels.read();
+            let (ports, _) = super::supply::ports_at(&d.ports, |pt| super::supply::at_point(&lab, pt), |p| super::supply::coastal(d, &doc.stats, p));
+            for (p, level) in ports {
+                let Some(pr) = d.provinces.get(p) else { continue };
+                let state = pr.state;
+                let nation = d.states.get(state).and_then(|s| s.nation);
+                let tag = nation.and_then(|n| out.nations.iter().find(|x| x.id == n)).map(|x| x.tag.clone()).unwrap_or_default();
+                let name = if !pr.name.trim().is_empty() { pr.name.clone() } else { out.state_names.get(&state).cloned().unwrap_or_default() };
+                out.ports.push(PortInfo { province: p, level, name, state, tag });
+            }
         }
         Some(out)
     }

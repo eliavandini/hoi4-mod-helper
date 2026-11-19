@@ -8,7 +8,7 @@
 //! version of a file that is overwritten or deleted goes to
 //! `content/.backups/<time>/`, so a save never loses what was on disk.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -90,8 +90,9 @@ impl SrcFile {
 #[derive(Default)]
 pub struct Package {
     pub files: BTreeMap<String, SrcFile>,
-    /// Files deleted in this session that are on disk.
-    pub removed: BTreeSet<String>,
+    /// Files deleted in this session that are on disk, and what is on disk
+    /// (an undo puts the file back as it was known).
+    pub removed: BTreeMap<String, Body>,
 }
 
 impl Package {
@@ -299,7 +300,8 @@ impl Store {
     }
 
     fn record(&mut self, pkg: &str, path: &str, after: Option<(Body, bool)>) {
-        let before = self.file(pkg, path).map(|f| (f.body.clone(), f.bom));
+        // the bytes, not "as on disk": a save may delete or overwrite the file
+        let before = self.file(pkg, path).map(|f| (self.materialize(pkg, path, f), f.bom));
         let step = self.open.get_or_insert_with(|| Step { label: "Edit".into(), changes: Vec::new(), merge: None, at: Instant::now() });
         if let Some(c) = step.changes.iter_mut().find(|c| c.pkg == pkg && c.path == path) {
             c.after = after;
@@ -311,9 +313,16 @@ impl Store {
     fn put(&mut self, pkg: &str, path: &str, v: Option<(Body, bool)>) {
         self.generation += 1;
         match v {
-            Some((body, bom)) => {
+            Some((mut body, bom)) => {
+                // undo back to what is on disk: unchanged again
+                if let Body::Bytes(b) = &body
+                    && self.file(pkg, path).is_some_and(|f| f.disk == Some(Body::OnDisk))
+                    && std::fs::read(self.root.join(pkg).join(path)).is_ok_and(|d| d == **b)
+                {
+                    body = Body::OnDisk;
+                }
                 let p = self.packages.entry(pkg.to_string()).or_default();
-                p.removed.remove(path);
+                let disk = p.removed.remove(path);
                 match p.files.get_mut(path) {
                     Some(f) => {
                         f.body = body;
@@ -321,16 +330,17 @@ impl Store {
                         f.reparse(path);
                     }
                     None => {
-                        p.files.insert(path.to_string(), SrcFile::new(path, body, bom, None));
+                        // back after a delete: still on disk, still to be deleted if it goes again
+                        p.files.insert(path.to_string(), SrcFile::new(path, body, bom, disk));
                     }
                 }
             }
             None => {
                 if let Some(p) = self.packages.get_mut(pkg)
                     && let Some(f) = p.files.remove(path)
-                    && f.disk.is_some()
+                    && let Some(disk) = f.disk
                 {
-                    p.removed.insert(path.to_string());
+                    p.removed.insert(path.to_string(), disk);
                 }
             }
         }
@@ -478,7 +488,7 @@ impl Store {
             let dir = self.root.join(&name);
             let (dirty, removed): (Vec<String>, Vec<String>) = {
                 let p = &self.packages[&name];
-                (p.files.iter().filter(|(_, f)| f.dirty()).map(|(k, _)| k.clone()).collect(), p.removed.iter().cloned().collect())
+                (p.files.iter().filter(|(_, f)| f.dirty()).map(|(k, _)| k.clone()).collect(), p.removed.keys().cloned().collect())
             };
             for rel in removed.iter().chain(&dirty) {
                 let disk = dir.join(rel);
@@ -515,14 +525,25 @@ impl Store {
                 }
             }
             // a package left with no files: its folder goes (if empty)
+            remove_empty_dirs(&dir);
             if p.files.is_empty() {
-                remove_empty_dirs(&dir);
                 self.packages.remove(&name);
-            } else {
-                remove_empty_dirs(&dir);
             }
         }
-        // undo steps hold bodies; binary ones written to disk stay valid as bytes
+        // the last ten backups stay (as the map's); one that cannot go stays too
+        if n > 0
+            && let Ok(rd) = std::fs::read_dir(self.root.join(".backups"))
+        {
+            let mut old: Vec<PathBuf> = rd
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()).and_then(crate::editor::model::parse_timestamp).is_some())
+                .collect();
+            old.sort();
+            for d in &old[..old.len().saturating_sub(crate::editor::model::BACKUPS_KEPT)] {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
         if n > 0 {
             crate::bundle::touched();
         }
@@ -574,7 +595,8 @@ impl Store {
 fn remove_empty_dirs(dir: &Path) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
-            if e.path().is_dir() {
+            // not into .git and the like (git needs its empty refs/ folders)
+            if e.path().is_dir() && !e.file_name().to_string_lossy().starts_with('.') {
                 remove_empty_dirs(&e.path());
             }
         }
@@ -647,6 +669,21 @@ mod tests {
         assert!(st.file("TYR", "notes.txt").is_none());
         assert_eq!(st.can_undo(), Some("add event"));
 
+        // delete, undo, delete again: deleted on save (and unchanged in between)
+        st.begin("del");
+        st.remove("TYR", "events/a.txt");
+        st.commit();
+        st.undo();
+        assert!(st.file("TYR", "events/a.txt").unwrap().disk.is_some(), "back, and known to be on disk");
+        st.redo();
+        assert!(st.package("TYR").unwrap().removed.contains_key("events/a.txt"));
+        st.undo();
+        // replace an image and undo: unchanged
+        st.begin("replace");
+        st.set_bytes("TYR", "flag.tga", vec![9]);
+        st.commit();
+        st.undo();
+        assert!(!st.file("TYR", "flag.tga").unwrap().dirty());
         st.begin("remove");
         st.remove("TYR", "flag.tga");
         st.commit();
@@ -662,6 +699,21 @@ mod tests {
         let st2 = Store::load(&map).unwrap();
         assert_eq!(st2.defs_of(Some("TYR"), Kind::Event).len(), 2);
         assert!(st2.package(".backups").is_none());
+        // undo after the save: the removed image comes back with its bytes
+        assert_eq!(st.can_undo(), Some("remove"));
+        st.undo();
+        assert_eq!(st.bytes("TYR", "flag.tga").unwrap().as_slice(), &[1, 2, 3]);
+        st.save().unwrap();
+        assert_eq!(std::fs::read(map.join("content/TYR/flag.tga")).unwrap(), [1, 2, 3]);
+
+        // a package under git: its empty folders stay
+        std::fs::create_dir_all(map.join("content/TYR/.git/refs/heads")).unwrap();
+        st.begin("note");
+        st.set_text("TYR", "notes.txt", "x".into());
+        st.commit();
+        st.save().unwrap();
+        assert!(map.join("content/TYR/.git/refs/heads").is_dir());
+        std::fs::remove_dir_all(map.join("content/TYR/.git")).unwrap();
 
         // rename a package
         st.begin("rename");

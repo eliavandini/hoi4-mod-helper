@@ -35,7 +35,7 @@ fn data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".local/share"))
+        .unwrap_or_else(|| std::env::home_dir().unwrap_or_default().join(".local/share"))
 }
 
 impl GameInfo {
@@ -46,10 +46,12 @@ impl GameInfo {
         let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
         let exe = s("exePath").unwrap_or_else(|| "./run_hoi4".into());
         let args = v.get("exeArgs").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-        let user_dir = match s("gameDataPath") {
-            Some(p) => PathBuf::from(p.replace("$LINUX_DATA_HOME", &data_home().to_string_lossy())),
-            None => modbuild::default_mods_dir().parent().map(Path::to_path_buf).unwrap_or_default(),
-        };
+        let user_dir = s("gameDataPath")
+            .map(|p| p.replace("$LINUX_DATA_HOME", &data_home().to_string_lossy()))
+            // Windows and macOS name the Documents folder with placeholders of their own
+            .filter(|p| !p.contains(['$', '%']))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| modbuild::default_mods_dir().parent().map(Path::to_path_buf).unwrap_or_default());
         Ok(GameInfo { exe, args, version: s("rawVersion").unwrap_or_default(), user_dir })
     }
 }
@@ -719,6 +721,9 @@ mod tests {
         let mut child = start_game(&game, &info).unwrap();
         assert!(child.wait().unwrap().success());
         assert_eq!(std::fs::read_to_string(game.join("started.txt")).unwrap().trim(), format!("{} -gdpr-compliant", game.display()));
+        // a placeholder of another system: the default user folder
+        std::fs::write(game.join("launcher-settings.json"), r#"{"gameDataPath":"%USER_DOCUMENTS%/Paradox Interactive/Hearts of Iron IV"}"#).unwrap();
+        assert_eq!(GameInfo::read(&game).unwrap().user_dir, modbuild::default_mods_dir().parent().unwrap());
         let _ = std::fs::remove_dir_all(&game);
     }
 }

@@ -68,7 +68,7 @@ pub fn slug(name: &str) -> String {
 /// Where new projects go by default: `~/Documents/mod-helper/<name>.hoi4proj`
 /// (or `~/mod-helper/…` without a Documents folder).
 pub fn default_file(name: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home = std::env::home_dir().unwrap_or_default();
     let docs = home.join("Documents");
     let base = if docs.is_dir() { docs.join("mod-helper") } else { home.join("mod-helper") };
     base.join(format!("{}.{}", slug(name), bundle::EXT))

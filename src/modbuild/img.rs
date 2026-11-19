@@ -17,11 +17,16 @@ fn i32le(b: &[u8], o: usize) -> i32 {
     u32le(b, o) as i32
 }
 
+/// Written under another name first, then renamed: a failed write leaves the
+/// old file (the editor saves the painted terrain this way too).
 fn write_file(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).with_context(|| format!("cannot create {}", d.display()))?;
     }
-    std::fs::write(path, bytes).with_context(|| format!("cannot write {}", path.display()))
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))
 }
 
 // ------------------------------------------------------------------ BMP
@@ -162,13 +167,16 @@ pub fn write_bmp_gray(path: &Path, w: u32, h: u32, data: &[u8]) -> Result<()> {
 
 /// 24-bit bitmap from RGB triples (rows top-down).
 pub fn write_bmp24(path: &Path, w: u32, h: u32, rgb: &[u8]) -> Result<()> {
+    write_bmp24_by(path, w, h, |i| [rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]])
+}
+
+/// 24-bit bitmap with the colour `colour(i)` at pixel `i` (rows top-down).
+pub fn write_bmp24_by(path: &Path, w: u32, h: u32, colour: impl Fn(usize) -> [u8; 3] + Sync) -> Result<()> {
     let wu = w as usize;
     let bytes = bmp_bytes(w, h, 24, &[], |y, out| {
-        let s = &rgb[y * wu * 3..(y + 1) * wu * 3];
         for x in 0..wu {
-            out[3 * x] = s[3 * x + 2];
-            out[3 * x + 1] = s[3 * x + 1];
-            out[3 * x + 2] = s[3 * x];
+            let c = colour(y * wu + x);
+            out[3 * x..3 * x + 3].copy_from_slice(&[c[2], c[1], c[0]]);
         }
     });
     write_file(path, &bytes)

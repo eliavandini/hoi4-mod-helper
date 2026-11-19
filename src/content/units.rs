@@ -27,11 +27,19 @@
 //!
 //! Left out: doctrines, national spirits, generals, experience, and
 //! equipment designs of the nation (tanks use the game's default design).
+//!
+//! What a nation has at the start is what its history gives
+//! (`set_technology`, `add_equipment_to_stockpile`), for players with the
+//! DLCs its `has_dlc` checks name or without them ([`super::dlc`]): a
+//! template is checked for each (the checks that fail only for some say
+//! for whom). Research by year keeps to the technologies a player with the
+//! chosen DLCs sees (No Step Back has its own tank technologies).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+use super::dlc::{self, Need, Owned};
 use super::script::{Block, Script};
 use super::source::Index;
 use super::store::Store;
@@ -187,13 +195,103 @@ pub struct Equipment {
     /// Every nation has it.
     pub active: bool,
     pub stats: Stats,
-    /// Built of modules (tanks): slot → module of the default design.
+    /// Built of modules (tanks, ships): slot → module of the default design.
     pub modular: bool,
     pub default_modules: BTreeMap<String, String>,
+    /// Its own `module_slots` (None: none, or `inherit`: its parent's or
+    /// archetype's), slot by slot.
+    pub slots: Option<Vec<(String, SlotSrc)>>,
+    /// The model it follows (`parent`).
+    pub parent: Option<String>,
+    /// `type = screen_ship`: what it is in combat.
+    pub types: Vec<String>,
+    /// Resources one factory takes to make it.
+    pub resources: Stats,
+    /// `module_count_limit`: at most so many modules of a category (or one
+    /// module).
+    pub count_limits: Vec<CountLimit>,
+    /// The model of before the designer it stands for
+    /// (`derived_variant_name`, a plane's `variant_name` of its family):
+    /// `small_plane_airframe_1` → `fighter_equipment_1`.
+    pub legacy: Option<String>,
+    /// A plane family's types a design can take (`allowed_types`), by the
+    /// module of the slot `type_override` names.
+    pub allowed_types: Vec<String>,
+    pub type_override: Option<String>,
+    /// The upgrades of a model without designer (`upgrades = { ... }`).
+    pub upgrades: Vec<String>,
+    /// Made by the game from another family (`duplicate_archetypes`).
+    pub derived: bool,
+}
+
+/// A slot of a design: whether it must be filled and the categories of
+/// modules it takes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SlotDef {
+    pub required: bool,
+    pub categories: Vec<String>,
+}
+
+/// Where the definition of a slot of a model is.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SlotSrc {
+    Own(SlotDef),
+    /// `slot = inherit`: that of the model it follows.
+    Inherit,
+    /// `mid_2_custom_slot = mid_1_custom_slot`: as another slot.
+    Like(String),
+}
+
+/// `module_count_limit = { category = ship_radar count < 2 }`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CountLimit {
+    /// A category of modules, or one module.
+    pub of: String,
+    pub module: bool,
+    pub max: u32,
+}
+
+impl CountLimit {
+    fn read(b: &Block) -> Option<CountLimit> {
+        let (of, module) = match (b.atom("category"), b.atom("module")) {
+            (Some(c), _) => (c.to_string(), false),
+            (None, Some(m)) => (m.to_string(), true),
+            _ => return None,
+        };
+        let it = b.get("count")?;
+        let n: f64 = it.text()?.parse().ok()?;
+        let max = match it.op.as_ref().map(|o| o.0) {
+            Some(super::script::Op::Lt) => n - 1.0,
+            Some(super::script::Op::Le | super::script::Op::Eq) => n,
+            _ => return None,
+        };
+        Some(CountLimit { of, module, max: max.max(0.0) as u32 })
+    }
 }
 
 impl Equipment {
     fn read(id: &str, b: &Block) -> Equipment {
+        let slots = b.block("module_slots").map(|s| {
+            s.items
+                .iter()
+                .filter_map(|i| {
+                    let k = i.key.as_ref()?.text.clone();
+                    let def = match (i.block(), i.text()) {
+                        (Some(d), _) => SlotSrc::Own(SlotDef { required: d.yes("required"), categories: words(d.block("allowed_module_categories")) }),
+                        (None, Some(v)) if v != "inherit" => SlotSrc::Like(v.to_string()),
+                        _ => SlotSrc::Inherit,
+                    };
+                    Some((k, def))
+                })
+                .collect()
+        });
+        let types = match b.get("type") {
+            Some(i) => match i.block() {
+                Some(t) => t.values().map(String::from).collect(),
+                None => i.text().map(|t| vec![t.to_string()]).unwrap_or_default(),
+            },
+            None => Vec::new(),
+        };
         Equipment {
             id: id.to_string(),
             archetype: b.atom("archetype").map(String::from),
@@ -203,15 +301,107 @@ impl Equipment {
             stats: numbers(b),
             modular: b.get("module_slots").is_some(),
             default_modules: b.block("default_modules").map(|d| d.items.iter().filter_map(|i| Some((i.key.as_ref()?.text.clone(), i.text()?.to_string()))).collect()).unwrap_or_default(),
+            slots,
+            parent: b.atom("parent").map(String::from),
+            types,
+            resources: b.block("resources").map(numbers).unwrap_or_default(),
+            count_limits: b.blocks("module_count_limit").filter_map(CountLimit::read).collect(),
+            legacy: b.atom("derived_variant_name").map(String::from),
+            allowed_types: words(b.block("allowed_types")),
+            type_override: b.atom("type_override").map(String::from),
+            upgrades: words(b.block("upgrades")),
+            derived: false,
         }
     }
 }
 
-/// A module of a design (a tank's gun, engine, armour ...).
+/// `duplicate_archetypes = { small_plane_cas_airframe = { archetype =
+/// small_plane_airframe type = cas ... } }`: a family the game makes of
+/// another, with each of its models (`small_plane_airframe_1` →
+/// `small_plane_cas_airframe_1`).
+#[derive(Clone, Debug, Default)]
+pub struct Duplicate {
+    pub archetype: String,
+    pub types: Vec<String>,
+    /// Its own stats (over the family's).
+    pub stats: Stats,
+    /// `for_each = { air_superiority = { set = 1.25 } }`: set on each model.
+    pub set: Stats,
+    /// Model → the model of before the designer it stands for.
+    pub variant_names: BTreeMap<String, String>,
+}
+
+impl Duplicate {
+    fn read(b: &Block) -> Option<Duplicate> {
+        let types = match b.get("type") {
+            Some(i) => i.block().map(|t| t.values().map(String::from).collect()).or_else(|| i.text().map(|t| vec![t.to_string()])).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let set = b.block("for_each").map(|f| f.items.iter().filter_map(|i| Some((i.key.as_ref()?.text.clone(), i.block()?.num("set")?))).collect()).unwrap_or_default();
+        let variant_names = b.block("variant_name").map(|v| v.items.iter().filter_map(|i| Some((i.key.as_ref()?.text.clone(), i.text()?.to_string()))).collect()).unwrap_or_default();
+        Some(Duplicate { archetype: b.atom("archetype")?.to_string(), types, stats: numbers(b), set, variant_names })
+    }
+}
+
+/// A legacy model's upgrade (`common/units/equipment/upgrades`): how far it
+/// goes and what each level does to the stats (a fraction per level).
+#[derive(Clone, Debug, Default)]
+pub struct Upgrade {
+    pub max_level: u32,
+    pub stats: Stats,
+}
+
+/// A module of a design (a tank's gun, engine, armour, a ship's battery ...).
 #[derive(Clone, Debug, Default)]
 pub struct Module {
     pub add: Stats,
     pub multiply: Stats,
+    /// `add_average_stats`: the design gets the average of its modules'.
+    pub average: Stats,
+    pub category: String,
+    /// Manpower it adds (outside `add_stats`).
+    pub manpower: f64,
+    /// Resources it adds to the cost (`build_cost_resources`).
+    pub resources: Stats,
+    /// Categories of modules a design with it cannot have.
+    pub forbid: Vec<String>,
+    /// What it makes the design (`add_equipment_type = capital_ship`, `{
+    /// fighter heavy_fighter }`).
+    pub add_types: Vec<String>,
+    /// Its picture: `GFX_SMI_<gfx>` (else its id).
+    pub gfx: Option<String>,
+    /// The DLCs of the `limit` of its `equipment_modules` block (the planes'
+    /// modules are By Blood Alone's).
+    pub need: Need,
+    /// `mission_type_stats`: what it adds on some missions (a plane's bombs
+    /// weigh on close air support).
+    pub missions: Vec<(Vec<String>, Stats)>,
+}
+
+impl Module {
+    fn read(b: &Block) -> Module {
+        let st = |k: &str| b.block(k).map(numbers).unwrap_or_default();
+        Module {
+            add: st("add_stats"),
+            multiply: st("multiply_stats"),
+            average: st("add_average_stats"),
+            category: b.atom("category").unwrap_or("").to_string(),
+            manpower: b.num("manpower").unwrap_or(0.0),
+            resources: st("build_cost_resources"),
+            forbid: words(b.block("forbid_module_categories")),
+            add_types: match b.get("add_equipment_type") {
+                Some(i) => i.block().map(|t| t.values().map(String::from).collect()).or_else(|| i.text().map(|t| vec![t.to_string()])).unwrap_or_default(),
+                None => Vec::new(),
+            },
+            gfx: b.atom("gfx").map(String::from),
+            need: Need::default(),
+            missions: b.blocks("mission_type_stats").map(|m| (words(m.block("limit")), m.block("add_stats").map(numbers).unwrap_or_default())).collect(),
+        }
+    }
+    /// The sprite of its picture in the designer.
+    pub fn icon(&self, id: &str) -> String {
+        format!("GFX_SMI_{}", self.gfx.as_deref().unwrap_or(id))
+    }
 }
 
 /// A technology's bonus to the battalions of a type or a category.
@@ -231,7 +421,18 @@ pub struct Tech {
     pub focus_only: bool,
     pub subunits: Vec<String>,
     pub equipment: Vec<String>,
+    /// Modules of designs it unlocks (`enable_equipment_modules`).
+    pub modules: Vec<String>,
+    /// The technologies it leads to on the research screen (`path`).
+    pub leads_to: Vec<String>,
     pub bonuses: Vec<Bonus>,
+    /// The research folders it is in (`folder = { name = x }`).
+    pub folders: Vec<String>,
+    /// DLC checks of its `allow_branch`.
+    pub allow_branch: Need,
+    /// Its research categories (`categories = { infantry_weapons }`), what
+    /// research bonuses go to.
+    pub categories: Vec<String>,
 }
 
 /// Blocks of a technology that are not bonuses to units.
@@ -279,17 +480,28 @@ impl Tech {
             focus_only: b.block("allow").is_some_and(|a| a.atom("always") == Some("no")) || b.get("folder").is_none(),
             subunits: b.blocks("enable_subunits").flat_map(|e| e.values().map(String::from).collect::<Vec<_>>()).collect(),
             equipment: b.blocks("enable_equipments").flat_map(|e| e.values().map(String::from).collect::<Vec<_>>()).collect(),
+            modules: b.blocks("enable_equipment_modules").flat_map(|e| e.values().map(String::from).collect::<Vec<_>>()).collect(),
+            leads_to: b.blocks("path").filter_map(|p| p.atom("leads_to_tech").map(String::from)).collect(),
             bonuses,
+            folders: b.blocks("folder").filter_map(|f| f.atom("name").map(String::from)).collect(),
+            allow_branch: b.block("allow_branch").map(|a| dlc::of_trigger(a).0).unwrap_or_default(),
+            categories: b.blocks("categories").flat_map(|e| e.values().map(String::from).collect::<Vec<_>>()).collect(),
         }
     }
 }
 
-/// What a nation has: its technologies and what they unlock.
+/// What a nation has: its technologies and what they unlock, and the
+/// equipment in its stockpile.
 #[derive(Clone, Debug, Default)]
 pub struct Have {
     pub techs: BTreeSet<String>,
     pub units: BTreeSet<String>,
+    /// Models it can make (what its divisions get, with the stockpile's).
     pub equipment: BTreeSet<String>,
+    /// Modules of designs it can use.
+    pub modules: BTreeSet<String>,
+    /// The stockpile at the start: model → how many.
+    pub stock: BTreeMap<String, f64>,
 }
 
 /// The land units of the game and the mod.
@@ -302,6 +514,32 @@ pub struct UnitDb {
     /// Land terrains: (name, combat width, width added per further side
     /// attacked from).
     pub widths: Vec<(String, f64, f64)>,
+    /// Research folders and the DLCs a player needs to see them (No Step
+    /// Back's tanks, the tanks of those without it).
+    pub folders: BTreeMap<String, Need>,
+    /// Ships: the naval sub-units (`definition` of a ship in an order of
+    /// battle).
+    pub ships: BTreeMap<String, ShipUnit>,
+    /// Module → the technologies that unlock it (worked out when read).
+    pub module_techs: BTreeMap<String, Vec<String>>,
+    /// The families the game makes of others (`duplicate_archetypes`).
+    pub duplicates: BTreeMap<String, Duplicate>,
+    /// The upgrades of the models without designer.
+    pub upgrades: BTreeMap<String, Upgrade>,
+}
+
+/// A kind of ship (`destroyer`, `light_cruiser`, ...): what a ship of a
+/// naval order of battle is (`definition`), and the hulls it is built on.
+#[derive(Clone, Debug, Default)]
+pub struct ShipUnit {
+    pub id: String,
+    /// The equipment archetypes it needs (`ship_hull_cruiser`).
+    pub hulls: Vec<String>,
+    /// screen_ship, capital_ship, submarine, carrier.
+    pub types: Vec<String>,
+    /// `need_equipment_modules = { any = { ... } }`: a design needs one of
+    /// these modules to be this kind (a battleship's armour).
+    pub modules_any: Vec<String>,
 }
 
 /// The `id = { ... }` entries of the `key = { ... }` blocks of a file.
@@ -316,7 +554,7 @@ fn entries<'a>(root: &'a Block, key: &str) -> Vec<(&'a str, &'a Block)> {
 }
 
 /// Folders the units are read from.
-pub const FOLDERS: [&str; 5] = ["common/units", "common/units/equipment", "common/units/equipment/modules", "common/technologies", "common/terrain"];
+pub const FOLDERS: [&str; 7] = ["common/units", "common/units/equipment", "common/units/equipment/modules", "common/units/equipment/upgrades", "common/technologies", "common/terrain", "common/technology_tags"];
 
 impl UnitDb {
     /// What a file of the game or the mod defines (by its folder); a later
@@ -326,26 +564,73 @@ impl UnitDb {
         let dir = p.rsplit_once('/').map(|x| x.0).unwrap_or("");
         match dir {
             "common/units/equipment/modules" => {
-                for (id, b) in entries(&s.root, "equipment_modules") {
-                    let st = |k: &str| b.block(k).map(numbers).unwrap_or_default();
-                    self.modules.insert(id.to_string(), Module { add: st("add_stats"), multiply: st("multiply_stats") });
+                for block in s.root.items.iter().filter(|i| i.is("equipment_modules")).filter_map(|i| i.block()) {
+                    let need = block.block("limit").map(|l| dlc::of_trigger(l).0).unwrap_or_default();
+                    for i in &block.items {
+                        if let (Some(k), Some(b)) = (i.key.as_ref(), i.block())
+                            && k.text != "limit"
+                        {
+                            let mut m = Module::read(b);
+                            m.need = need.clone();
+                            self.modules.insert(k.text.clone(), m);
+                        }
+                    }
+                }
+            }
+            "common/units/equipment/upgrades" => {
+                for (id, b) in entries(&s.root, "upgrades") {
+                    let mut stats = numbers(b);
+                    stats.remove("max_level");
+                    self.upgrades.insert(id.to_string(), Upgrade { max_level: b.num("max_level").unwrap_or(0.0).max(0.0) as u32, stats });
                 }
             }
             "common/units/equipment" => {
                 for (id, b) in entries(&s.root, "equipments") {
                     self.equipment.insert(id.to_string(), Equipment::read(id, b));
                 }
+                for (id, b) in entries(&s.root, "duplicate_archetypes") {
+                    if let Some(d) = Duplicate::read(b) {
+                        self.duplicates.insert(id.to_string(), d);
+                    }
+                }
+                self.expand_duplicates();
             }
             "common/units" => {
                 for (id, b) in entries(&s.root, "sub_units") {
                     if SubUnit::is_land(b) {
                         self.subunits.insert(id.to_string(), SubUnit::read(id, b, content));
+                    } else if b.atom("map_icon_category") == Some("ship") || b.atom("map_icon_category") == Some("uboat") {
+                        let need = |k: &str| b.block(k).map(|n| n.items.iter().filter_map(|i| i.key.as_ref().map(|k| k.text.clone())).collect::<Vec<_>>()).unwrap_or_default();
+                        let mut hulls = need("need");
+                        hulls.extend(need("need_equipment"));
+                        let types = match b.get("type") {
+                            Some(i) => i.block().map(|t| t.values().map(String::from).collect()).or_else(|| i.text().map(|t| vec![t.to_string()])).unwrap_or_default(),
+                            None => Vec::new(),
+                        };
+                        let modules_any = b.block("need_equipment_modules").and_then(|m| m.block("any")).map(|a| a.items.iter().filter_map(|i| i.key.as_ref().map(|k| k.text.clone())).collect()).unwrap_or_default();
+                        self.ships.insert(id.to_string(), ShipUnit { id: id.to_string(), hulls, types, modules_any });
                     }
                 }
             }
             "common/technologies" => {
                 for (id, b) in entries(&s.root, "technologies") {
-                    self.techs.insert(id.to_string(), Tech::read(id, b));
+                    let t = Tech::read(id, b);
+                    for m in &t.modules {
+                        let v = self.module_techs.entry(m.clone()).or_default();
+                        if !v.contains(&t.id) {
+                            v.push(t.id.clone());
+                        }
+                    }
+                    self.techs.insert(id.to_string(), t);
+                }
+            }
+            "common/technology_tags" => {
+                for i in s.root.items.iter().filter(|i| i.is("technology_folders")) {
+                    for f in i.block().map(|b| b.items.as_slice()).unwrap_or_default() {
+                        if let (Some(k), Some(fb)) = (f.key.as_ref(), f.block()) {
+                            self.folders.insert(k.text.clone(), fb.block("available").map(|a| dlc::of_trigger(a).0).unwrap_or_default());
+                        }
+                    }
                 }
             }
             "common/terrain" => {
@@ -357,6 +642,50 @@ impl UnitDb {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// The families of `duplicate_archetypes` made: a copy of the family
+    /// (with its own type and stats) and of each of its models, named after
+    /// it (`small_plane_airframe_1` → `small_plane_cas_airframe_1`). Models
+    /// a file defines itself are kept.
+    pub fn expand_duplicates(&mut self) {
+        for (id, d) in &self.duplicates {
+            let Some(arch) = self.equipment.get(&d.archetype).cloned() else { continue };
+            let mut made: Vec<Equipment> = Vec::new();
+            let mut a = arch.clone();
+            a.id = id.clone();
+            a.is_archetype = true;
+            a.archetype = None;
+            a.derived = true;
+            a.legacy = None;
+            if !d.types.is_empty() {
+                a.types = d.types.clone();
+            }
+            a.stats.extend(d.stats.clone());
+            a.stats.extend(d.set.clone());
+            made.push(a);
+            let prefix = format!("{}_", d.archetype);
+            for e in self.equipment.values().filter(|e| !e.derived && !e.is_archetype && e.archetype.as_deref() == Some(d.archetype.as_str())) {
+                let Some(suffix) = e.id.strip_prefix(&prefix) else { continue };
+                let mut c = e.clone();
+                c.id = format!("{id}_{suffix}");
+                c.archetype = Some(id.clone());
+                c.parent = e.parent.as_deref().map(|p| p.strip_prefix(&prefix).map(|s| format!("{id}_{s}")).unwrap_or_else(|| p.to_string()));
+                c.derived = true;
+                c.legacy = d.variant_names.get(&c.id).cloned();
+                for (k, v) in &d.set {
+                    if let Some(x) = c.stats.get_mut(k) {
+                        *x = *v;
+                    }
+                }
+                made.push(c);
+            }
+            for e in made {
+                if self.equipment.get(&e.id).is_none_or(|x| x.derived) {
+                    self.equipment.insert(e.id.clone(), e);
+                }
+            }
         }
     }
 
@@ -390,23 +719,88 @@ impl UnitDb {
     pub fn have(&self, techs: BTreeSet<String>) -> Have {
         let mut units: BTreeSet<String> = self.subunits.values().filter(|u| u.active).map(|u| u.id.clone()).collect();
         let mut equipment: BTreeSet<String> = self.equipment.values().filter(|e| e.active).map(|e| e.id.clone()).collect();
+        // modules no technology unlocks: everyone's
+        let mut modules: BTreeSet<String> = self.modules.keys().filter(|m| !self.module_techs.contains_key(*m)).cloned().collect();
         for t in techs.iter().filter_map(|t| self.techs.get(t)) {
             units.extend(t.subunits.iter().cloned());
             equipment.extend(t.equipment.iter().cloned());
+            modules.extend(t.modules.iter().cloned());
         }
-        Have { techs, units, equipment }
+        Have { techs, units, equipment, modules, stock: BTreeMap::new() }
+    }
+
+    /// What a nation has at the start: what its history gives, for a
+    /// player with `owned` (None: every line of the history, whatever DLC
+    /// it checks).
+    pub fn at_start(&self, st: &Store, tag: &str, owned: Option<&Owned>) -> Have {
+        let mut h = self.have(start_techs(st, tag, owned));
+        h.stock = start_stock(st, tag, owned);
+        h
+    }
+
+    /// The DLCs a player needs (or must not have) to research a technology:
+    /// those of its folder (when all its folders agree) and `allow_branch`.
+    pub fn tech_need(&self, id: &str) -> Need {
+        let Some(t) = self.techs.get(id) else { return Need::default() };
+        let mut it = t.folders.iter().map(|f| self.folders.get(f).cloned().unwrap_or_default());
+        let folder = match it.next() {
+            Some(first) => it.fold(first, |a, b| a.common(&b)),
+            None => Need::default(),
+        };
+        // what every player has is no need
+        folder.and(&t.allow_branch).for_players()
+    }
+
+    /// The DLCs a player needs (or must not have) for a technology, a
+    /// battalion or a model: a battalion or model, what every technology
+    /// that unlocks it needs (nothing when every nation has it).
+    pub fn need_of(&self, id: &str) -> Need {
+        if self.techs.contains_key(id) {
+            return self.tech_need(id);
+        }
+        if self.subunits.get(id).is_some_and(|u| u.active) || self.equipment.get(id).is_some_and(|e| e.active) {
+            return Need::default();
+        }
+        let mut it = self.unlocked_by(id).into_iter().map(|t| self.tech_need(&t.id));
+        match it.next() {
+            Some(first) => it.fold(first, |a, b| a.common(&b)),
+            None => Need::default(),
+        }
+    }
+
+    /// The DLCs that change what can be researched: those research folders
+    /// and technologies check.
+    pub fn dlcs(&self) -> BTreeSet<String> {
+        self.folders.values().chain(self.techs.values().map(|t| &t.allow_branch)).flat_map(|n| n.names().cloned()).filter(|d| !dlc::integrated(d)).collect()
+    }
+
+    /// "Basic Light Tank (only without No Step Back) or Light Tank I (only
+    /// with No Step Back)": the technologies that unlock something.
+    pub fn unlocked_text(&self, ids: &[&str], name: &dyn Fn(&str) -> String, limit: usize) -> String {
+        let mut techs: Vec<&Tech> = ids.iter().flat_map(|i| self.unlocked_by(i)).collect();
+        techs.sort_by_key(|t| (t.focus_only, t.year.map(|y| y as i64), t.id.clone()));
+        techs.dedup_by_key(|t| t.id.clone());
+        let ts: Vec<&Tech> = if techs.iter().any(|t| !t.focus_only) { techs.into_iter().filter(|t| !t.focus_only).take(limit).collect() } else { techs.into_iter().take(limit).collect() };
+        let v: Vec<String> = ts
+            .iter()
+            .map(|t| {
+                let n = self.tech_need(&t.id);
+                if n.is_empty() { name(&t.id) } else { format!("{} (only {})", name(&t.id), n.describe()) }
+            })
+            .collect();
+        v.join(" or ")
     }
 
     /// The technologies that unlock a battalion or a model of equipment.
     pub fn unlocked_by(&self, id: &str) -> Vec<&Tech> {
-        self.techs.values().filter(|t| t.subunits.iter().any(|s| s == id) || t.equipment.iter().any(|s| s == id)).collect()
+        self.techs.values().filter(|t| t.subunits.iter().any(|s| s == id) || t.equipment.iter().any(|s| s == id) || t.modules.iter().any(|s| s == id)).collect()
     }
 
     /// The technologies up to a year (those of focuses and events left
-    /// out), with `start`.
-    pub fn up_to(&self, start: &BTreeSet<String>, year: u32) -> BTreeSet<String> {
+    /// out, and those a player with `owned` does not see), with `start`.
+    pub fn up_to(&self, start: &BTreeSet<String>, year: u32, owned: Option<&Owned>) -> BTreeSet<String> {
         let mut s = start.clone();
-        s.extend(self.techs.values().filter(|t| !t.focus_only && t.year.is_none_or(|y| y <= year as f64)).map(|t| t.id.clone()));
+        s.extend(self.techs.values().filter(|t| !t.focus_only && t.year.is_none_or(|y| y <= year as f64) && owned.is_none_or(|o| self.tech_need(&t.id).holds(o))).map(|t| t.id.clone()));
         s
     }
 
@@ -422,14 +816,15 @@ impl UnitDb {
     /// has of that archetype (or that very model), if any.
     pub fn best(&self, need: &str, have: &Have) -> Option<&Equipment> {
         let e = self.equipment.get(need)?;
+        let has = |id: &str| have.equipment.contains(id) || have.stock.get(id).is_some_and(|n| *n > 0.0);
         if !e.is_archetype {
-            return have.equipment.contains(need).then_some(e);
+            return has(need).then_some(e);
         }
         // the newest; of two of a year, the one with stats of its own (the
         // game's tanks without a design, as without No Step Back)
         self.equipment
             .values()
-            .filter(|v| !v.is_archetype && v.archetype.as_deref() == Some(need) && have.equipment.contains(&v.id))
+            .filter(|v| !v.is_archetype && v.archetype.as_deref() == Some(need) && has(&v.id))
             .max_by(|a, b| a.year.total_cmp(&b.year).then((!a.modular).cmp(&!b.modular)))
     }
 
@@ -638,31 +1033,112 @@ pub struct Problem {
 
 /// The technologies a nation starts with: those the build gives every
 /// nation, and the `set_technology` of its history in the content.
-pub fn start_techs(st: &Store, tag: &str) -> BTreeSet<String> {
+pub fn start_techs(st: &Store, tag: &str, owned: Option<&Owned>) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = crate::modbuild::START_TECHS.iter().map(|s| s.to_string()).collect();
-    if let Some(p) = st.package(tag) {
-        for (path, f) in &p.files {
-            if !path.starts_with("history/countries/") {
-                continue;
-            }
-            let Some(s) = &f.script else { continue };
-            s.root.walk(&mut |i, _| {
-                if i.is("set_technology")
-                    && let Some(b) = i.block()
+    history_lines(st, tag, &mut |i, need| {
+        if i.is("set_technology")
+            && owned.is_none_or(|o| need.holds(o))
+            && let Some(b) = i.block()
+        {
+            for it in &b.items {
+                if let (Some(k), Some(v)) = (it.key.as_ref(), it.text())
+                    && v != "0"
+                    && k.text != "popup"
                 {
-                    for it in &b.items {
-                        if let (Some(k), Some(v)) = (it.key.as_ref(), it.text())
-                            && v != "0"
-                            && k.text != "popup"
-                        {
-                            out.insert(k.text.clone());
-                        }
-                    }
+                    out.insert(k.text.clone());
                 }
-            });
+            }
+        }
+    });
+    out
+}
+
+/// The technologies each country of the game starts with (tag → ids): the
+/// `set_technology` of its history, in and out of its `has_dlc` checks,
+/// without the dated blocks of the later starts (`1939.1.1 = { ... }`).
+/// Read once per game.
+pub fn game_start_techs(base: &Index) -> Arc<BTreeMap<String, BTreeSet<String>>> {
+    type Cache = Option<((usize, usize), Arc<BTreeMap<String, BTreeSet<String>>>)>;
+    static CACHE: Mutex<Cache> = Mutex::new(None);
+    let key = (base as *const Index as usize, base.paths.len());
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((k, m)) = c.as_ref()
+        && *k == key
+    {
+        return m.clone();
+    }
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for path in base.files.list("history/countries", "txt", false) {
+        let tag: String = path.rsplit('/').next().unwrap_or("").chars().take(3).collect();
+        if tag.len() != 3 || !tag.chars().all(|c| c.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if let Some(text) = base.files.text(&path) {
+            set_technology_in(&Script::parse(&text).root, out.entry(tag.to_ascii_uppercase()).or_default());
         }
     }
+    let m = Arc::new(out);
+    *c = Some((key, m.clone()));
+    m
+}
+
+/// The technologies of the `set_technology` lines of a history, those in
+/// `if` / `else_if` / `else` too.
+fn set_technology_in(b: &Block, out: &mut BTreeSet<String>) {
+    for i in &b.items {
+        let Some(body) = i.block() else { continue };
+        if i.is("set_technology") {
+            for it in &body.items {
+                if let (Some(k), Some(v)) = (it.key.as_ref(), it.text())
+                    && v != "0"
+                    && k.text != "popup"
+                {
+                    out.insert(k.text.clone());
+                }
+            }
+        } else if i.is("if") || i.is("else_if") || i.is("else") {
+            set_technology_in(body, out);
+        }
+    }
+}
+
+/// The equipment a nation's history puts in its stockpile
+/// (`add_equipment_to_stockpile`), for a player with `owned` (None: all of
+/// it): model → how many.
+pub fn start_stock(st: &Store, tag: &str, owned: Option<&Owned>) -> BTreeMap<String, f64> {
+    let mut out: BTreeMap<String, f64> = BTreeMap::new();
+    history_lines(st, tag, &mut |i, need| {
+        if i.is("add_equipment_to_stockpile")
+            && owned.is_none_or(|o| need.holds(o))
+            && let Some(b) = i.block()
+            && let (Some(t), Some(n)) = (b.atom("type"), b.num("amount"))
+        {
+            *out.entry(t.to_string()).or_default() += n;
+        }
+    });
+    out.retain(|_, n| *n > 0.0);
     out
+}
+
+/// The DLCs the `has_dlc` checks of a nation's history name.
+pub fn history_dlcs(st: &Store, tag: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    history_lines(st, tag, &mut |_, need| out.extend(need.names().filter(|d| !dlc::integrated(d)).cloned()));
+    out
+}
+
+/// Each line of a nation's history (`history/countries`) that is about
+/// the nation itself (not another country's scope in it), with the DLCs
+/// it runs for.
+pub fn history_lines(st: &Store, tag: &str, f: &mut dyn FnMut(&super::script::Item, &Need)) {
+    let Some(p) = st.package(tag) else { return };
+    for (path, file) in &p.files {
+        if path.starts_with("history/countries/")
+            && let Some(s) = &file.script
+        {
+            dlc::walk_flow(&s.root, &Need::default(), f);
+        }
+    }
 }
 
 /// A group as said in the designer.
@@ -714,8 +1190,8 @@ impl UnitDb {
             }
             // the nation has it
             if !have.units.contains(&s.unit) {
-                let techs: Vec<String> = self.unlocked_by(&s.unit).iter().map(|t| name(&t.id)).collect();
-                let how = if techs.is_empty() { "no technology unlocks it".to_string() } else { format!("it comes with {}", techs.join(" or ")) };
+                let techs = self.unlocked_text(&[s.unit.as_str()], name, 3);
+                let how = if techs.is_empty() { "no technology unlocks it".to_string() } else { format!("it comes with {techs}") };
                 add(Severity::Error, format!("{n} is not available to {tag} at the start: {how} (give it in the nation's history: set_technology = {{ ... }})"), Some(i));
             }
             match s.section {
@@ -778,8 +1254,8 @@ impl UnitDb {
         for (e, i) in needs {
             if self.equipment.contains_key(e) && self.best(e, have).is_none() {
                 let models: Vec<&str> = self.equipment.values().filter(|m| m.archetype.as_deref() == Some(e) || m.id == e).map(|m| m.id.as_str()).collect();
-                let techs: BTreeSet<String> = models.iter().flat_map(|m| self.unlocked_by(m)).filter(|t| !t.focus_only).take(2).map(|t| name(&t.id)).collect();
-                let how = if techs.is_empty() { String::new() } else { format!(" (it comes with {})", techs.into_iter().collect::<Vec<_>>().join(" or ")) };
+                let techs = self.unlocked_text(&models, name, 2);
+                let how = if techs.is_empty() { String::new() } else { format!(" (it comes with {techs}, or put some in its stockpile)") };
                 add(Severity::Warning, format!("{tag} has no {} at the start: its divisions of this template start without it{how}", name(e)), Some(i));
             } else if !self.equipment.contains_key(e) {
                 add(Severity::Error, format!("{e} is not equipment of the game or the mod"), Some(i));
@@ -787,6 +1263,59 @@ impl UnitDb {
         }
         out
     }
+}
+
+impl UnitDb {
+    /// The checks of a template of a nation for players with and without
+    /// each DLC its history checks with `has_dlc` (each mix of up to three;
+    /// with more, all of them and none). A problem only some players have
+    /// says whom: "players without No Step Back: ...". `who` is the nation
+    /// as said in the messages.
+    pub fn check_for_players(&self, st: &Store, t: &Template, tag: &str, who: &str, name: &dyn Fn(&str) -> String) -> Vec<Problem> {
+        let rel: Vec<String> = history_dlcs(st, tag).into_iter().collect();
+        if rel.is_empty() {
+            return self.check(t, &self.at_start(st, tag, None), who, name);
+        }
+        let cases: Vec<Owned> = if rel.len() <= 3 {
+            (0..1usize << rel.len()).map(|m| rel.iter().enumerate().filter(|(i, _)| m >> i & 1 == 1).map(|(_, d)| d.clone()).collect()).collect()
+        } else {
+            vec![rel.iter().cloned().collect(), Owned::new()]
+        };
+        let mut found: Vec<(Problem, Vec<usize>)> = Vec::new();
+        for (ci, o) in cases.iter().enumerate() {
+            for p in self.check(t, &self.at_start(st, tag, Some(o)), who, name) {
+                match found.iter_mut().find(|(q, _)| q.message == p.message && q.slot == p.slot) {
+                    Some((_, v)) => v.push(ci),
+                    None => found.push((p, vec![ci])),
+                }
+            }
+        }
+        found
+            .into_iter()
+            .map(|(mut p, v)| {
+                if v.len() < cases.len() {
+                    p.message = format!("players {}: {}", for_whom(&rel, &cases, &v), p.message);
+                }
+                p
+            })
+            .collect()
+    }
+}
+
+/// Who the cases `v` of `cases` are: "with No Step Back", "without Man the
+/// Guns", else each mix.
+fn for_whom(rel: &[String], cases: &[Owned], v: &[usize]) -> String {
+    let set: BTreeSet<usize> = v.iter().copied().collect();
+    for d in rel {
+        if set == (0..cases.len()).filter(|i| cases[*i].contains(d)).collect() {
+            return format!("with {d}");
+        }
+        if set == (0..cases.len()).filter(|i| !cases[*i].contains(d)).collect() {
+            return format!("without {d}");
+        }
+    }
+    let mix = |o: &Owned| Need { with: rel.iter().filter(|d| o.contains(*d)).cloned().collect(), without: rel.iter().filter(|d| !o.contains(*d)).cloned().collect() }.describe();
+    v.iter().map(|i| mix(&cases[*i])).collect::<Vec<_>>().join("; ")
 }
 
 // ------------------------------------------------------------- division
@@ -955,6 +1484,14 @@ pub fn db(base: Option<&Index>, st: &Store) -> Arc<UnitDb> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_history_starts_with_its_technologies_not_those_of_later_starts() {
+        let s = Script::parse("set_technology = { infantry_weapons = 1 popup = no }\nif = { limit = { has_dlc = \"By Blood Alone\" } set_technology = { iw_small_airframe = 1 } }\nelse = { set_technology = { early_fighter = 1 } }\nset_technology = { gone = 0 }\n1939.1.1 = { set_technology = { infantry_weapons1 = 1 } }\n");
+        let mut out = BTreeSet::new();
+        set_technology_in(&s.root, &mut out);
+        assert_eq!(out, ["early_fighter", "infantry_weapons", "iw_small_airframe"].map(String::from).into());
+    }
+
     const UNITS: &str = "sub_units = {
 	infantry = {
 		abbreviation = \"INF\"
@@ -1108,7 +1645,7 @@ mod tests {
         assert!(h.units.contains("infantry") && h.units.contains("artillery_brigade") && !h.units.contains("engineer") && !h.units.contains("motorized"));
         assert_eq!(d.best("infantry_equipment", &h).map(|e| e.id.as_str()), Some("infantry_equipment_1"), "the newest model");
         assert!(d.best("motorized_equipment", &h).is_none());
-        let later = d.have(d.up_to(&h.techs, 1938));
+        let later = d.have(d.up_to(&h.techs, 1938, None));
         assert!(later.units.contains("motorized") && later.units.contains("engineer"));
         assert!(!later.techs.contains("secret") && !later.techs.contains("mass_assault"), "focus technologies are not counted by year");
         assert_eq!(d.years(), vec![1936, 1938]);
@@ -1126,7 +1663,7 @@ mod tests {
         assert_eq!(inf.get("max_organisation"), 60.0);
         let art = d.battalion(&d.subunits["artillery"], &h);
         assert_eq!(art.get("soft_attack"), 12.5, "the company's -50%");
-        let later = d.have(d.up_to(&h.techs, 1938));
+        let later = d.have(d.up_to(&h.techs, 1938, None));
         let mot = d.battalion(&d.subunits["motorized"], &later);
         assert_eq!(mot.get("maximum_speed"), 12.0, "its transport sets the speed");
         assert!((mot.get("hardness") - 0.1).abs() < 1e-9);
@@ -1135,7 +1672,7 @@ mod tests {
     #[test]
     fn a_division_adds_and_averages() {
         let d = db();
-        let h = d.have(d.up_to(&start(&d).techs, 1936));
+        let h = d.have(d.up_to(&start(&d).techs, 1936, None));
         let t = template(
             "division_template = {
 	name = \"Inf\"
@@ -1163,6 +1700,32 @@ mod tests {
         assert!((div.get("build_cost_ic") - (200.0 * 0.5 + 12.0 * 3.5 + 10.0 * 4.0)).abs() < 1e-9);
         // forest: infantry 0.1 averaged over 3 line battalions, engineers' 0.1 added
         assert!((div.terrain["forest"].attack - (0.2 / 3.0 + 0.1)).abs() < 1e-9);
+    }
+
+    /// Research by year keeps to what a player with these DLCs sees; the
+    /// stockpile equips divisions.
+    #[test]
+    fn dlc_folders_and_the_stockpile() {
+        let mut d = db();
+        d.read_file("common/technology_tags/00_technology.txt", &Script::parse("technology_folders = { infantry_folder = { } support_folder = { } artillery_folder = { } nsb_folder = { available = { has_dlc = \"No Step Back\" } } mtg_folder = { available = { has_dlc = \"Man the Guns\" } } }"), false);
+        d.read_file("common/technologies/x.txt", &Script::parse("technologies = { nsb_trucks = { folder = { name = nsb_folder } start_year = 1936 enable_equipments = { motorized_equipment_2 } } mtg_trucks = { folder = { name = mtg_folder } start_year = 1936 enable_equipments = { motorized_equipment_2 } } }"), false);
+        d.read_file("common/units/equipment/x.txt", &Script::parse("equipments = { motorized_equipment_2 = { year = 1938 archetype = motorized_equipment } }"), false);
+        assert_eq!(d.tech_need("nsb_trucks").describe(), "with No Step Back");
+        // Man the Guns is part of the game: every player has it
+        assert!(d.tech_need("mtg_trucks").is_empty());
+        assert!(d.need_of("motorized_equipment_2").is_empty(), "mtg_trucks unlocks it for everyone");
+        assert!(d.need_of("motorized_equipment_1").is_empty() && d.need_of("infantry_equipment_1").is_empty(), "unlocked by what every player sees");
+        assert_eq!(d.dlcs(), ["No Step Back".to_string()].into());
+        let start = start(&d).techs;
+        let none = Owned::new();
+        let nsb: Owned = ["No Step Back".to_string()].into();
+        assert!(!d.up_to(&start, 1936, Some(&none)).contains("nsb_trucks") && d.up_to(&start, 1936, Some(&nsb)).contains("nsb_trucks") && d.up_to(&start, 1936, None).contains("nsb_trucks"));
+        assert!(d.up_to(&start, 1936, Some(&none)).contains("mtg_trucks"));
+        // a model in the stockpile equips divisions without the technology
+        let mut h = d.have(start);
+        assert!(d.best("motorized_equipment", &h).is_none());
+        h.stock.insert("motorized_equipment_1".into(), 50.0);
+        assert_eq!(d.best("motorized_equipment", &h).map(|e| e.id.as_str()), Some("motorized_equipment_1"));
     }
 
     #[test]
@@ -1211,7 +1774,7 @@ mod tests {
             "error field_guns and field_guns on column 1 (x = 0): a column takes one regimental support company",
             "error field_guns is on column 5 (x = 4), which has no battalions",
             "warning column 1 (x = 0) mixes infantry and combat support: the game's designer keeps one group per column",
-            "warning TYR has no motorized_equipment at the start: its divisions of this template start without it (it comes with motorised_infantry)",
+            "warning TYR has no motorized_equipment at the start: its divisions of this template start without it (it comes with motorised_infantry, or put some in its stockpile)",
         ];
         for w in want {
             assert!(m.iter().any(|x| x == w), "missing {w:?} in\n{}", m.join("\n"));

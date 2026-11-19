@@ -399,9 +399,11 @@ fn load_bmp(path: &Path, progress: &Progress) -> Result<Raster> {
     if !(12..=1024).contains(&dib_size) {
         bail!("invalid BMP header size {dib_size}");
     }
-    let mut dib = vec![0u8; dib_size];
+    // shorter headers (OS/2 2.x: 16 to 64 bytes) leave the rest 0, which is
+    // what the missing fields mean
+    let mut dib = vec![0u8; dib_size.max(40)];
     dib[..4].copy_from_slice(&sz);
-    f.read_exact(&mut dib[4..])?;
+    f.read_exact(&mut dib[4..dib_size])?;
 
     let (width, height_signed, bpp, compression, clr_used, pal_entry) = if dib_size == 12 {
         (le_u16(&dib, 4) as i64, le_u16(&dib, 6) as i16 as i64, le_u16(&dib, 10), 0, 0, 3)
@@ -1053,6 +1055,30 @@ fn load_with_image_crate(path: &Path) -> Result<Raster> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A BMP with the 16-byte OS/2 2.x header reads (it ran past the header).
+    #[test]
+    fn short_bmp_header() {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"BM");
+        b.extend_from_slice(&(14u32 + 16 + 4).to_le_bytes());
+        b.extend_from_slice(&[0; 4]);
+        b.extend_from_slice(&(14u32 + 16).to_le_bytes());
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes()); // width
+        b.extend_from_slice(&1u32.to_le_bytes()); // height
+        b.extend_from_slice(&1u16.to_le_bytes()); // planes
+        b.extend_from_slice(&24u16.to_le_bytes());
+        b.extend_from_slice(&[30, 20, 10, 0]); // B G R + row padding
+        let p = std::env::temp_dir().join(format!("mh-short-{}.bmp", std::process::id()));
+        std::fs::write(&p, &b).unwrap();
+        let r = load_bmp(&p, &Progress::default());
+        let _ = std::fs::remove_file(&p);
+        let r = r.unwrap();
+        assert_eq!((r.width, r.height), (1, 1));
+        let Pixels::Rgb8(px) = &r.pixels else { panic!("{}", r.format) };
+        assert_eq!(px[..], [10, 20, 30]);
+    }
 
     #[test]
     fn colormap_endpoints() {

@@ -118,6 +118,7 @@ impl ImportState {
                 Src::Bundle(p) => source::of_bundle(p).map(|(i, m)| (i, Some(m))),
                 Src::Base | Src::Nation(_) => anyhow::bail!("not read here"),
             })();
+            crate::util::release_freed_memory();
             let _ = tx.send(r.map_err(|e| format!("{e:#}")));
             c.request_repaint();
         });

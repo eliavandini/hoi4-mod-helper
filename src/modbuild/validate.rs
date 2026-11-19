@@ -556,7 +556,10 @@ fn run(c: &mut Checker, md: &Path, g: &Path) -> Result<()> {
             let templates: HashSet<String> = re_oob_tmpl.captures_iter(&ot).map(|x| x[1].to_string()).collect();
             for x in re_div.captures_iter(&ot) {
                 let p: u32 = x[1].parse().unwrap_or(0);
-                c.check(state_prov.get(&p).is_some_and(|s| owned[t].contains(s)), || format!("{t}: division in province {p} it does not own"));
+                // the content's to decide (an occupied state, an ally's): said, not failed
+                if !state_prov.get(&p).is_some_and(|s| owned[t].contains(s)) {
+                    (c.log)(&format!("WARNING: {t}: division in province {p}, which it does not own"));
+                }
                 c.check(templates.contains(&x[2]), || format!("{t}: unknown template {}", &x[2]));
             }
         }

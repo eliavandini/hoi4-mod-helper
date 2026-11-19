@@ -228,6 +228,13 @@ const SKILLS: &[Part] = &[
     opt("specialization_nuclear", "Nuclear", One(Number), ""),
 ];
 const SCIENTIST: &[Part] = &[opt("traits", "Traits", PartTy::Words(Ref(Kind::ScientistTrait)), ""), need("skills", "Skill levels", Sub(SKILLS), ""), opt("visible", "Shown when", PartTy::Script(Role::Trigger), "")];
+/// A design (`create_equipment_variant`); its modules are kept as they
+/// are (the Navy page's ship designer fits them).
+const VARIANT: &[Part] = &[
+    need("name", "Name", One(Param::Text), "$ID Class"),
+    need("type", "Hull or model", One(Ref(Kind::Equipment)), "ship_hull_light_1"),
+    opt("obsolete", "Obsolete", One(YesNo), ""),
+];
 const PORTRAIT: &[Part] = &[opt("large", "Large", One(Param::Sprite), ""), opt("small", "Small", One(Param::Sprite), "")];
 const PORTRAITS: &[Part] = &[opt("civilian", "As a civilian", Sub(PORTRAIT), ""), opt("army", "In the army", Sub(PORTRAIT), ""), opt("navy", "In the navy", Sub(PORTRAIT), "")];
 const TEXT: &[Part] = &[opt("trigger", "When", PartTy::Script(Role::Trigger), ""), need("localization_key", "Text", One(Loc), "")];
@@ -260,6 +267,7 @@ pub fn shape_of(kind: Kind, key: &str) -> Option<Shape> {
         (K::Equipment, "resources") => weights(Param::Resource, "Resource", "How much", "Resources one factory takes to make it."),
         (K::CountryHistory, "set_autonomy") => Shape::Values(AUTONOMY),
         (K::CountryHistory, "diplomatic_relation") => Shape::Values(RELATION),
+        (K::CountryHistory, "create_equipment_variant") => Shape::Values(VARIANT),
         (K::CountryHistory, "set_variable") => weights(Word, "Variable", "Value", "Variables the country starts with."),
         (K::Character, "country_leader") => Shape::Values(LEADER),
         (K::Character, "corps_commander" | "field_marshal") => Shape::Values(GENERAL),
@@ -681,6 +689,11 @@ fn parts_problems(parts: &[Part], f: &Form, prefix: &str, out: &mut Vec<String>)
                 }
             }
             One(Number) if v.parse::<f64>().is_err() => out.push(format!("{}: a number", p.label)),
+            One(Number) => {
+                if let Some(Err(why)) = super::limits::of_part(p.key).map(|r| r.check_text(v)) {
+                    out.push(format!("{}: {why}", p.label));
+                }
+            }
             One(Date) if !is_date(v) => out.push(format!("{}: a date like 1936.1.1", p.label)),
             PartTy::Script(_) => {
                 if let Some(e) = Script::parse(v).errors.first() {
@@ -756,6 +769,19 @@ mod tests {
         f.vals.insert("trigger".into(), "has_war = {".into());
         let p = problems(&s, &f);
         assert!(p[0].contains("a number") && p[1].starts_with("When: line 1"), "{p:?}");
+        // numbers the game allows
+        f.vals.insert("x".into(), "1.5".into());
+        f.vals.insert("trigger".into(), "has_war = yes".into());
+        assert_eq!(problems(&s, &f), vec!["Moved across (x): a whole number".to_string()]);
+        let s = shape_of(Kind::CountryHistory, "set_autonomy").unwrap();
+        let mut f = read(&s, None, &fill());
+        f.vals.insert("target".into(), "TYR".into());
+        f.vals.insert("freedom_level".into(), "1.5".into());
+        assert_eq!(problems(&s, &f), vec!["Freedom (0 to 1): from 0 to 1".to_string()]);
+        let s = shape_of(Kind::Character, "corps_commander").unwrap();
+        let mut f = read(&s, None, &fill());
+        f.vals.insert("skill".into(), "0".into());
+        assert_eq!(problems(&s, &f), vec!["Skill: a whole number, 1 or more".to_string()]);
     }
 
     #[test]

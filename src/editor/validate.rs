@@ -3,8 +3,12 @@
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use std::sync::Arc;
+
+use super::density::Terrain;
 use super::doc::Doc;
-use super::model::{Id, Index, Kind, Labels, MapData, Stats};
+use super::model::{Id, Index, Kind, Labels, MapData, State, Stats};
+use crate::modbuild::buildings::{self, Caps};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -31,6 +35,10 @@ pub struct Snapshot {
     pub index: Index,
     pub w: u32,
     pub h: u32,
+    /// For the built-up land of the states (their automatic category).
+    pub terrain: Option<Arc<Terrain>>,
+    /// What the game allows of buildings.
+    pub caps: Arc<Caps>,
 }
 
 impl Snapshot {
@@ -42,7 +50,24 @@ impl Snapshot {
             index: doc.index.clone(),
             w: doc.w,
             h: doc.h,
+            terrain: doc.terrain.clone(),
+            caps: buildings::current(),
         }
+    }
+}
+
+/// A state touches the sea (dockyards and naval bases need that).
+pub fn on_coast(d: &MapData, stats: &Stats, provs: &[Id]) -> bool {
+    provs.iter().any(|&p| stats.neighbours(p).iter().any(|&o| d.kind(o) == Kind::Sea))
+}
+
+/// The category a state has: its own, else the build's automatic one by
+/// its built-up km² (None: the terrain is not loaded to tell).
+pub fn category_of(s: &State, urban_km2: Option<f64>) -> Option<String> {
+    match s.category.as_deref().filter(|c| !c.is_empty()) {
+        Some(c) => Some(c.to_string()),
+        None if s.impassable => Some("wasteland".into()),
+        None => urban_km2.map(|u| crate::modbuild::auto_category(false, u).to_string()),
     }
 }
 
@@ -155,6 +180,7 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
             st_regions.entry(pr.state).or_default().insert(pr.region);
         }
     }
+    let sealed = doc.terrain.as_ref().map(|t| super::doc::sealed_per_province(t, &doc.labels, d));
     for (s, st) in d.states.iter() {
         let provs = doc.index.provs_of_state(s);
         let first = provs.first().copied();
@@ -194,6 +220,21 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
                 out.push(Issue { severity: Severity::Error, msg: format!("victory point of state {} is in a province outside it", st.name), at: None, prov: first });
             }
         }
+        // what the game allows of its buildings
+        let caps = &doc.caps;
+        if let Some(c) = st.category.as_deref().filter(|c| !c.is_empty())
+            && caps.slots(c).is_none()
+        {
+            out.push(Issue { severity: Severity::Error, msg: format!("state {} ({s}): the game has no state category {c}", st.name), at: None, prov: first });
+        }
+        let urban = sealed.as_ref().map(|u| provs.iter().map(|&p| u.get(p as usize).copied().unwrap_or(0.0)).sum::<f64>());
+        let cat = category_of(st, urban).filter(|c| caps.slots(c).is_some());
+        for p in caps.problems(&st.buildings, cat.as_deref(), on_coast(d, &doc.stats, provs)) {
+            out.push(Issue { severity: Severity::Error, msg: format!("state {} ({s}): {p}", st.name), at: None, prov: first });
+        }
+        if let Some(p) = cat.as_deref().and_then(|c| caps.slot_problem(&st.buildings, c)) {
+            out.push(Issue { severity: Severity::Warning, msg: format!("state {} ({s}): {p}", st.name), at: None, prov: first });
+        }
     }
     // nations
     let mut tags: FxHashMap<String, Id> = FxHashMap::default();
@@ -210,7 +251,7 @@ pub fn validate(doc: &Snapshot) -> Vec<Issue> {
         if let Some(o) = cap.and_then(|c| c.occupier()) {
             out.push(Issue {
                 severity: Severity::Warning,
-                msg: format!("the capital of {} is occupied by {}: its starting divisions are placed there; pick another capital", nat.name, d.nation_name(o)),
+                msg: format!("the capital of {} is occupied by {}: it starts without its capital in its hands; pick another capital", nat.name, d.nation_name(o)),
                 at: None,
                 prov: doc.index.provs_of_state(nat.capital_state).first().copied(),
             });

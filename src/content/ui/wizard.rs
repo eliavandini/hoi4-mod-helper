@@ -101,6 +101,8 @@ pub struct WizardState {
     first: Vec<String>,
     pops: BTreeMap<String, f32>,
     politics: [String; 4],
+    /// A stockpile line: model, amount, producer, design.
+    stock: [String; 4],
     category: String,
     bonus: String,
     battalion: String,
@@ -114,6 +116,119 @@ pub struct WizardState {
     form: sh::Form,
     /// The part of the form being built with a catalog: (path, label).
     part: (String, String),
+    /// The filters of the technologies' page.
+    techf: TechFilter,
+}
+
+/// What the technologies' page lists.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct TechFilter {
+    /// The research tab (`folder`): "" any, [`NO_TAB`] those on none.
+    tab: String,
+    /// A category, or part of its id ("" any).
+    category: String,
+    /// The years (0: no bound); `dated`: leave out those without a year.
+    from: i32,
+    to: i32,
+    dated: bool,
+    /// A country: the technologies it starts with, or (`lacks`) those it
+    /// does not.
+    country: String,
+    lacks: bool,
+    /// "" any, [`EVERY`] every player's, [`NO_ONE`] no player's now,
+    /// "+X" only with DLC X, "-X" only without it.
+    dlc: String,
+    show: Show,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Show {
+    #[default]
+    All,
+    Ticked,
+    Unticked,
+}
+
+const NO_TAB: &str = "-";
+const EVERY: &str = "=";
+const NO_ONE: &str = "!";
+
+/// A technology as the filters see it.
+struct TechRow<'a> {
+    id: &'a str,
+    /// The words searched: name and id.
+    text: &'a str,
+    tech: Option<&'a crate::content::units::Tech>,
+    /// What a player needs to research it (its tab's DLC and its own).
+    need: crate::content::dlc::Need,
+    ticked: bool,
+}
+
+impl TechFilter {
+    fn shown(&self, r: &TechRow, words: &[String], country: Option<&BTreeSet<String>>) -> bool {
+        let hay = r.text.to_lowercase();
+        if !words.iter().all(|w| hay.contains(w.as_str())) {
+            return false;
+        }
+        match self.show {
+            Show::Ticked if !r.ticked => return false,
+            Show::Unticked if r.ticked => return false,
+            _ => {}
+        }
+        let folders = r.tech.map(|t| t.folders.as_slice()).unwrap_or_default();
+        if self.tab == NO_TAB && !folders.is_empty() || !self.tab.is_empty() && self.tab != NO_TAB && !folders.contains(&self.tab) {
+            return false;
+        }
+        let cat = self.category.trim().to_lowercase();
+        if !cat.is_empty() && !r.tech.is_some_and(|t| t.categories.iter().any(|c| c.to_lowercase().contains(&cat))) {
+            return false;
+        }
+        match r.tech.and_then(|t| t.year) {
+            Some(y) => {
+                let y = y as i32;
+                if self.from > 0 && y < self.from || self.to > 0 && y > self.to {
+                    return false;
+                }
+            }
+            None if self.dated => return false,
+            None => {}
+        }
+        if let Some(c) = country
+            && c.contains(r.id) == self.lacks
+        {
+            return false;
+        }
+        let dead = r.need.without.iter().any(|d| crate::content::dlc::integrated(d));
+        match self.dlc.as_str() {
+            "" => true,
+            EVERY => r.need.is_empty(),
+            NO_ONE => dead,
+            d => match d.split_at(1) {
+                ("+", n) => r.need.with.contains(n),
+                ("-", n) => !dead && r.need.without.contains(n),
+                _ => true,
+            },
+        }
+    }
+
+    /// Set from `key=value;key=value` (screenshots and tests).
+    fn set(&mut self, spec: &str) {
+        for kv in spec.split(';') {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            match k {
+                "tab" => self.tab = v.into(),
+                "category" => self.category = v.into(),
+                "from" => self.from = v.parse().unwrap_or(0),
+                "to" => self.to = v.parse().unwrap_or(0),
+                "dated" => self.dated = v != "no",
+                "country" => self.country = v.into(),
+                "lacks" => self.lacks = v != "no",
+                "dlc" => self.dlc = v.into(),
+                "show" => self.show = match v { "ticked" => Show::Ticked, "unticked" => Show::Unticked, _ => Show::All },
+                _ => {}
+            }
+        }
+    }
 }
 
 impl WizardState {
@@ -134,6 +249,10 @@ impl WizardState {
     /// Show a page and pick an entry by name (`trigger`, `trigger=has_war`; for screenshots and tests).
     pub fn show_page(&mut self, spec: &str) {
         let (page, pick) = spec.split_once('=').map(|(a, b)| (a, Some(b))).unwrap_or((spec, None));
+        if page == "techs" {
+            self.techf.set(pick.unwrap_or(""));
+            return;
+        }
         self.page = Some(match page {
             "effect" => Role::Effect,
             "trigger" => Role::Trigger,
@@ -463,6 +582,9 @@ fn init(cx: &Cx, ws: &mut WizardState, t: &Target) {
         Role::Regiments => ws.battalion = "infantry".into(),
         Role::Support => ws.battalion = "engineer".into(),
         Role::RegimentalSupport => ws.battalion = "field_guns".into(),
+        Role::Stockpile => {
+            ws.stock = [atom("type").unwrap_or_else(|| "infantry_equipment_1".into()), atom("amount").unwrap_or_else(|| "1000".into()), atom("producer").unwrap_or_default(), atom("variant_name").unwrap_or_default()];
+        }
         _ => {}
     }
     ws.first = if t.role.is_shape() { ws.form.words.clone() } else { ws.picks.clone() };
@@ -856,7 +978,7 @@ fn detail(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, page: Role) {
                     ws.values[i] = v;
                 });
             }
-            let problem = wz::missing(&item, &ws.values);
+            let problem = wz::missing(&item, &ws.values, &crate::modbuild::buildings::for_game(cx.game));
             let mut line = wz::render(&item, &ws.values);
             if page == Role::Trigger {
                 ui.checkbox(&mut ws.negate, "the opposite (NOT)");
@@ -998,6 +1120,232 @@ fn tick_list(ui: &mut egui::Ui, id: &str, items: &[(String, String)], picks: &mu
     });
 }
 
+/// The technologies a country starts with: a nation of the content by
+/// its history, a country of the game by the game's.
+fn country_techs(cx: &Cx, tag: &str) -> Option<BTreeSet<String>> {
+    let mine = cx.st.package(tag).is_some_and(|p| p.files.keys().any(|f| f.starts_with("history/countries/")));
+    if mine {
+        return Some(crate::content::units::start_techs(cx.st, tag, None));
+    }
+    cx.base.and_then(|b| crate::content::units::game_start_techs(b).get(tag).cloned())
+}
+
+/// A research tab or category by its name in the game.
+fn tech_label(cx: &Cx, id: &str) -> String {
+    cx.shown_text(id).map(|t| crate::content::loc::plain(&t)).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| id.replace('_', " "))
+}
+
+/// The technologies' page: the list with its filters.
+fn tech_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState) {
+    use crate::content::dlc;
+    ui.label(RichText::new("Tick the technologies the country starts with. The filters narrow the list, and \"tick the shown\" ticks what it shows: all of a research tab up to a year, all a country of the game starts with.").weak());
+    let db = crate::content::units::db(cx.base, cx.st);
+    let items = list(cx, &mut ws.lists, Param::Ref(Kind::Technology));
+    let tags: Arc<Vec<(String, String)>> = Arc::new(list(cx, &mut ws.lists, Param::Tag).iter().filter(|(_, l)| l != "scope").cloned().collect());
+    // what the filters offer
+    let mut tabs: BTreeMap<String, dlc::Need> = BTreeMap::new();
+    let mut years: BTreeSet<i32> = BTreeSet::new();
+    let mut dlcs: BTreeSet<String> = BTreeSet::new();
+    for (id, t) in &db.techs {
+        for f in &t.folders {
+            tabs.entry(f.clone()).or_insert_with(|| db.folders.get(f).cloned().unwrap_or_default());
+        }
+        years.extend(t.year.map(|y| y as i32));
+        let n = db.tech_need(id);
+        dlcs.extend(n.with.iter().map(|d| format!("+{d}")));
+        dlcs.extend(n.without.iter().filter(|d| !dlc::integrated(d)).map(|d| format!("-{d}")));
+    }
+    let tab_text = |cx: &Cx, f: &str| -> String {
+        if f.is_empty() {
+            return "any".into();
+        }
+        if f == NO_TAB {
+            return "none (focuses and events give it)".into();
+        }
+        let n = tabs.get(f).cloned().unwrap_or_default();
+        let name = tech_label(cx, f);
+        if n.without.iter().any(|d| dlc::integrated(d)) {
+            format!("{name} (before {}, no player's now)", n.without.iter().find(|d| dlc::integrated(d)).cloned().unwrap_or_default())
+        } else if n.for_players().is_empty() {
+            name
+        } else {
+            format!("{name} ({})", n.for_players().describe())
+        }
+    };
+    let dlc_text = |d: &str| -> String {
+        match d {
+            "" => "any".into(),
+            EVERY => "every player's".into(),
+            NO_ONE => "no player's now (before a DLC every player has)".into(),
+            _ => match d.split_at(1) {
+                ("+", n) => format!("only with {n}"),
+                (_, n) => format!("only without {n}"),
+            },
+        }
+    };
+    let year_text = |y: i32| if y == 0 { "any".to_string() } else { y.to_string() };
+    let f = &mut ws.techf;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("🔍");
+        ui.add(egui::TextEdit::singleline(&mut ws.search).desired_width(180.0).hint_text("name or id"));
+        ui.separator();
+        ui.label("Research tab").on_hover_text("The tab of the research screen it is on (its folder)");
+        egui::ComboBox::from_id_salt("tech_tab").selected_text(tab_text(cx, &f.tab)).width(170.0).show_ui(ui, |ui| {
+            ui.selectable_value(&mut f.tab, String::new(), "any");
+            for t in tabs.keys() {
+                ui.selectable_value(&mut f.tab, t.clone(), tab_text(cx, t));
+            }
+            ui.selectable_value(&mut f.tab, NO_TAB.to_string(), tab_text(cx, NO_TAB));
+        });
+        ui.label("Category").on_hover_text("Its research category (infantry_weapons, cat_heavy_armor, radar_tech ...), what research bonuses go to; part of the id is enough");
+        let cats = || {
+            let mut c: BTreeMap<&str, usize> = BTreeMap::new();
+            for t in db.techs.values() {
+                for x in &t.categories {
+                    *c.entry(x.as_str()).or_default() += 1;
+                }
+            }
+            Arc::new(c.into_iter().map(|(k, n)| (k.to_string(), format!("{} · {n}", tech_label(cx, k)))).collect::<Vec<_>>())
+        };
+        choose(ui, egui::Id::unique("tech_category"), &mut f.category, &cats, 130.0);
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Year");
+        for (salt, v) in [("tech_from", &mut f.from), ("tech_to", &mut f.to)] {
+            if salt == "tech_to" {
+                ui.label("to");
+            } else {
+                ui.label("from");
+            }
+            egui::ComboBox::from_id_salt(salt).selected_text(year_text(*v)).width(60.0).show_ui(ui, |ui| {
+                ui.selectable_value(v, 0, "any");
+                for y in &years {
+                    ui.selectable_value(v, *y, y.to_string());
+                }
+            });
+        }
+        ui.checkbox(&mut f.dated, "with a year only").on_hover_text("Leave out the technologies without a start_year");
+        ui.separator();
+        ui.label("DLC");
+        egui::ComboBox::from_id_salt("tech_dlc").selected_text(dlc_text(&f.dlc)).width(190.0).show_ui(ui, |ui| {
+            for d in ["", EVERY].into_iter().map(String::from).chain(dlcs.iter().cloned()).chain([NO_ONE.to_string()]) {
+                let t = dlc_text(&d);
+                ui.selectable_value(&mut f.dlc, d, t);
+            }
+        });
+    });
+    let country = f.country.trim().to_string();
+    let ctechs = (!country.is_empty()).then(|| country_techs(cx, &country)).flatten();
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Country").on_hover_text("The technologies a country starts with in 1936: a nation of the mod by its history, a country of the game by the game's");
+        choose(ui, egui::Id::unique("tech_country"), &mut f.country, &|| tags.clone(), 50.0);
+        egui::ComboBox::from_id_salt("tech_lacks").selected_text(if f.lacks { "does not start with" } else { "starts with" }).width(130.0).show_ui(ui, |ui| {
+            ui.selectable_value(&mut f.lacks, false, "starts with");
+            ui.selectable_value(&mut f.lacks, true, "does not start with");
+        });
+        if !country.is_empty() {
+            let name = tags.iter().find(|(t, _)| *t == country).map(|(_, n)| n.clone()).unwrap_or_default();
+            match &ctechs {
+                Some(c) => ui.label(RichText::new(format!("{name}: {} technologies", c.len())).weak().small()),
+                None => ui.label(RichText::new(format!("no history of {country}")).color(WARN).small()),
+            };
+        }
+        ui.separator();
+        ui.label("Show");
+        for (v, t) in [(Show::All, "all"), (Show::Ticked, "ticked"), (Show::Unticked, "not ticked")] {
+            ui.selectable_value(&mut f.show, v, t);
+        }
+        if *f != TechFilter::default() && ui.small_button("reset the filters").clicked() {
+            *f = TechFilter::default();
+        }
+    });
+    // the rows: those ticked by hand that the game does not have too
+    let mut rows: Vec<(String, String)> = ws.picks.iter().filter(|p| !items.iter().any(|(v, _)| v == *p)).map(|p| (p.clone(), String::new())).collect();
+    rows.extend(items.iter().cloned());
+    rows.sort_by_key(|(v, _)| !ws.first.contains(v));
+    let words: Vec<String> = ws.search.to_lowercase().split_whitespace().map(String::from).collect();
+    let ticked: BTreeSet<&str> = ws.picks.iter().map(String::as_str).collect();
+    // a country without a history: nothing it starts with
+    let none = BTreeSet::new();
+    let cset = (!country.is_empty()).then(|| ctechs.as_ref().unwrap_or(&none));
+    let shown: Vec<(String, String)> = rows
+        .into_iter()
+        .filter(|(id, name)| {
+            let text = format!("{id} {name}");
+            let r = TechRow { id, text: &text, tech: db.techs.get(id), need: db.tech_need(id), ticked: ticked.contains(id.as_str()) };
+            ws.techf.shown(&r, &words, cset)
+        })
+        .collect();
+    drop(ticked);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{} of {} shown · {} ticked", shown.len(), items.len(), ws.picks.len())).weak());
+        let off = shown.iter().filter(|(id, _)| !ws.picks.contains(id)).count();
+        if off > 0 && ui.small_button(format!("tick the shown ({off})")).clicked() {
+            ws.picks.extend(shown.iter().filter(|(id, _)| !ws.picks.contains(id)).map(|(id, _)| id.clone()).collect::<Vec<_>>());
+        }
+        let on = shown.iter().filter(|(id, _)| ws.picks.contains(id)).count();
+        if on > 0 && ui.small_button(format!("untick the shown ({on})")).clicked() {
+            ws.picks.retain(|p| !shown.iter().any(|(id, _)| id == p));
+        }
+    });
+    egui::ScrollArea::vertical().id_salt("tech_list").max_height(ui.available_height() - 8.0).auto_shrink([false, false]).show_rows(ui, 20.0, shown.len(), |ui, range| {
+        egui::Grid::new("tech_rows").num_columns(4).spacing([14.0, 2.0]).show(ui, |ui| {
+            for (id, name) in &shown[range] {
+                let t = db.techs.get(id);
+                let mut on = ws.picks.contains(id);
+                // names that name another text (`$gw_armored_car_equipment$`): that text
+                let name = if name.contains('$') { cx.shown_text(id).map(|t| crate::content::loc::plain(&t)).unwrap_or_else(|| name.clone()) } else { name.clone() };
+                let label = if name.is_empty() { RichText::new(id).monospace() } else { RichText::new(name) };
+                ui.horizontal(|ui| {
+                    ui.set_min_width(300.0);
+                    let r = ui.checkbox(&mut on, label);
+                    if r.changed() {
+                        if on {
+                            ws.picks.push(id.clone());
+                        } else {
+                            ws.picks.retain(|p| p != id);
+                        }
+                    }
+                    if let Some(t) = t {
+                        r.on_hover_text(tech_hover(cx, &db, t));
+                    }
+                });
+                ui.label(t.and_then(|t| t.year).map(|y| (y as i32).to_string()).unwrap_or_default());
+                ui.label(RichText::new(t.and_then(|t| t.folders.first()).map(|f| tech_label(cx, f)).unwrap_or_default()).weak());
+                ui.label(RichText::new(id).weak().small().monospace());
+                ui.end_row();
+            }
+        });
+    });
+}
+
+/// What a technology is: year, tab, categories, DLC, what it unlocks.
+fn tech_hover(cx: &Cx, db: &crate::content::units::UnitDb, t: &crate::content::units::Tech) -> String {
+    let mut v = vec![t.id.clone()];
+    if let Some(y) = t.year {
+        v.push(format!("year {}", y as i32));
+    }
+    if !t.folders.is_empty() {
+        v.push(format!("research tab: {}", t.folders.iter().map(|f| tech_label(cx, f)).collect::<Vec<_>>().join(", ")));
+    } else {
+        v.push("on no research tab: focuses and events give it".into());
+    }
+    if !t.categories.is_empty() {
+        v.push(format!("categories: {}", t.categories.join(", ")));
+    }
+    let n = db.tech_need(&t.id);
+    if !n.is_empty() {
+        v.push(format!("for players {}", n.describe()));
+    }
+    let names = |xs: &[String]| xs.iter().map(|x| cx.text(x).map(crate::content::loc::plain).unwrap_or_else(|| x.clone())).collect::<Vec<_>>().join(", ");
+    for (what, xs) in [("battalions", &t.subunits), ("equipment", &t.equipment), ("modules", &t.modules)] {
+        if !xs.is_empty() {
+            v.push(format!("{what}: {}", names(xs)));
+        }
+    }
+    v.join("\n")
+}
+
 fn own_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, t: &Target, role: Role) {
     match role {
         Role::AiWeight | Role::Mtth | Role::TreeCountry => weight_page(ui, cx, ws, role),
@@ -1014,14 +1362,17 @@ fn own_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, t: &Target, ro
             ws.search = search;
             ws.built = ws.picks.iter().map(|f| format!("focus = {f}")).collect::<Vec<_>>().join("\n");
         }
-        Role::Technologies | Role::Ideas => {
-            let kind = if role == Role::Technologies { Kind::Technology } else { Kind::Idea };
-            ui.label(RichText::new(if role == Role::Technologies { "Tick the technologies the country starts with." } else { "Tick the ideas (laws, national spirits) the country starts with." }).weak());
-            let items = list(cx, &mut ws.lists, Param::Ref(kind));
+        Role::Technologies => {
+            tech_page(ui, cx, ws);
+            ws.built = ws.picks.iter().map(|p| format!("{p} = 1")).collect::<Vec<_>>().join("\n");
+        }
+        Role::Ideas => {
+            ui.label(RichText::new("Tick the ideas (laws, national spirits) the country starts with.").weak());
+            let items = list(cx, &mut ws.lists, Param::Ref(Kind::Idea));
             let mut search = std::mem::take(&mut ws.search);
             tick_list(ui, "refs", &items, &mut ws.picks, &ws.first, &mut search);
             ws.search = search;
-            ws.built = ws.picks.iter().map(|p| if role == Role::Technologies { format!("{p} = 1") } else { p.clone() }).collect::<Vec<_>>().join("\n");
+            ws.built = ws.picks.join("\n");
         }
         Role::SearchFilters => {
             ui.label(RichText::new("The filters of the focus search in the game the focus shows under.").weak());
@@ -1096,6 +1447,7 @@ fn own_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, t: &Target, ro
             add_button(ui, ws, &line, (!ok).then(|| "a category and a number".to_string()));
         }
         Role::Regiments | Role::Support | Role::RegimentalSupport => battalion_page(ui, cx, ws, t, role),
+        Role::Stockpile => stockpile_page(ui, cx, ws),
         _ => {}
     }
 }
@@ -1176,6 +1528,54 @@ fn weight_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState, role: Role)
             ui.label(RichText::new("write or build a condition").weak().small());
         }
     });
+}
+
+/// A line of the stockpile: a model, how many, who made it, which design.
+fn stockpile_page(ui: &mut egui::Ui, cx: &mut Cx, ws: &mut WizardState) {
+    ui.label(RichText::new("Equipment in the country's stockpile at the start. Divisions draw from it, so a model the country cannot make yet still equips them. The Stockpile list at the top of the form shows every line, with amounts to drag.").weak());
+    let db = cx.base.map(|b| crate::content::units::db(Some(b), cx.st));
+    let labels = ["Model", "How many", "Made by (optional)", "Design (optional)"];
+    for (i, label) in labels.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.add_sized([150.0, 18.0], egui::Label::new(*label));
+            let mut v = std::mem::take(&mut ws.stock[i]);
+            match (i, &db) {
+                (0, Some(db)) => {
+                    choose(ui, egui::Id::unique("wz_stock_model"), &mut v, &|| super::stockpile::models(cx, db), 220.0);
+                    let note = match db.equipment.get(v.trim()) {
+                        None => ("not equipment of the game or the mod".to_string(), WARN),
+                        Some(e) if e.is_archetype => ("a family: pick a model of it".to_string(), WARN),
+                        Some(_) => {
+                            let need = db.need_of(v.trim());
+                            if need.is_empty() {
+                                (cx.name_of(Kind::Equipment, v.trim()), ui.visuals().weak_text_color())
+                            } else {
+                                (format!("only players {} get it: put it inside if = {{ limit = {{ {} }} }}", need.describe(), need.trigger()), WARN)
+                            }
+                        }
+                    };
+                    ui.label(RichText::new(note.0).small().color(note.1));
+                }
+                (2, _) => param_ui(ui, cx, &mut ws.lists, egui::Id::unique("wz_stock_tag"), Param::Tag, &mut v),
+                _ => {
+                    ui.add(egui::TextEdit::singleline(&mut v).desired_width(if i == 1 { 90.0 } else { 220.0 }));
+                }
+            }
+            ws.stock[i] = v;
+        });
+    }
+    let [m, a, p, d] = ws.stock.clone().map(|s| s.trim().to_string());
+    if a.parse::<f64>().is_err() {
+        ui.label(RichText::new("how many is a number (negative takes some away)").color(WARN).small());
+    }
+    let mut lines = vec![format!("type = {m}"), format!("amount = {a}")];
+    if !p.is_empty() {
+        lines.push(format!("producer = {p}"));
+    }
+    if !d.is_empty() {
+        lines.push(format!("variant_name = {}", script::quote(&d)));
+    }
+    ws.built = lines.join("\n");
 }
 
 /// Battalions of a division template, put into free places.
@@ -1283,5 +1683,77 @@ mod tests {
             assert_eq!(ws.form.vals["idea_token"], "TYR_hofer");
             assert_eq!(ws.form.vals["allowed"], "original_tag = TYR");
         });
+    }
+
+    #[test]
+    fn technologies_are_filtered() {
+        use crate::content::units::UnitDb;
+        let mut db = UnitDb::default();
+        db.read_file(
+            "common/technologies/t.txt",
+            &Script::parse(
+                "technologies = {
+	infantry_weapons = { start_year = 1918 categories = { infantry_weapons } folder = { name = infantry_folder } }
+	infantry_weapons1 = { start_year = 1936 categories = { infantry_weapons } folder = { name = infantry_folder } }
+	early_fighter = { start_year = 1933 categories = { light_fighter } folder = { name = air_techs_folder } }
+	iw_small_airframe = { start_year = 1926 folder = { name = bba_air_techs_folder } }
+	early_ship_hull_light = { start_year = 1922 folder = { name = naval_folder } }
+	secret = { }
+}",
+            ),
+            false,
+        );
+        db.read_file(
+            "common/technology_tags/00_technology.txt",
+            &Script::parse("technology_folders = {\n\tinfantry_folder\n\tair_techs_folder = { available = { NOT = { has_dlc = \"By Blood Alone\" } } }\n\tbba_air_techs_folder = { available = { has_dlc = \"By Blood Alone\" } }\n\tnaval_folder = { available = { NOT = { has_dlc = \"Man the Guns\" } } }\n}\n"),
+            false,
+        );
+        let ids = ["infantry_weapons", "infantry_weapons1", "early_fighter", "iw_small_airframe", "early_ship_hull_light", "secret"];
+        let picked = ["infantry_weapons1"];
+        let shown = |f: &TechFilter, search: &str, country: Option<&BTreeSet<String>>| -> Vec<&str> {
+            let words: Vec<String> = search.split_whitespace().map(String::from).collect();
+            ids.iter()
+                .copied()
+                .filter(|id| {
+                    let text = format!("{id} name of {id}");
+                    let r = TechRow { id, text: &text, tech: db.techs.get(*id), need: db.tech_need(id), ticked: picked.contains(id) };
+                    f.shown(&r, &words, country)
+                })
+                .collect()
+        };
+        let mut f = TechFilter::default();
+        assert_eq!(shown(&f, "", None).len(), 6);
+        assert_eq!(shown(&f, "weapons1", None), ["infantry_weapons1"]);
+        f.set("tab=infantry_folder;to=1930");
+        assert_eq!(shown(&f, "", None), ["infantry_weapons"], "a tab up to a year");
+        f = TechFilter::default();
+        f.set("from=1930");
+        assert_eq!(shown(&f, "", None), ["infantry_weapons1", "early_fighter", "secret"], "those without a year stay");
+        f.set("dated=yes");
+        assert_eq!(shown(&f, "", None), ["infantry_weapons1", "early_fighter"]);
+        f = TechFilter::default();
+        f.set(&format!("tab={NO_TAB}"));
+        assert_eq!(shown(&f, "", None), ["secret"], "on no tab");
+        f.set("tab=;category=fight");
+        assert_eq!(shown(&f, "", None), ["early_fighter"], "part of a category");
+        // DLC: the tab's
+        f = TechFilter::default();
+        f.set("dlc=+By Blood Alone");
+        assert_eq!(shown(&f, "", None), ["iw_small_airframe"]);
+        f.set("dlc=-By Blood Alone");
+        assert_eq!(shown(&f, "", None), ["early_fighter"]);
+        f.set(&format!("dlc={EVERY}"));
+        assert_eq!(shown(&f, "", None), ["infantry_weapons", "infantry_weapons1", "secret"]);
+        f.set(&format!("dlc={NO_ONE}"));
+        assert_eq!(shown(&f, "", None), ["early_ship_hull_light"], "Man the Guns is every player's");
+        // a country's, and what it lacks
+        let aus: BTreeSet<String> = ["infantry_weapons", "early_fighter"].map(String::from).into();
+        f = TechFilter::default();
+        f.set("country=AUS");
+        assert_eq!(shown(&f, "", Some(&aus)), ["infantry_weapons", "early_fighter"]);
+        f.set("lacks=yes;show=unticked");
+        assert_eq!(shown(&f, "", Some(&aus)), ["iw_small_airframe", "early_ship_hull_light", "secret"]);
+        f.set("lacks=no;show=ticked");
+        assert!(shown(&f, "", Some(&aus)).is_empty());
     }
 }

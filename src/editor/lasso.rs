@@ -663,7 +663,7 @@ mod tests {
             self.time += 1.0 / 60.0;
             let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0));
             let input = egui::RawInput { events, time: Some(self.time), screen_rect: Some(screen), ..Default::default() };
-            let _ = self.ctx.run_ui(input, |ui| {
+            let mut out = self.ctx.run_ui(input, |ui| {
                 let r = ui.allocate_rect(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0)), egui::Sense::click_and_drag());
                 let to_px = |p: egui::Pos2| Some([p.x as f64 / 10.0, p.y as f64 / 10.0]);
                 let pos = r.interact_pointer_pos().or(r.hover_pos()).and_then(to_px);
@@ -671,6 +671,7 @@ mod tests {
                 ed.lasso_input(ui.ctx(), &r, pos, origin, 10.0);
                 ed.lasso_keys(ui.ctx());
             });
+            out.textures_delta.clear(); // no renderer here
         }
 
         fn button(&mut self, ed: &mut Editor, (x, y): (f32, f32), pressed: bool) {

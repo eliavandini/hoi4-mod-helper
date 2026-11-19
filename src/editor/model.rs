@@ -3,13 +3,15 @@
 //! regions, adjacencies), as first written by make_provinces.py and read by
 //! the mod build ([`crate::modbuild`]).
 //!
-//! In memory, provinces / states / nations / regions live in id-indexed
-//! tables; deleted entries leave gaps, which are closed when saving (HOI4
-//! wants ids 1..n). A province knows its state and strategic region; the
-//! member lists of states and regions are derived (see [`Index`]).
+//! Provinces / states / nations / regions live in id-indexed tables; deleted
+//! entries leave gaps. The ids stay as they are when saving, so what the
+//! nation content names by number (a division's province, a capital state)
+//! keeps naming it; the mod build numbers them 1..n as HOI4 wants
+//! ([`compact`]) and changes the content's numbers along. A province knows
+//! its state and strategic region; the member lists of states and regions
+//! are derived (see [`Index`]).
 
 use std::collections::BTreeMap;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -153,6 +155,8 @@ pub struct Nation {
     pub color: Option<[u8; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ideology: Option<String>,
+    /// Once: no militia from the build. The build places no divisions now
+    /// (the content's Army page does); kept so older maps still read.
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_units: bool,
     #[serde(flatten)]
@@ -251,9 +255,16 @@ impl<T> Table<T> {
     pub fn count(&self) -> usize {
         self.items.iter().filter(|x| x.is_some()).count()
     }
-    /// One past the largest id.
+    /// One past the largest id (deleted ones included: an id is not handed
+    /// out again).
     pub fn cap(&self) -> usize {
         self.items.len()
+    }
+    /// Hand out ids from `cap` on (ids used before, kept by the file).
+    pub fn reserve(&mut self, cap: usize) {
+        if self.items.len() < cap {
+            self.items.resize_with(cap, || None);
+        }
     }
 }
 
@@ -731,6 +742,14 @@ pub fn load(dir: &Path, progress: &Progress) -> Result<Loaded> {
         }
         data.regions.put(r.id, r);
     }
+    // the ids of what was deleted at the end are not handed out again: the
+    // content may still name them (see `save`)
+    let next = |k: &str| data.header.get("next_ids").and_then(|n| n.get(k)).and_then(Value::as_u64).unwrap_or(0) as usize;
+    let (np, ns, nn, nr) = (next("provinces"), next("states"), next("nations"), next("regions"));
+    data.provinces.reserve(np);
+    data.states.reserve(ns);
+    data.nations.reserve(nn);
+    data.regions.reserve(nr);
 
     let (r, geo) = raster::load(&dir.join("provinces.bmp"), progress)?;
     let Pixels::Rgb8(rgb) = &r.pixels else { bail!("provinces.bmp is not a 24-bit RGB bitmap ({})", r.format) };
@@ -761,36 +780,106 @@ pub struct SaveReport {
     pub nations: usize,
     pub regions: usize,
     pub adjacencies: usize,
-    pub renumbered: bool,
     pub backup: Option<PathBuf>,
 }
 
-/// Old id -> new id (1..n in id order), 0 for gaps.
-fn compaction<T>(t: &Table<T>) -> (Vec<Id>, bool) {
-    let mut map = vec![0; t.cap()];
-    let mut next = 1;
-    for (id, _) in t.iter() {
-        map[id as usize] = next;
-        next += 1;
+/// Old id → new id (1..n in id order) of provinces and states, 0 for an id
+/// with nothing: how [`compact`] numbered them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Renumbering {
+    pub provinces: Vec<Id>,
+    pub states: Vec<Id>,
+}
+
+impl Renumbering {
+    pub fn province(&self, old: Id) -> Option<Id> {
+        self.provinces.get(old as usize).copied().filter(|&n| n != 0)
     }
-    let gaps = t.count() + 1 != t.cap();
-    (map, gaps)
+    pub fn state(&self, old: Id) -> Option<Id> {
+        self.states.get(old as usize).copied().filter(|&n| n != 0)
+    }
+}
+
+/// Old id → new id (1..n in id order), 0 for gaps.
+fn new_ids<T>(t: &Table<T>) -> Vec<Id> {
+    let mut map = vec![0; t.cap()];
+    for (n, (id, _)) in t.iter().enumerate() {
+        map[id as usize] = n as Id + 1;
+    }
+    map
+}
+
+/// Number provinces, states, nations and strategic regions 1..n in id order,
+/// as HOI4 wants, the pixels with them (the map's deleted ids leave gaps).
+/// Returns how provinces and states were numbered, None when no id changed.
+pub fn compact(d: &mut MapData, labels: &mut Labels) -> Option<Renumbering> {
+    fn trim<T>(t: &mut Table<T>) {
+        while t.items.len() > 1 && t.items.last().is_some_and(Option::is_none) {
+            t.items.pop();
+        }
+    }
+    // ids kept for what was deleted at the end change nothing
+    trim(&mut d.provinces);
+    trim(&mut d.states);
+    trim(&mut d.nations);
+    trim(&mut d.regions);
+    let (p, s, n, r) = (new_ids(&d.provinces), new_ids(&d.states), new_ids(&d.nations), new_ids(&d.regions));
+    let same = |m: &[Id]| m.iter().enumerate().all(|(i, &v)| v == 0 || v as usize == i);
+    if same(&p) && same(&s) && same(&n) && same(&r) {
+        return None;
+    }
+    let at = |m: &[Id], id: Id| m.get(id as usize).copied().unwrap_or(0);
+    let all = |m: &[Id], v: &[Id]| -> Vec<Id> { v.iter().map(|&x| at(m, x)).filter(|&x| x != 0).collect() };
+    let some = |m: &[Id], v: Option<Id>| v.map(|x| at(m, x)).filter(|&x| x != 0);
+    fn moved<T>(t: &mut Table<T>, m: &[Id], mut f: impl FnMut(&mut T, Id)) {
+        let mut out = Table::default();
+        for (id, v) in std::mem::take(&mut t.items).into_iter().enumerate() {
+            if let Some(mut v) = v {
+                let new = m[id];
+                f(&mut v, new);
+                out.put(new, v);
+            }
+        }
+        *t = out;
+    }
+    moved(&mut d.provinces, &p, |x, id| {
+        x.id = id;
+        x.state = at(&s, x.state);
+        x.region = at(&r, x.region);
+        x.nation = some(&n, x.nation);
+    });
+    moved(&mut d.states, &s, |x, id| {
+        x.id = id;
+        x.nation = some(&n, x.nation);
+        x.provinces = all(&p, &x.provinces);
+        x.victory_points = x.victory_points.iter().filter_map(|v| Some([some(&p, Some(v[0]))?, v[1]])).collect();
+        x.cores = x.cores.as_ref().map(|c| all(&n, c));
+        x.controller = some(&n, x.controller);
+    });
+    moved(&mut d.nations, &n, |x, id| {
+        x.id = id;
+        x.capital_state = at(&s, x.capital_state);
+        x.states = all(&s, &x.states);
+    });
+    moved(&mut d.regions, &r, |x, id| {
+        x.id = id;
+        x.provinces = all(&p, &x.provinces);
+        x.states = all(&s, &x.states);
+    });
+    d.adjacencies.retain_mut(|a| {
+        (a.from, a.to) = (at(&p, a.from), at(&p, a.to));
+        a.through = some(&p, a.through);
+        a.from != 0 && a.to != 0
+    });
+    labels.px.par_iter_mut().for_each(|x| *x = at(&p, *x));
+    Some(Renumbering { provinces: p, states: s })
 }
 
 /// "YYYYMMDD-HHMMSS" (UTC) for backup folder names.
 pub fn timestamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (days, rem) = (secs / 86400, secs % 86400);
-    // civil_from_days (Howard Hinnant)
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    let rem = secs % 86400;
+    let (y, m, d) = crate::util::civil_from_days((secs / 86400) as i64);
     format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
@@ -799,6 +888,8 @@ pub const BACKUPS_KEPT: usize = 10;
 /// Seconds since 1970 of a [`timestamp`] ("YYYYMMDD-HHMMSS", UTC).
 pub fn parse_timestamp(s: &str) -> Option<u64> {
     let (date, time) = s.split_once('-')?;
+    // a second backup of the same second: "-2"
+    let time = time.split('-').next()?;
     if date.len() != 8 || time.len() != 6 || !date.bytes().chain(time.bytes()).all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -864,7 +955,9 @@ fn backup(dir: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let root = dir.join("backups");
-    let dest = root.join(timestamp());
+    // two saves in one second: the second gets a folder of its own
+    let stamp = timestamp();
+    let dest = (1..).map(|k| root.join(if k == 1 { stamp.clone() } else { format!("{stamp}-{k}") })).find(|d| !d.exists()).unwrap();
     std::fs::create_dir_all(&dest).with_context(|| format!("cannot create {}", dest.display()))?;
     for f in files {
         std::fs::copy(dir.join(f), dest.join(f)).with_context(|| format!("cannot back up {f}"))?;
@@ -887,47 +980,9 @@ fn backup(dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(dest))
 }
 
-fn write_bmp24(path: &Path, w: u32, h: u32, row: impl Fn(u32, &mut Vec<u8>) + Sync) -> Result<()> {
-    let stride = (w as usize * 3).div_ceil(4) * 4;
-    let size = 54 + stride * h as usize;
-    let mut out = Vec::with_capacity(size);
-    out.extend_from_slice(b"BM");
-    out.extend_from_slice(&(size as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&54u32.to_le_bytes());
-    out.extend_from_slice(&40u32.to_le_bytes());
-    out.extend_from_slice(&(w as i32).to_le_bytes());
-    out.extend_from_slice(&(h as i32).to_le_bytes()); // bottom-up
-    out.extend_from_slice(&1u16.to_le_bytes());
-    out.extend_from_slice(&24u16.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&((stride * h as usize) as u32).to_le_bytes());
-    out.extend_from_slice(&2835i32.to_le_bytes());
-    out.extend_from_slice(&2835i32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    let rows: Vec<Vec<u8>> = (0..h)
-        .into_par_iter()
-        .map(|y| {
-            let mut v = Vec::with_capacity(stride);
-            row(h - 1 - y, &mut v);
-            v.resize(stride, 0);
-            v
-        })
-        .collect();
-    for r in rows {
-        out.extend_from_slice(&r);
-    }
-    let tmp = path.with_extension("bmp.tmp");
-    std::fs::File::create(&tmp)
-        .and_then(|mut f| f.write_all(&out))
-        .with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
-    Ok(())
-}
-
-/// Write provinces.bmp and provinces.json (ids renumbered to 1..n), and the
-/// painted terrain and imported heightmap (removed when there are none).
+/// Write provinces.bmp and provinces.json (the ids as they are, see
+/// [`compact`]), and the painted terrain and imported heightmap (removed when
+/// there are none).
 pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &[u8], heights: Option<&[u8]>) -> Result<SaveReport> {
     let backup = backup(dir)?;
     let (pf, hf) = (dir.join(bitmaps::PAINT_FILE), dir.join(bitmaps::HEIGHTS_FILE));
@@ -943,12 +998,7 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
         None if hf.exists() => std::fs::remove_file(&hf).with_context(|| format!("cannot remove {}", hf.display()))?,
         None => {}
     }
-    let (pmap, g1) = compaction(&data.provinces);
-    let (smap, g2) = compaction(&data.states);
-    let (nmap, g3) = compaction(&data.nations);
-    let (rmap, g4) = compaction(&data.regions);
     let ix = Index::build(data);
-    let m = |map: &Vec<Id>, id: Id| map.get(id as usize).copied().unwrap_or(0);
     let km2 = data.km2_per_px();
 
     // colours: unique per province
@@ -968,10 +1018,9 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
     let mut provinces = Vec::new();
     for (id, p) in data.provinces.iter() {
         let mut q = p.clone();
-        q.id = m(&pmap, id);
         q.rgb = rgb[id as usize];
         q.km2 = (stats.get(id).px as f64 * km2 * 1000.0).round() / 1000.0;
-        q.nation = (p.kind == Kind::Land).then(|| m(&nmap, data.nation_of(id))).filter(|&n| n != 0);
+        q.nation = (p.kind == Kind::Land).then(|| data.nation_of(id)).filter(|&n| n != 0);
         // as vanilla: land next to the sea, and sea next to land
         q.coastal = match p.kind {
             Kind::Land => stats.neighbours(id).iter().any(|&o| data.kind(o) == Kind::Sea),
@@ -983,18 +1032,14 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
     let mut states = Vec::new();
     for (id, s) in data.states.iter() {
         let mut t = s.clone();
-        t.id = m(&smap, id);
-        t.nation = s.nation.map(|n| m(&nmap, n)).filter(|&n| n != 0);
-        t.provinces = ix.provs_of_state(id).iter().map(|&p| m(&pmap, p)).filter(|&p| p != 0).collect();
-        t.victory_points = s.victory_points.iter().filter(|v| m(&pmap, v[0]) != 0).map(|v| [m(&pmap, v[0]), v[1]]).collect();
+        t.provinces = ix.provs_of_state(id).to_vec();
+        t.victory_points.retain(|v| data.provinces.contains(v[0]));
         states.push(serde_json::to_value(&t)?);
     }
     let mut nations = Vec::new();
     for (id, n) in data.nations.iter() {
         let mut t = n.clone();
-        t.id = m(&nmap, id);
-        t.capital_state = m(&smap, n.capital_state);
-        t.states = ix.states_of_nation(id).iter().map(|&s| m(&smap, s)).collect();
+        t.states = ix.states_of_nation(id).to_vec();
         let px: u64 = ix.states_of_nation(id).iter().flat_map(|&s| ix.provs_of_state(s)).map(|&p| stats.get(p).px as u64).sum();
         t.km2 = (px as f64 * km2 * 100.0).round() / 100.0;
         nations.push(serde_json::to_value(&t)?);
@@ -1002,24 +1047,17 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
     let mut regions = Vec::new();
     for (id, r) in data.regions.iter() {
         let mut t = r.clone();
-        t.id = m(&rmap, id);
-        t.provinces = ix.provs_of_region(id).iter().map(|&p| m(&pmap, p)).collect();
-        let mut st: Vec<Id> = ix.provs_of_region(id).iter().map(|&p| data.state_of(p)).filter(|&s| s != 0).map(|s| m(&smap, s)).collect();
+        t.provinces = ix.provs_of_region(id).to_vec();
+        let mut st: Vec<Id> = ix.provs_of_region(id).iter().map(|&p| data.state_of(p)).filter(|&s| s != 0).collect();
         st.sort_unstable();
         st.dedup();
         t.states = st;
         regions.push(serde_json::to_value(&t)?);
     }
     let mut adjacencies = Vec::new();
-    for a in &data.adjacencies {
-        let (f, t) = (m(&pmap, a.from), m(&pmap, a.to));
-        if f == 0 || t == 0 {
-            continue;
-        }
+    for a in data.adjacencies.iter().filter(|a| data.provinces.contains(a.from) && data.provinces.contains(a.to)) {
         let mut b = a.clone();
-        b.from = f;
-        b.to = t;
-        b.through = a.through.map(|x| m(&pmap, x)).filter(|&x| x != 0);
+        b.through = a.through.filter(|&x| data.provinces.contains(x));
         adjacencies.push(serde_json::to_value(&b)?);
     }
 
@@ -1029,13 +1067,17 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
     }
     root.insert("size".into(), serde_json::json!([labels.w, labels.h]));
     root.insert("edited_with".into(), Value::String("mod-helper map editor".into()));
+    // the next new ids: a deleted id is never used again (`load`)
+    root.insert(
+        "next_ids".into(),
+        serde_json::json!({"provinces": data.provinces.cap(), "states": data.states.cap(), "nations": data.nations.cap(), "regions": data.regions.cap()}),
+    );
     let report = SaveReport {
         provinces: provinces.len(),
         states: states.len(),
         nations: nations.len(),
         regions: regions.len(),
         adjacencies: adjacencies.len(),
-        renumbered: g1 || g2 || g3 || g4,
         backup,
     };
     root.insert("nations".into(), Value::Array(nations));
@@ -1043,7 +1085,7 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
     root.insert("states".into(), Value::Array(states));
     root.insert("regions".into(), Value::Array(regions));
     root.insert("adjacencies".into(), Value::Array(adjacencies));
-    // map points, not province ids: nothing to renumber
+    // map points, not province ids
     if !data.rivers.is_empty() {
         root.insert("rivers".into(), serde_json::to_value(&data.rivers)?);
     }
@@ -1060,14 +1102,9 @@ pub fn save(dir: &Path, data: &MapData, labels: &Labels, stats: &Stats, paint: &
         root.insert("ambient_objects".into(), serde_json::to_value(&data.ambient)?);
     }
 
-    let w = labels.w as usize;
-    write_bmp24(&dir.join("provinces.bmp"), labels.w, labels.h, |y, out| {
-        for &p in &labels.px[y as usize * w..(y as usize + 1) * w] {
-            let c = rgb.get(p as usize).copied().unwrap_or([0, 0, 0]);
-            out.extend_from_slice(&[c[2], c[1], c[0]]);
-        }
-    })?;
+    // made before anything is written: the bitmap and the JSON go together
     let json = serde_json::to_string_pretty(&Value::Object(root))?;
+    crate::modbuild::img::write_bmp24_by(&dir.join("provinces.bmp"), labels.w, labels.h, |i| rgb.get(labels.px[i] as usize).copied().unwrap_or([0, 0, 0]))?;
     let path = dir.join("provinces.json");
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json).with_context(|| format!("cannot write {}", tmp.display()))?;
@@ -1086,7 +1123,81 @@ mod tests {
         assert_eq!(parse_timestamp("20261104-234427"), Some(1_793_835_867));
         assert_eq!(parse_timestamp("20240229-120000"), Some(1_709_208_000));
         assert_eq!(parse_timestamp(&timestamp()).map(|t| t / 10), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs() / 10));
+        assert_eq!(parse_timestamp("20240229-120000-2"), Some(1_709_208_000), "a second backup of the same second");
         assert_eq!(parse_timestamp("backups"), None);
         assert_eq!(parse_timestamp("2026110-2344270"), None);
+    }
+
+    /// The id of a province deleted at the end is not handed out again after
+    /// the map is saved and read back (the content may still name it).
+    #[test]
+    fn deleted_ids_stay_taken() {
+        fn v<T: serde::de::DeserializeOwned>(j: Value) -> T {
+            serde_json::from_value(j).unwrap()
+        }
+        let dir = std::env::temp_dir().join(format!("mh-next-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut d = MapData { pixel_m: 100.0, ..Default::default() };
+        for id in 1..=3u32 {
+            d.provinces.put(id, v(serde_json::json!({"id": id, "rgb": [40 * id, 0, 0], "type": "land"})));
+        }
+        d.provinces.remove(3);
+        let labels = Labels { w: 2, h: 1, px: vec![1, 2] };
+        let stats = compute_stats(&labels, d.provinces.cap());
+        save(&dir, &d, &labels, &stats, &[crate::modbuild::bitmaps::AUTO; 2], None).unwrap();
+        let mut l = load(&dir, &crate::util::Progress::default()).unwrap();
+        assert_eq!(l.data.provinces.ids(), [1, 2]);
+        assert_eq!(l.data.provinces.push(|id| v(serde_json::json!({"id": id, "rgb": [9, 9, 9], "type": "land"}))), 4, "3 was deleted: not again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Province 2, states 1, 3, 4 and nation 2 were deleted: the build's
+    /// copy is numbered 1..n, and everything that names an id follows.
+    #[test]
+    fn compact_closes_the_gaps() {
+        fn v<T: serde::de::DeserializeOwned>(j: Value) -> T {
+            serde_json::from_value(j).unwrap()
+        }
+        let mut d = MapData::default();
+        d.provinces.put(1, v(serde_json::json!({"id": 1, "rgb": [1, 0, 0], "type": "land", "nation": 3})));
+        d.provinces.put(3, v(serde_json::json!({"id": 3, "rgb": [3, 0, 0], "type": "land", "nation": 1})));
+        d.provinces.put(4, v(serde_json::json!({"id": 4, "rgb": [4, 0, 0], "type": "sea"})));
+        for (p, s) in [(1, 2), (3, 5), (4, 0)] {
+            let pr = d.provinces.get_mut(p).unwrap();
+            (pr.state, pr.region) = (s, 2);
+        }
+        d.states.put(2, v(serde_json::json!({"id": 2, "name": "A", "nation": 3, "provinces": [1], "victory_points": [[1, 5], [2, 3]], "cores": [1, 2, 3], "controller": 1})));
+        d.states.put(5, v(serde_json::json!({"id": 5, "name": "B", "nation": 1, "provinces": [3], "controller": 2})));
+        d.nations.put(1, v(serde_json::json!({"id": 1, "name": "N1", "capital_state": 5, "states": [5]})));
+        d.nations.put(3, v(serde_json::json!({"id": 3, "name": "N3", "capital_state": 2, "states": [2]})));
+        d.regions.put(2, v(serde_json::json!({"id": 2, "name": "Air", "provinces": [1, 3, 4], "states": [2, 5]})));
+        d.adjacencies.push(v(serde_json::json!({"from": 1, "to": 3, "type": "sea", "through": 4})));
+        d.adjacencies.push(v(serde_json::json!({"from": 1, "to": 2, "type": "impassable"})));
+        let mut labels = Labels { w: 2, h: 2, px: vec![1, 3, 4, 4] };
+
+        let ids = compact(&mut d, &mut labels).unwrap();
+        assert_eq!((ids.province(3), ids.province(2), ids.state(5), ids.state(1)), (Some(2), None, Some(2), None));
+        assert_eq!(labels.px, [1, 2, 3, 3]);
+        assert_eq!((d.provinces.ids(), d.states.ids(), d.nations.ids(), d.regions.ids()), (vec![1, 2, 3], vec![1, 2], vec![1, 2], vec![1]));
+        let p = d.provinces.get(2).unwrap();
+        assert_eq!((p.id, p.rgb, p.state, p.region, p.nation), (2, [3, 0, 0], 2, 1, Some(1)));
+        let a = d.states.get(1).unwrap();
+        assert_eq!((a.id, a.nation, a.provinces.clone(), a.victory_points.clone()), (1, Some(2), vec![1], vec![[1, 5]]));
+        assert_eq!((a.cores.clone(), a.controller), (Some(vec![1, 2]), Some(1)), "cores and occupier follow the nations");
+        assert_eq!(d.states.get(2).unwrap().controller, None, "occupied by a nation that is gone: not occupied");
+        let n = d.nations.get(2).unwrap();
+        assert_eq!((n.id, n.name.as_str(), n.capital_state, n.states.clone()), (2, "N3", 1, vec![1]));
+        assert_eq!(d.nations.get(1).unwrap().capital_state, 2);
+        let r = d.regions.get(1).unwrap();
+        assert_eq!((r.provinces.clone(), r.states.clone()), (vec![1, 2, 3], vec![1, 2]));
+        assert_eq!(d.adjacencies.len(), 1);
+        assert_eq!((d.adjacencies[0].from, d.adjacencies[0].to, d.adjacencies[0].through), (1, 2, Some(3)));
+
+        // no gaps: nothing to do; a gap at the end only: neither
+        assert_eq!(compact(&mut d, &mut labels), None);
+        d.provinces.reserve(9);
+        assert_eq!(compact(&mut d, &mut labels), None);
+        assert_eq!(d.provinces.cap(), 4);
     }
 }

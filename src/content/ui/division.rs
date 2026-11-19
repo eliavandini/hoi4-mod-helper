@@ -1,7 +1,9 @@
 //! The division designer of a division template: its battalions and
 //! companies on the game's grid with their icons, picked from what the
-//! nation can use at the start; its problems; and its stats, with the
-//! nation's research at the start or all research up to a year.
+//! nation can use at the start; its problems (for players with and without
+//! the DLCs the nation's history checks); and its stats, with the nation's
+//! research and stockpile at the start or all research up to a year, for
+//! players with the DLCs picked (as the focus tree view: one choice).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -9,6 +11,7 @@ use std::sync::Arc;
 use eframe::egui::{self, Color32, RichText, Sense, Stroke, Vec2};
 
 use super::{Cx, ERR, OK, WARN};
+use crate::content::dlc::{self, Owned};
 use crate::content::loc;
 use crate::content::script;
 use crate::content::store::{DefKey, SHARED};
@@ -26,12 +29,25 @@ pub struct DesignerState {
     /// The list of this place opens (for screenshots).
     start: Option<(Section, i64, i64)>,
     /// What the nation has at the start and for the stats, by (content
-    /// generation, tag, year).
+    /// generation, tag, year, DLCs).
     have: Option<(HaveKey, Arc<(Have, Have)>)>,
 }
 
-/// Content generation, tag, year.
-type HaveKey = (u64, String, Option<u32>);
+/// Content generation, tag, year, DLCs of the player.
+type HaveKey = (u64, String, Option<u32>, Owned);
+
+/// The DLCs the views assume: those picked, else all of them.
+pub fn owned(cx: &Cx, db: &UnitDb, tag: &str) -> Owned {
+    match &cx.settings.dlcs {
+        Some(o) => o.clone(),
+        None => {
+            let mut all = dlc::known(cx.base.map(|b| &b.files));
+            all.extend(db.dlcs());
+            all.extend(units::history_dlcs(cx.st, tag));
+            all
+        }
+    }
+}
 
 impl DesignerState {
     /// Open the list of a place once shown: `regiments:1:0`.
@@ -104,18 +120,19 @@ pub fn designer(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, ds: &mut DesignerS
     let db = units::db(Some(base), cx.st);
     let Some(t) = cx.st.def(key).and_then(|(d, _, s)| d.block(s).map(Template::read)) else { return };
     let tag = key.pkg.clone();
-    let hkey = (cx.st.generation, tag.clone(), ds.year);
+    let owned = owned(cx, &db, &tag);
+    let hkey = (cx.st.generation, tag.clone(), ds.year, owned.clone());
     if ds.have.as_ref().is_none_or(|h| h.0 != hkey) {
-        let start = units::start_techs(cx.st, &tag);
+        let start = db.at_start(cx.st, &tag, Some(&owned));
         let research = match ds.year {
-            Some(y) => db.have(db.up_to(&start, y)),
-            None => db.have(start.clone()),
+            Some(y) => db.have(db.up_to(&start.techs, y, Some(&owned))),
+            None => start.clone(),
         };
-        ds.have = Some((hkey, Arc::new((db.have(start), research))));
+        ds.have = Some((hkey, Arc::new((start, research))));
     }
     let have = ds.have.as_ref().map(|h| h.1.clone()).unwrap_or_default();
     let who = if tag == SHARED { "every nation".to_string() } else { tag.clone() };
-    let problems = db.check(&t, &have.0, &who, &|id| name(cx, id));
+    let problems = db.check_for_players(cx.st, &t, &tag, &who, &|id| name(cx, id));
     let mut bad: BTreeMap<usize, Severity> = BTreeMap::new();
     for p in &problems {
         if let Some(i) = p.slot {
@@ -134,6 +151,10 @@ pub fn designer(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, ds: &mut DesignerS
             .small(),
         );
         grid(ui, cx, &g, ds, &mut acts);
+        if tag != SHARED && ui.small_button("🪖 Place divisions of it on the map").on_hover_text("the Army page, with this template to place").clicked() {
+            super::army::place_next(ui.ctx(), &key.id);
+            cx.go(super::Nav::Page(super::Page::Army));
+        }
         ui.add_space(4.0);
         if problems.is_empty() {
             ui.colored_label(OK, "✔ No problems: the game takes this template as it is.");
@@ -145,15 +166,15 @@ pub fn designer(ui: &mut egui::Ui, cx: &mut Cx, key: &DefKey, ds: &mut DesignerS
             });
         }
         ui.add_space(6.0);
-        research_row(ui, &db, ds, &who);
+        research_row(ui, cx, &db, ds, &who, &tag);
         let div = db.division(&t, &have.1);
         stats(ui, cx, &g, &div);
     });
     apply(cx, key, acts);
 }
 
-/// The research the stats are worked out with.
-fn research_row(ui: &mut egui::Ui, db: &UnitDb, ds: &mut DesignerState, who: &str) {
+/// The research the stats are worked out with, and the DLCs of the player.
+fn research_row(ui: &mut egui::Ui, cx: &mut Cx, db: &UnitDb, ds: &mut DesignerState, who: &str, tag: &str) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Stats").strong());
         ui.label("with");
@@ -171,8 +192,9 @@ fn research_row(ui: &mut egui::Ui, db: &UnitDb, ds: &mut DesignerState, who: &st
             })
             .response
             .on_hover_text(
-                "At the start: the technologies the build gives every nation and those of its history (set_technology). Up to a year: also every technology of the research screen meant for that year or before (not those of focuses and events), with the newest equipment they bring.",
+                "At the start: the technologies the build gives every nation and those of its history (set_technology), and its stockpile (add_equipment_to_stockpile). Up to a year: also every technology of the research screen meant for that year or before (not those of focuses and events), with the newest equipment they bring.",
             );
+        dlc_menu(ui, cx, db, tag);
     });
 }
 
@@ -352,8 +374,8 @@ fn picker(ui: &mut egui::Ui, cx: &mut Cx, g: &G, ds: &mut DesignerState, acts: &
         let mut last = String::new();
         for (n, u) in list {
             let why: Option<String> = if !g.start.units.contains(&u.id) {
-                let techs: Vec<String> = g.db.unlocked_by(&u.id).iter().take(2).map(|t| name(cx, &t.id)).collect();
-                Some(if techs.is_empty() { format!("{} cannot use it", g.tag) } else { format!("needs {}", techs.join(" or ")) })
+                let techs = g.db.unlocked_text(&[u.id.as_str()], &|i| name(cx, i), 2);
+                Some(if techs.is_empty() { format!("{} cannot use it", g.tag) } else { format!("needs {techs}") })
             } else if section == Section::Regiments && group.as_ref().is_some_and(|gr| *gr != u.group) {
                 Some(format!("column {} is of {}", x + 1, group_label(group.as_deref().unwrap_or(""))))
             } else if section == Section::RegimentalSupport && group.as_ref().is_some_and(|gr| !u.allowed_groups.is_empty() && !u.allowed_groups.contains(gr)) {
@@ -405,6 +427,55 @@ fn picker(ui: &mut egui::Ui, cx: &mut Cx, g: &G, ds: &mut DesignerState, acts: &
     if shown == 0 {
         ui.label(RichText::new(if ds.show_locked || !q.is_empty() { "Nothing found." } else { "Nothing can go here (tick \"all\" to see why)." }).weak());
     }
+}
+
+/// The DLCs the player has, for the stats and what can be picked: all of
+/// them, or those ticked (the focus tree view's choice too).
+fn dlc_menu(ui: &mut egui::Ui, cx: &mut Cx, db: &UnitDb, tag: &str) {
+    let mut names = db.dlcs();
+    names.extend(units::history_dlcs(cx.st, tag));
+    if names.is_empty() {
+        return;
+    }
+    let installed = cx.base.map(|b| dlc::installed(&b.files)).unwrap_or_default();
+    let label = match &cx.settings.dlcs {
+        None => "with every DLC".to_string(),
+        Some(o) => {
+            let on: Vec<&String> = names.iter().filter(|d| o.contains(*d)).collect();
+            if on.is_empty() { "with no DLC".to_string() } else if on.len() == names.len() { "with every DLC".to_string() } else { format!("with {}", on.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")) }
+        }
+    };
+    ui.menu_button(format!("{label} ▾"), |ui| {
+        ui.label(RichText::new("The DLCs of the player: research by year keeps to the technologies they see (No Step Back and By Blood Alone have their own), and the history's has_dlc checks go by them. The focus tree view uses the same choice.").small().weak());
+        let mut all = cx.settings.dlcs.is_none();
+        if ui.checkbox(&mut all, "every DLC").changed() {
+            cx.settings.dlcs = if all { None } else { Some(names.clone()) };
+        }
+        if !installed.is_empty() && ui.button("those installed with the game").clicked() {
+            cx.settings.dlcs = Some(installed.clone());
+        }
+        if ui.button("none").clicked() {
+            cx.settings.dlcs = Some(Owned::new());
+        }
+        ui.separator();
+        let mut o = cx.settings.dlcs.clone().unwrap_or_else(|| names.clone());
+        let mut changed = false;
+        for d in &names {
+            let mut on = o.contains(d);
+            let text = if installed.contains(d) { format!("{d} (installed)") } else { d.clone() };
+            if ui.checkbox(&mut on, text).changed() {
+                changed = true;
+                if on {
+                    o.insert(d.clone());
+                } else {
+                    o.remove(d);
+                }
+            }
+        }
+        if changed {
+            cx.settings.dlcs = Some(o);
+        }
+    });
 }
 
 /// Infantry first, support last, as the game lists them.
@@ -461,8 +532,8 @@ fn card(ui: &mut egui::Ui, cx: &Cx, g: &G, u: &SubUnit) {
     };
     ui.label(RichText::new(format!("{what} · {}{}{}", u.id, if u.special_forces { " · special forces" } else { "" }, if u.content { " · the mod's" } else { "" })).small().weak());
     if !g.start.units.contains(&u.id) {
-        let techs: Vec<String> = g.db.unlocked_by(&u.id).iter().map(|t| name(cx, &t.id)).collect();
-        ui.colored_label(WARN, if techs.is_empty() { format!("{} cannot use it at the start", g.tag) } else { format!("{} cannot use it at the start: it comes with {}", g.tag, techs.join(" or ")) });
+        let techs = g.db.unlocked_text(&[u.id.as_str()], &|i| name(cx, i), 4);
+        ui.colored_label(WARN, if techs.is_empty() { format!("{} cannot use it at the start", g.tag) } else { format!("{} cannot use it at the start: it comes with {techs}", g.tag) });
     }
     let b = g.db.battalion(u, g.research);
     egui::Grid::new(("card", &u.id)).num_columns(4).spacing([10.0, 1.0]).show(ui, |ui| {
@@ -590,11 +661,17 @@ fn stats(ui: &mut egui::Ui, cx: &Cx, g: &G, d: &Division) {
             });
             ui.add_space(4.0);
             for (arch, (model, n)) in &d.equipment {
+                let stock: f64 = g.start.stock.iter().filter(|(m, _)| g.db.archetype_of(m) == arch || *m == arch).map(|(_, k)| k).sum();
+                let more = if stock > 0.0 { format!(" · {} in the stockpile", num(stock)) } else { String::new() };
                 let text = match model {
-                    Some(m) => format!("{} × {}", num(*n), name(cx, m)),
-                    None => format!("{} × {}: none", num(*n), name(cx, arch)),
+                    Some(m) => format!("{} × {}{more}", num(*n), name(cx, m)),
+                    None => format!("{} × {}: none{more}", num(*n), name(cx, arch)),
                 };
-                let tip = if model.is_some() { "The newest model of it with this research".to_string() } else { format!("{} has no model of it with this research: the division has none of it", g.tag) };
+                let tip = if model.is_some() {
+                    format!("The newest model of it with this research or in the stockpile{}", if stock > 0.0 && *n > 0.0 { format!(": the stockpile at the start fills {} divisions of this template", num((stock / n).floor())) } else { String::new() })
+                } else {
+                    format!("{} has no model of it with this research: the division has none of it", g.tag)
+                };
                 let c = if model.is_some() { ui.visuals().text_color() } else { WARN };
                 ui.label(RichText::new(text).small().color(c)).on_hover_text(tip);
             }
@@ -649,7 +726,8 @@ pub fn unit_combo(ui: &mut egui::Ui, cx: &mut Cx, tag: &str, section: Section, v
         return None;
     };
     let db = units::db(Some(base), cx.st);
-    let have = db.have(units::start_techs(cx.st, tag));
+    let o = owned(cx, &db, tag);
+    let have = db.at_start(cx.st, tag, Some(&o));
     let mut list: Vec<(String, String)> = db.subunits.values().filter(|u| u.section() == Some(section) && have.units.contains(&u.id)).map(|u| (u.id.clone(), name(cx, &u.id))).collect();
     list.sort_by(|a, b| a.1.cmp(&b.1));
     let shown = list.iter().find(|x| x.0 == *value).map(|x| x.1.clone()).unwrap_or_else(|| value.clone());

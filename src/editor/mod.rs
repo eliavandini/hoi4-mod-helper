@@ -52,7 +52,7 @@ use crate::util::Progress;
 use crate::view::{self, DrawCtx};
 
 use density::{Terrain, TerrainRule};
-pub use content_link::{MapFacts, NationInfo, WATER};
+pub use content_link::{GONE, MapFacts, NationInfo, WATER};
 #[cfg(test)]
 pub use content_link::StatePixels;
 use doc::Doc;
@@ -826,6 +826,8 @@ impl Editor {
 
     fn start_check(&mut self, ctx: &egui::Context) {
         let Some(doc) = &self.doc else { return };
+        // the building limits of the install in use (Snapshot::of takes them)
+        modbuild::buildings::for_game(&self.settings.game_dir.clone().unwrap_or_else(modbuild::default_game_dir));
         let snap = validate::Snapshot::of(doc);
         let v = version(doc);
         let (tx, rx) = crossbeam_channel::bounded(1);
@@ -1320,9 +1322,6 @@ impl Editor {
                     "saved {} provinces, {} states, {} nations, {} zones, {} adjacencies",
                     r.provinces, r.states, r.nations, r.regions, r.adjacencies
                 );
-                if r.renumbered {
-                    m.push_str(" (ids renumbered 1..n in the file; Reload to see them)");
-                }
                 if let Some(b) = r.backup {
                     m.push_str(&format!("; backup in {}", b.display()));
                 }
@@ -3173,6 +3172,7 @@ impl Editor {
         let Some(mut draft) = self.draft.take() else { return };
         let doc = self.doc.as_ref().unwrap();
         let sealed = self.sealed.as_ref().filter(|s| s.0 == doc.pixel_version).map(|s| s.1.clone());
+        let caps = modbuild::buildings::for_game(&self.settings.game_dir.clone().unwrap_or_else(modbuild::default_game_dir));
         let title = match &draft {
             Draft::Province(..) => "Province",
             Draft::State(..) => "State",
@@ -3187,7 +3187,7 @@ impl Editor {
                 Draft::Province(id, p) => province_props(ui, *id, p, doc, acts),
                 Draft::State(id, s) => {
                     want_sealed = sealed.is_none();
-                    state_props(ui, *id, s, doc, &mut self.nation_filter, &mut self.vp_new, sealed.as_deref(), acts)
+                    state_props(ui, *id, s, doc, &mut self.nation_filter, &mut self.vp_new, sealed.as_deref(), &caps, acts)
                 }
                 Draft::Nation(id, n) => nation_props(ui, *id, n, doc, acts),
                 Draft::Region(id, r) => region_props(ui, *id, r, doc),
@@ -3656,16 +3656,18 @@ const CATEGORIES: [&str; 13] = [
     "megalopolis",
     "large_island",
 ];
+/// The state buildings the panel sets (their highest levels come from the
+/// game, [`modbuild::buildings`]).
 const BUILDINGS: [(&str, &str); 11] = [
-    ("infrastructure", "infrastructure (0-5)"),
+    ("infrastructure", "infrastructure"),
     ("industrial_complex", "civilian factories"),
     ("arms_factory", "military factories"),
     ("dockyard", "dockyards"),
-    ("air_base", "air base (0-10)"),
-    ("anti_air_building", "anti-air (0-5)"),
+    ("air_base", "air base"),
+    ("anti_air_building", "anti-air"),
     ("synthetic_refinery", "synthetic refinery"),
     ("fuel_silo", "fuel silo"),
-    ("radar_station", "radar (0-6)"),
+    ("radar_station", "radar"),
     ("rocket_site", "rocket site"),
     ("nuclear_reactor", "nuclear reactor"),
 ];
@@ -3737,10 +3739,28 @@ fn nation_choices<'a>(ui: &mut egui::Ui, d: &'a model::MapData, filter: &mut Str
     list
 }
 
-fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut String, vp_new: &mut (Id, u32), sealed: Option<&[f64]>, acts: &mut Vec<Act>) {
+const POPULATION_TIP: &str = "The state's population (manpower in the state file): the nation recruits a share of it by its conscription law, which is where divisions without start_manpower_factor get their men";
+
+/// 1234567 → "1,234,567".
+fn thousands(v: u64) -> String {
+    let s = v.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut String, vp_new: &mut (Id, u32), sealed: Option<&[f64]>, caps: &modbuild::buildings::Caps, acts: &mut Vec<Act>) {
     let d = &doc.data;
     let provs = doc.index.provs_of_state(id);
     let px: u64 = provs.iter().map(|&p| doc.stats.get(p).px as u64).sum();
+    let urban: Option<f64> = sealed.map(|sk| provs.iter().map(|&p| sk.get(p as usize).copied().unwrap_or(0.0)).sum());
+    let coastal = validate::on_coast(d, &doc.stats, provs);
     egui::Grid::new("stateprops").num_columns(2).show(ui, |ui| {
         ui.label("name");
         ui.text_edit_singleline(&mut s.name);
@@ -3809,37 +3829,85 @@ fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut
         ui.end_row();
         ui.label("size");
         let mut info = format!("{} provinces · {:.1} km²", provs.len(), px as f64 * d.km2_per_px());
-        if let Some(sk) = sealed {
-            let u: f64 = provs.iter().map(|&p| sk.get(p as usize).copied().unwrap_or(0.0)).sum();
+        if let Some(u) = urban {
             info.push_str(&format!(" · built-up {u:.2} km²"));
+        }
+        if coastal {
+            info.push_str(" · on the coast");
         }
         ui.label(info);
         ui.end_row();
-        ui.label("population");
-        ui.horizontal(|ui| {
-            let mut auto = s.manpower.is_none();
-            if ui.checkbox(&mut auto, "auto").on_hover_text("the mod build derives it from the built-up area").changed() {
-                s.manpower = if auto { None } else { Some(100_000) };
-            }
-            if let Some(m) = &mut s.manpower {
-                ui.add(egui::DragValue::new(m).clamp_existing_to_range(false).range(0..=100_000_000u64).speed(500.0));
+        ui.label("population").on_hover_text(POPULATION_TIP);
+        // what the build gives it when not set (known once the built-up land is)
+        let capital = s.nation.and_then(|n| d.nations.get(n)).is_some_and(|n| n.capital_state == id);
+        let meta = d.mod_meta();
+        let auto_value = urban.map(|u| modbuild::auto_manpower(&meta, capital, s.impassable, u));
+        // without the built-up land: the base alone
+        let floor = modbuild::auto_manpower(&meta, capital, s.impassable, 0.0);
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                let mut auto = s.manpower.is_none();
+                let label = match auto_value {
+                    Some(v) => format!("auto: {}", thousands(v)),
+                    None => format!("auto: at least {}", thousands(floor)),
+                };
+                if ui.checkbox(&mut auto, label).on_hover_text("the mod build derives it from the project's manpower base (a quarter outside the capital state) and the built-up area (Mod details › Build); untick to set it").changed() {
+                    s.manpower = if auto { None } else { Some(auto_value.unwrap_or(floor)) };
+                }
+                if let Some(m) = &mut s.manpower {
+                    ui.add(egui::DragValue::new(m).clamp_existing_to_range(false).range(0..=100_000_000u64).speed(500.0).custom_formatter(|v, _| thousands(v as u64)).custom_parser(|t| t.replace([',', '.', ' ', '\''], "").parse::<f64>().ok()));
+                }
+            });
+            if let Some(p) = s.manpower.or(auto_value) {
+                ui.label(RichText::new(format!("≈ {} soldiers with Volunteer Only (1.5%), {} with Limited Conscription (2.5%)", thousands((p as f64 * 0.015) as u64), thousands((p as f64 * 0.025) as u64))).small().weak())
+                    .on_hover_text("The share of the population a nation can recruit depends on its conscription law; a state that is not its core gives less. Volunteer Only is the game's default.");
             }
         });
         ui.end_row();
-        ui.label("category");
-        egui::ComboBox::from_id_salt("category").selected_text(s.category.clone().unwrap_or_else(|| "auto".into())).show_ui(ui, |ui| {
-            ui.selectable_value(&mut s.category, None, "auto (by built-up area)");
-            for c in CATEGORIES {
-                ui.selectable_value(&mut s.category, Some(c.to_string()), c);
+        ui.label("category").on_hover_text("How built-up the state is: it gives the building slots for factories, dockyards, refineries and the like");
+        let slots_text = |c: &str| caps.slots(c).map(|n| format!("{c} ({n} slots)")).unwrap_or_else(|| c.to_string());
+        let auto = match validate::category_of(&State { category: None, ..s.clone() }, urban) {
+            Some(c) => format!("auto: {}", slots_text(&c)),
+            None => "auto (by built-up area)".into(),
+        };
+        let cur = s.category.as_deref().filter(|c| !c.is_empty()).map(slots_text).unwrap_or_else(|| auto.clone());
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("category").selected_text(cur).show_ui(ui, |ui| {
+                ui.selectable_value(&mut s.category, None, auto);
+                for c in CATEGORIES {
+                    ui.selectable_value(&mut s.category, Some(c.to_string()), slots_text(c));
+                }
+            });
+            if let Some(c) = s.category.as_deref().filter(|c| !c.is_empty() && caps.slots(c).is_none()) {
+                ui.colored_label(ERR, format!("the game has no category {c}"));
             }
         });
         ui.end_row();
     });
+    let cat = validate::category_of(s, urban).filter(|c| caps.slots(c).is_some());
+    let slots = cat.as_deref().and_then(|c| caps.slots(c));
     ui.label(RichText::new("Buildings (unticked = the mod build decides)").strong());
     egui::Grid::new("buildings").num_columns(2).show(ui, |ui| {
         for (k, label) in BUILDINGS {
+            let b = caps.building(k);
+            let max = caps.max_level(k, cat.as_deref());
+            let shares = b.is_some_and(|b| b.shares_slots);
+            let mut tip = match max {
+                Some(m) => format!("The game allows levels 0 to {m}"),
+                None => "No level cap of its own".to_string(),
+            };
+            if shares {
+                tip.push_str("; it takes the state's building slots");
+            }
+            if b.is_some_and(|b| b.coastal) {
+                tip.push_str("; only in a state on the coast");
+            }
+            let shown = match max {
+                Some(m) => format!("{label} (0-{m})"),
+                None => label.to_string(),
+            };
             let mut on = s.buildings.contains_key(k);
-            if ui.checkbox(&mut on, label).changed() {
+            if ui.checkbox(&mut on, shown).on_hover_text(tip).changed() {
                 if on {
                     s.buildings.insert(k.to_string(), 0);
                 } else {
@@ -3847,13 +3915,33 @@ fn state_props(ui: &mut egui::Ui, id: Id, s: &mut State, doc: &Doc, filter: &mut
                 }
             }
             if let Some(v) = s.buildings.get_mut(k) {
-                ui.add(egui::DragValue::new(v).clamp_existing_to_range(false).range(0..=50));
+                ui.horizontal(|ui| {
+                    // (a value over the cap read from a file stays as it is, in red)
+                    ui.add(egui::DragValue::new(v).clamp_existing_to_range(false).range(0..=max.or(slots).unwrap_or(50)));
+                    if let Some(m) = max.filter(|m| *v > *m) {
+                        ui.colored_label(ERR, format!("at most {m}"));
+                    }
+                    if *v > 0 && b.is_some_and(|b| b.coastal) && !coastal {
+                        ui.colored_label(ERR, "needs a coast");
+                    }
+                });
             } else {
                 ui.label("");
             }
             ui.end_row();
         }
     });
+    let used = caps.used_slots(&s.buildings);
+    match (&cat, slots) {
+        (Some(c), Some(n)) => {
+            let text = format!("Building slots: {used} of the {n} of a {c} state set here; the build fills the free ones with the factories left unticked");
+            ui.label(RichText::new(text).small().color(if used > n { ERR } else { ui.visuals().weak_text_color() }));
+        }
+        _ if used > 0 => {
+            ui.label(RichText::new(format!("Building slots: {used} set here; load the terrain or pick a category to see how many the state has")).small().weak());
+        }
+        _ => {}
+    }
     ui.label(RichText::new("Resources").strong());
     egui::Grid::new("resources").num_columns(2).show(ui, |ui| {
         for k in RESOURCES {
@@ -3962,12 +4050,6 @@ fn nation_props(ui: &mut egui::Ui, id: Id, n: &mut Nation, doc: &Doc, acts: &mut
             }
         });
         ui.end_row();
-        ui.label("army");
-        let mut units = !n.no_units;
-        if ui.checkbox(&mut units, "starts with a militia").changed() {
-            n.no_units = !units;
-        }
-        ui.end_row();
         ui.label("states");
         ui.vertical(|ui| {
             for &s in states.iter().take(12) {
@@ -3993,6 +4075,25 @@ fn region_props(ui: &mut egui::Ui, id: Id, r: &mut Region, doc: &Doc) {
     });
 }
 
+/// What is wrong with the province a strait or canal crosses.
+fn through_problem(a: &Adjacency, doc: &Doc) -> Option<&'static str> {
+    let d = &doc.data;
+    if a.kind != "sea" {
+        return None;
+    }
+    let canal = d.kind(a.from) == Kind::Sea && d.kind(a.to) == Kind::Sea;
+    let Some(t) = a.through.filter(|&t| d.provinces.get(t).is_some()) else {
+        return Some(if a.through.is_some() { "no such province" } else if canal { "a canal needs the land province it crosses" } else { "a strait needs the sea province it crosses" });
+    };
+    if canal {
+        return (d.kind(t) != Kind::Land).then_some("a canal crosses a land province");
+    }
+    if d.kind(t) != Kind::Sea {
+        return Some("not a sea province");
+    }
+    (doc.stats.border_len(a.from, t) == 0 || doc.stats.border_len(a.to, t) == 0).then_some("it does not touch both ends")
+}
+
 fn adjacency_props(ui: &mut egui::Ui, i: usize, a: &mut Adjacency, doc: &Doc, acts: &mut Vec<Act>) {
     let d = &doc.data;
     egui::Grid::new("adjprops").num_columns(2).show(ui, |ui| {
@@ -4016,11 +4117,15 @@ fn adjacency_props(ui: &mut egui::Ui, i: usize, a: &mut Adjacency, doc: &Doc, ac
         ui.label("through");
         ui.horizontal(|ui| {
             let mut t = a.through.unwrap_or(0);
-            if ui.add(egui::DragValue::new(&mut t)).on_hover_text("sea province the strait crosses (0 = none)").changed() {
+            let top = d.provinces.cap().saturating_sub(1) as Id;
+            if ui.add(egui::DragValue::new(&mut t).clamp_existing_to_range(false).range(0..=top)).on_hover_text("sea province the strait crosses (0 = none)").changed() {
                 a.through = (t != 0).then_some(t);
             }
             if let Some(t) = a.through {
                 ui.label(d.prov_name(t));
+            }
+            if let Some(p) = through_problem(a, doc) {
+                ui.colored_label(ERR, p);
             }
         });
         ui.end_row();

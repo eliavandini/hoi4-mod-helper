@@ -352,7 +352,13 @@ impl Doc {
             }
             n
         });
+        // ids used since the backup stay taken: the content may name them
+        let caps = (self.data.provinces.cap(), self.data.states.cap(), self.data.nations.cap(), self.data.regions.cap());
         self.data = l.data;
+        self.data.provinces.reserve(caps.0);
+        self.data.states.reserve(caps.1);
+        self.data.nations.reserve(caps.2);
+        self.data.regions.reserve(caps.3);
         if let Some(t) = self.txn.as_mut() {
             t.whole = true;
         }
@@ -548,16 +554,20 @@ impl Doc {
     /// Built-up (sealed) km² per province, if the terrain is loaded.
     pub fn sealed_km2(&self) -> Option<Vec<f64>> {
         let t = self.terrain.as_ref()?;
-        let lab = self.labels.read();
-        let mut out = vec![0f64; self.data.provinces.cap()];
-        let k = self.data.km2_per_px();
-        for (i, &p) in lab.px.iter().enumerate() {
-            if t.sealed[i] {
-                if let Some(o) = out.get_mut(p as usize) {
-                    *o += k;
-                }
-            }
-        }
-        Some(out)
+        Some(sealed_per_province(t, &self.labels.read(), &self.data))
     }
+}
+
+/// Built-up (sealed) km² per province of the terrain.
+pub fn sealed_per_province(t: &Terrain, lab: &Labels, data: &MapData) -> Vec<f64> {
+    let mut out = vec![0f64; data.provinces.cap()];
+    let k = data.km2_per_px();
+    for (i, &p) in lab.px.iter().enumerate() {
+        if t.sealed.get(i).copied().unwrap_or(false)
+            && let Some(o) = out.get_mut(p as usize)
+        {
+            *o += k;
+        }
+    }
+    out
 }

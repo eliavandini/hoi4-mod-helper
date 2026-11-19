@@ -127,8 +127,7 @@ fn real_map_loads_validates_and_round_trips() {
     let labels0 = doc.labels.read().px.clone();
     let data0 = doc.data.clone();
     doc.dirty = true;
-    let r = doc.save().unwrap();
-    assert!(!r.renumbered, "ids of the generated map are 1..n already");
+    doc.save().unwrap();
     let doc2 = open(&dir, false);
     assert_eq!(doc2.labels.read().px, labels0);
     assert_eq!(doc2.data.provinces.count(), data0.provinces.count());
@@ -462,9 +461,11 @@ fn real_map_edits_keep_it_valid() {
     assert_eq!(backups.len(), 1, "{backups:?}");
     assert_eq!(backups[0].provinces, Some(np0));
     let edited = doc.labels.read().px.clone();
+    let cap = doc.data.provinces.cap();
     doc.begin("load backup");
     let n = doc.replace_map(model::load(&backups[0].dir, &Progress::default()).unwrap()).unwrap();
     doc.commit();
+    assert!(doc.data.provinces.cap() >= cap, "ids used since the backup are not handed out again");
     println!("load backup: {n} px differ");
     assert!(n > 0);
     assert_eq!(doc.labels.read().px, labels0, "the backup is the map before the edits");

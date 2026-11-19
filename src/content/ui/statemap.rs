@@ -15,9 +15,9 @@ use crate::editor::{MapFacts, WATER};
 /// The longer side of the map in cells.
 const MAX_SIDE: usize = 1600;
 
-const SEA: [u8; 3] = [42, 72, 120];
-const NO_STATE: [u8; 3] = [86, 86, 82];
-const PICKED: [u8; 3] = [255, 196, 40];
+pub(super) const SEA: [u8; 3] = [42, 72, 120];
+pub(super) const NO_STATE: [u8; 3] = [86, 86, 82];
+pub(super) const PICKED: [u8; 3] = [255, 196, 40];
 
 /// The states of the map at a lower resolution.
 pub struct Raster {
@@ -94,13 +94,13 @@ fn raster_of(ctx: &egui::Context, f: &MapFacts) -> Option<Arc<Raster>> {
 
 /// Where the map looks: its middle in cells and screen points per cell.
 #[derive(Clone, Copy, Debug)]
-struct View {
-    centre: Pos2,
-    scale: f32,
+pub(super) struct View {
+    pub(super) centre: Pos2,
+    pub(super) scale: f32,
 }
 
 /// The view that shows `b` (x0, y0, x1, y1 in cells) in `size`, with a margin.
-fn fit(b: [f32; 4], size: Vec2) -> View {
+pub(super) fn fit(b: [f32; 4], size: Vec2) -> View {
     let (bw, bh) = ((b[2] - b[0]).max(4.0), (b[3] - b[1]).max(4.0));
     let scale = (size.x / (bw * 1.15)).min(size.y / (bh * 1.15));
     View { centre: Pos2::new((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0), scale }
@@ -111,8 +111,30 @@ fn box_of(r: &Raster, states: impl IntoIterator<Item = u32>) -> Option<[f32; 4]>
     states.into_iter().filter_map(|s| r.boxes.get(&s)).map(|x| x.0).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
 }
 
-fn mix(c: [u8; 3], to: [u8; 3], t: f32) -> [u8; 3] {
+pub(super) fn mix(c: [u8; 3], to: [u8; 3], t: f32) -> [u8; 3] {
     [0, 1, 2].map(|i| (c[i] as f32 + (to[i] as f32 - c[i] as f32) * t).round() as u8)
+}
+
+/// The wheel zooms about the mouse, dragging moves (a map of `w` × `h`
+/// cells in `rect`).
+pub(super) fn steer(ui: &egui::Ui, resp: &egui::Response, rect: Rect, v: &mut View, w: usize, h: usize) {
+    if resp.hovered() {
+        let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+        let k = zoom * (scroll * 0.003).exp();
+        if (k - 1.0).abs() > 1e-4
+            && let Some(m) = resp.hover_pos()
+        {
+            let at = v.centre + (m - rect.center()) / v.scale;
+            let min = (rect.width() / w as f32).min(rect.height() / h as f32) * 0.8;
+            v.scale = (v.scale * k).clamp(min, 40.0);
+            v.centre = at - (m - rect.center()) / v.scale;
+            ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
+        }
+    }
+    if resp.dragged() {
+        v.centre -= resp.drag_delta() / v.scale;
+    }
+    v.centre = v.centre.clamp(Pos2::ZERO, Pos2::new(w as f32, h as f32));
 }
 
 /// The map; returns the state clicked. `own`: the states of the nation
@@ -128,24 +150,7 @@ pub fn map(ui: &mut egui::Ui, cx: &Cx, id: egui::Id, own: &[u32], picked: &[u32]
     let vid = id.with("view");
     let whole = [0.0, 0.0, r.w as f32, r.h as f32];
     let mut v: View = ui.data(|d| d.get_temp(vid)).unwrap_or_else(|| fit(box_of(&r, picked.iter().chain(own).copied()).unwrap_or(whole), size));
-    // the wheel zooms about the mouse, dragging moves
-    if resp.hovered() {
-        let (scroll, zoom) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
-        let k = zoom * (scroll * 0.003).exp();
-        if (k - 1.0).abs() > 1e-4
-            && let Some(m) = resp.hover_pos()
-        {
-            let at = v.centre + (m - rect.center()) / v.scale;
-            let min = (size.x / r.w as f32).min(size.y / r.h as f32) * 0.8;
-            v.scale = (v.scale * k).clamp(min, 40.0);
-            v.centre = at - (m - rect.center()) / v.scale;
-            ui.input_mut(|i| i.smooth_scroll_delta = Vec2::ZERO);
-        }
-    }
-    if resp.dragged() {
-        v.centre -= resp.drag_delta() / v.scale;
-    }
-    v.centre = v.centre.clamp(Pos2::ZERO, Pos2::new(r.w as f32, r.h as f32));
+    steer(ui, &resp, rect, &mut v, r.w, r.h);
     let to_screen = |c: Pos2| rect.center() + (c - v.centre) * v.scale;
     let to_cell = |p: Pos2| v.centre + (p - rect.center()) / v.scale;
     let state_at = |p: Pos2| {

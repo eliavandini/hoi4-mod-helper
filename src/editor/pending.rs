@@ -239,6 +239,32 @@ mod tests {
         }
     }
 
+    /// The map check knows the game's building limits: levels over the cap,
+    /// a dockyard inland, more than the category's slots, a category the
+    /// game does not have.
+    #[test]
+    fn building_limits_in_the_check() {
+        use super::super::validate::{Severity, Snapshot, validate};
+        let mut doc = tiny(out_dir("building-limits"));
+        let a = doc.data.states.get_mut(1).unwrap();
+        a.buildings = [("infrastructure", 7), ("dockyard", 1), ("industrial_complex", 3), ("arms_factory", 2)].map(|(k, v)| (k.to_string(), v)).into();
+        a.category = Some("town".into());
+        doc.data.states.get_mut(2).unwrap().category = Some("hamlet".into());
+        let msgs: Vec<(Severity, String)> = validate(&Snapshot::of(&doc)).into_iter().filter(|i| i.msg.starts_with("state ")).map(|i| (i.severity, i.msg)).collect();
+        let want = [
+            (Severity::Error, "state A (1): dockyard: only in a state on the coast"),
+            (Severity::Error, "state A (1): infrastructure 7: at most 5"),
+            (Severity::Error, "state B (2): the game has no state category hamlet"),
+            (Severity::Warning, "state A (1): 6 buildings take building slots; a town state has 4"),
+        ];
+        assert_eq!(msgs, want.map(|(s, m)| (s, m.to_string())));
+        // within the limits: nothing
+        let a = doc.data.states.get_mut(1).unwrap();
+        a.buildings = [("infrastructure", 5), ("industrial_complex", 2), ("arms_factory", 2)].map(|(k, v)| (k.to_string(), v)).into();
+        doc.data.states.get_mut(2).unwrap().category = None;
+        assert!(validate(&Snapshot::of(&doc)).iter().all(|i| !i.msg.starts_with("state ")));
+    }
+
     #[test]
     fn only_the_changed_fields_go_in() {
         let orig: State = from(json!({"id": 1, "name": "A", "nation": 1, "manpower": 1000, "buildings": {"infrastructure": 2}}));
@@ -362,8 +388,9 @@ mod tests {
         let names: Vec<String> = l.data.states.iter().map(|(_, s)| s.name.clone()).collect();
         assert_eq!(names, ["Bozen", "Brixen - Bressanone"]);
         let owners: Vec<Option<u32>> = l.data.states.iter().map(|(_, s)| s.nation).collect();
-        assert_eq!(owners, [Some(1), Some(1)], "both states belong to N2 (renumbered to 1)");
-        assert_eq!(l.data.nations.get(1).unwrap().name, "N2");
+        assert_eq!(owners, [Some(2), Some(2)], "both states belong to N2, whose id stays");
+        assert_eq!(l.data.nations.get(2).unwrap().name, "N2");
+        assert!(l.data.nations.get(1).is_none());
         assert_eq!(l.data.provinces.get(3).unwrap().name, "Brixen");
         assert_eq!(l.data.rivers[0].name, "Eisack");
         assert_eq!(l.data.mod_meta().name, "Tirol test");

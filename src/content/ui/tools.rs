@@ -289,11 +289,11 @@ pub fn loc_page(ui: &mut egui::Ui, cx: &mut Cx, ts: &mut ToolsState) {
                     go = Some(Nav::Def(k.clone()));
                 }
                 let cur = r.text.clone().unwrap_or_default();
-                if let Some(v) = form::line_field(ui, egui::Id::unique(("loc_row", &lang, &r.key)), &cur, tw, "missing", &|_| true) {
+                if let Some(v) = form::line_field(ui, egui::Id::unique(("loc_row", &lang, &r.key)), &cur, tw, "missing", &|_| Ok(())) {
                     edits.push((r.key.clone(), v));
                 }
                 let o = r.other.clone().unwrap_or_default();
-                if let Some(v) = form::line_field(ui, egui::Id::unique(("loc_row", &other, &r.key)), &o, tw, "missing", &|_| true) {
+                if let Some(v) = form::line_field(ui, egui::Id::unique(("loc_row", &other, &r.key)), &o, tw, "missing", &|_| Ok(())) {
                     edits.push((format!("\u{0}{}", r.key), v));
                 }
                 if !r.used && ui.small_button("✖").on_hover_text("delete the key in every language of the nation").clicked() {
@@ -1064,7 +1064,7 @@ fn changes_page(ui: &mut egui::Ui, cx: &mut Cx, s: &mut ChangesState) {
                 changed.push((pkg.clone(), path.clone(), if f.disk.is_none() { "new" } else { "changed" }));
             }
         }
-        for r in &p.removed {
+        for r in p.removed.keys() {
             changed.push((pkg.clone(), r.clone(), "deleted"));
         }
     }
@@ -1282,6 +1282,7 @@ fn compat_page(ui: &mut egui::Ui, cx: &mut Cx, s: &mut CompatState) {
                         c.request_repaint();
                     })
                 })();
+                crate::util::release_freed_memory();
                 let _ = tx.send(r.map_err(|e| format!("{e:#}")));
                 c.request_repaint();
             });

@@ -278,14 +278,14 @@ pub struct Find {
 
 impl Find {
     fn pattern(&self) -> Result<Regex> {
-        let mut p = if self.regex { self.needle.clone() } else { regex::escape(&self.needle) };
-        if self.whole_word {
-            p = format!(r"(?:^|[^\w.@:'-])({p})(?:$|[^\w.@:'-])");
-        } else {
-            p = format!("({p})");
-        }
-        regex::RegexBuilder::new(&p).case_insensitive(!self.case).multi_line(true).build().map_err(|e| anyhow::anyhow!("{e}"))
+        let p = if self.regex { self.needle.clone() } else { regex::escape(&self.needle) };
+        regex::RegexBuilder::new(&format!("({p})")).case_insensitive(!self.case).multi_line(true).build().map_err(|e| anyhow::anyhow!("{e}"))
     }
+}
+
+/// A character that is part of a word (as `whole_word` sees it).
+fn wordish(c: char) -> bool {
+    c.is_alphanumeric() || "_.@:'-".contains(c)
 }
 
 /// A hit: package, file, line, the line's text, and the byte range.
@@ -311,6 +311,11 @@ pub fn find(st: &Store, q: &Find, limit: usize) -> Result<Vec<Hit>> {
         for c in re.captures_iter(&text) {
             let m = c.get(1).unwrap();
             let s = m.start();
+            // checked here, not in the pattern: a pattern would take the
+            // character between two hits, and miss the second
+            if q.whole_word && (text[..s].chars().next_back().is_some_and(wordish) || text[m.end()..].chars().next().is_some_and(wordish)) {
+                continue;
+            }
             out.push(Hit {
                 pkg: pkg.clone(),
                 file: file.clone(),
@@ -454,6 +459,7 @@ pub fn references(st: &Store, id: &str, skip: Option<&DefKey>) -> Vec<(String, S
 /// The kinds a word names in the project.
 pub fn kinds_named(st: &Store, id: &str) -> Vec<Kind> {
     let mut v: Vec<Kind> = st.defs().filter(|k| k.id == id).map(|k| k.kind).collect();
+    v.sort();
     v.dedup();
     v
 }
@@ -516,6 +522,12 @@ mod tests {
         assert!(p.files[0].text.contains("add_stability = 2"));
         let ww = Find { needle: "tyr.1".into(), whole_word: true, scripts: true, ..Default::default() };
         assert!(find(&st, &ww, 10).unwrap().is_empty());
+        // two hits one character apart: both
+        st.begin("x");
+        st.set_text("shared", "common/x.txt", "x = { AUS AUS AUS_y }\n".into());
+        st.commit();
+        let ww = Find { needle: "AUS".into(), whole_word: true, case: true, scripts: true, ..Default::default() };
+        assert_eq!(find(&st, &ww, 10).unwrap().len(), 2);
 
         // tag rename
         let (p, moves) = plan_tag_rename(&st, "TYR", "TRL").unwrap();

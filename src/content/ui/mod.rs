@@ -11,8 +11,13 @@ pub mod code;
 pub mod division;
 pub mod form;
 pub mod import_ui;
+pub mod air;
+pub mod army;
+pub mod navy;
 pub mod picker;
+pub mod provmap;
 pub mod statemap;
+pub mod stockpile;
 pub mod tools;
 pub mod tree;
 pub mod wizard;
@@ -50,7 +55,8 @@ pub struct Settings {
     pub pkg: Option<String>,
     /// The language texts are edited in.
     pub language: String,
-    /// The DLCs the focus tree view assumes (None: all of them).
+    /// The DLCs the focus tree view and the division designer assume
+    /// (None: all of them).
     pub dlcs: Option<BTreeSet<String>>,
     /// Folders and bundles imported from before.
     pub sources: Vec<PathBuf>,
@@ -74,6 +80,12 @@ pub enum Page {
     Export,
     Play,
     Tool(tools::Tool),
+    /// The navy of a nation: ship designs and fleets.
+    Navy,
+    /// The air force of a nation: plane designs, fallbacks, air wings.
+    Air,
+    /// The army of a nation: its order of battle, divisions on the map.
+    Army,
 }
 
 /// Draw `f` in the space left in `ui`, clipped to it: what it draws never
@@ -265,6 +277,19 @@ impl<'a> Cx<'a> {
         let text = kinds::template(kind, id, &tag);
         let pkg = self.pkg.to_string();
         self.st.begin(format!("new {} {id}", kind.spec().one));
+        // a template goes into the nation's order of battle, before its divisions
+        if kind == Kind::DivisionTemplate
+            && let Some((_, Some((p, path)))) = crate::content::army::army_oob(self.st, &pkg)
+            && p == pkg
+        {
+            self.st.edit_text(&pkg, &path, |t| {
+                let s = crate::content::script::Script::parse(t);
+                crate::content::script::apply(t, &[army::insert_template(t, &s.root, &text)])
+            });
+            self.st.commit();
+            self.info(format!("new {} {id} in {path}", kind.spec().one));
+            return self.st.find_in(&pkg, &[kind], id);
+        }
         match import::insert_def(self.st, &pkg, kind, group, id, &text) {
             Ok(()) => {
                 self.st.commit();
@@ -324,14 +349,17 @@ pub struct Screen {
     pub import: import_ui::ImportState,
     pub check: check::CheckState,
     tools: tools::ToolsState,
+    navy: navy::NavyState,
+    air: air::AirState,
+    army: army::ArmyState,
     /// Ask before deleting all of a nation's content.
     ask_delete_pkg: Option<String>,
     pub ask_close: bool,
     pub close_ok: bool,
     /// Counts per package and kind (at a generation of the store).
     counts: (u64, Arc<BTreeMap<String, BTreeMap<Kind, usize>>>),
-    /// The game's documentation (read when the game folder is known).
-    docs: (PathBuf, Arc<crate::content::docs::Docs>),
+    /// The game's documentation and user folder, read once per game folder.
+    docs: (PathBuf, Arc<crate::content::docs::Docs>, PathBuf),
     /// From the start spec: a definition to open, and a window to open on it
     /// (`wizard:<field>`, `picker:<field>`, `code`, `about:<field>`, `map:<field>`).
     start_def: Option<(Kind, String)>,
@@ -373,11 +401,14 @@ impl Screen {
             import: import_ui::ImportState::default(),
             check: check::CheckState::default(),
             tools: tools::ToolsState::default(),
+            navy: navy::NavyState::default(),
+            air: air::AirState::default(),
+            army: army::ArmyState::default(),
             ask_delete_pkg: None,
             ask_close: false,
             close_ok: false,
             counts: (0, Arc::new(BTreeMap::new())),
-            docs: (PathBuf::new(), Arc::new(crate::content::docs::Docs::default())),
+            docs: (PathBuf::new(), Arc::new(crate::content::docs::Docs::default()), PathBuf::new()),
             start_def: None,
             start_popup: None,
         }
@@ -412,6 +443,20 @@ impl Screen {
                 Page::Import
             }
             "export" => Page::Export,
+            "navy" => {
+                self.navy.open_at(what.as_deref(), self.start_popup.as_deref());
+                self.start_popup = None;
+                Page::Navy
+            }
+            "air" => {
+                self.air.open_at(what.as_deref(), self.start_popup.as_deref());
+                self.start_popup = None;
+                Page::Air
+            }
+            "army" => {
+                self.army.open_at(what.as_deref());
+                Page::Army
+            }
             "loc" => Page::Localisation,
             "files" => Page::Files,
             p => Kind::all().find(|k| k.spec().label.to_lowercase().starts_with(p)).map(Page::Kind).or_else(|| tools::Tool::ALL.into_iter().find(|t| t.label().to_lowercase().contains(p)).map(Page::Tool)).unwrap_or(Page::Overview),
@@ -463,6 +508,7 @@ impl Screen {
                 c.request_repaint();
             })
             .map_err(|e| format!("{e:#}"));
+            crate::util::release_freed_memory();
             if let Ok(ix) = &r {
                 log::info!("base game read in {:.1} s: {} definitions, {} texts, {} sprites", t.elapsed().as_secs_f32(), ix.defs.len(), ix.loc.len(), ix.sprites.len());
             }
@@ -653,15 +699,15 @@ impl Screen {
 
         let counts = self.counts();
         egui::Panel::left("content_nav").default_size(250.0).min_size(200.0).max_size(ui.available_width() * 0.3).show(ui, |ui| contained(ui, |ui| self.nav(ui, &facts, &counts, &pkg, editor)));
-        let user_dir = crate::editor::launcher::GameInfo::read(&editor.game_dirs().game).map(|g| g.user_dir).unwrap_or_else(|_| crate::modbuild::default_mods_dir().parent().map(|p| p.to_path_buf()).unwrap_or_default());
         let game = editor.game_dirs().game;
         if self.docs.0 != game {
-            self.docs = (game.clone(), Arc::new(crate::content::docs::Docs::load(&game)));
+            let user_dir = crate::editor::launcher::GameInfo::read(&game).map(|g| g.user_dir).unwrap_or_else(|_| crate::modbuild::default_mods_dir().parent().map(|p| p.to_path_buf()).unwrap_or_default());
+            self.docs = (game.clone(), Arc::new(crate::content::docs::Docs::load(&game)), user_dir);
         }
-        let docs = self.docs.1.clone();
+        let (docs, user_dir) = (self.docs.1.clone(), self.docs.2.clone());
         let mut nav = None;
         {
-            let Screen { store, base, gfx, settings, msg, loc, page, tree, form, kind_filter, new_group, files, import, check, tools, .. } = self;
+            let Screen { store, base, gfx, settings, msg, loc, page, tree, form, kind_filter, new_group, files, import, check, tools, navy, air, army, .. } = self;
             let st = store.as_mut().unwrap();
             loc.refresh(st, &settings.language);
             let nation = facts.nations.iter().find(|n| n.tag == pkg);
@@ -677,6 +723,9 @@ impl Screen {
                 Page::Export => import_ui::export_page(ui, &mut cx, import),
                 Page::Play => check::play_page(ui, &mut cx, check, editor),
                 Page::Tool(t) => tools::page(ui, &mut cx, t, tools),
+                Page::Navy => navy::page(ui, &mut cx, navy),
+                Page::Air => air::page(ui, &mut cx, air),
+                Page::Army => army::page(ui, &mut cx, army),
             });
         }
         if let Some(n) = nav {
@@ -870,6 +919,11 @@ impl Screen {
             const MAIN: [Kind; 8] = [Kind::Event, Kind::Decision, Kind::DecisionCategory, Kind::Idea, Kind::Character, Kind::CountryHistory, Kind::DivisionTemplate, Kind::SharedFocus];
             for k in MAIN {
                 ui.selectable_value(&mut page, Page::Kind(k), label(&format!("   {}", k.label()), n(k)));
+                if k == Kind::DivisionTemplate && pkg != SHARED {
+                    ui.selectable_value(&mut page, Page::Army, "   🪖 Army: divisions on the map").on_hover_text("The divisions the nation starts with: templates from the division designer, placed by clicking provinces of the map");
+                    ui.selectable_value(&mut page, Page::Navy, "   ⚓ Navy: ship designs and fleets").on_hover_text("The ship designer and the fleets the nation starts with, at the naval bases of the map");
+                    ui.selectable_value(&mut page, Page::Air, "   ✈ Air: plane designs and air wings").on_hover_text("The plane designer (By Blood Alone) with a fallback of each design for players without it, and the air wings the nation starts with, at the air bases of the map");
+                }
             }
             let open = egui::CollapsingHeader::new("More kinds").default_open(self.more_kinds).show(ui, |ui| {
                 for k in Kind::listed().filter(|k| !MAIN.contains(k) && *k != Kind::FocusTree) {

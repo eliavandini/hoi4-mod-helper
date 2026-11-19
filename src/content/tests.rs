@@ -63,7 +63,7 @@ fn import_german_tree_from_the_base_game() {
             assert!(s.errors.is_empty(), "{path}: {:?}", s.errors);
         }
     }
-    let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1].into()))].into(), provinces: 100, states: [1].into(), unpinned: 0 };
+    let facts = Facts { nations: [("TYR".to_string(), ("Tirol".to_string(), 1, [1].into()))].into(), provinces: 100, states: [1].into(), unpinned: 0, ..Default::default() };
     let issues = validate::validate(&st, Some(&base), &facts);
     let (e, w, i) = validate::summary(&issues);
     eprintln!("validated: {e} errors, {w} warnings, {i} notes");
@@ -93,6 +93,13 @@ fn units_of_the_base_game() {
     eprintln!("at the start: {can:?}");
     assert!(start.units.contains("infantry") && start.units.contains("engineer") && !start.units.contains("motorized") && !start.units.contains("recon"));
     let name = |s: &str| base.loc.get(s).cloned().unwrap_or_else(|| s.to_string());
+    // what DLCs change
+    eprintln!("DLCs that change research: {:?}", db.dlcs());
+    for id in ["basic_light_tank", "basic_light_tank_chassis", "light_tank_equipment_1", "light_tank_chassis_1", "light_armor", "infantry_weapons", "motorised_infantry"] {
+        eprintln!("  {id}: {:?}", db.need_of(id).describe());
+    }
+    assert!(db.need_of("light_tank_equipment_1").describe().contains("without No Step Back") && db.need_of("light_tank_chassis_1").describe().contains("with No Step Back"));
+    assert!(db.need_of("infantry_weapons").is_empty() && db.need_of("light_armor").is_empty(), "light tanks come with or without No Step Back");
     for (label, text) in [
         ("9 infantry", "division_template = { name = A regiments = { infantry = { x = 0 y = 0 } infantry = { x = 0 y = 1 } infantry = { x = 0 y = 2 } infantry = { x = 1 y = 0 } infantry = { x = 1 y = 1 } infantry = { x = 1 y = 2 } infantry = { x = 2 y = 0 } infantry = { x = 2 y = 1 } infantry = { x = 2 y = 2 } } }"),
         ("7/2 with engineers and artillery", "division_template = { name = B regiments = { infantry = { x = 0 y = 0 } infantry = { x = 0 y = 1 } infantry = { x = 0 y = 2 } infantry = { x = 1 y = 0 } infantry = { x = 1 y = 1 } infantry = { x = 1 y = 2 } infantry = { x = 1 y = 3 } artillery_brigade = { x = 2 y = 0 } artillery_brigade = { x = 2 y = 1 } } support = { engineer = { x = 0 y = 0 } artillery = { x = 0 y = 1 } } }"),
@@ -100,7 +107,9 @@ fn units_of_the_base_game() {
     ] {
         let s = Script::parse(text);
         let t = Template::read(s.root.block("division_template").unwrap());
-        for (lbl, have) in [("start", start.clone()), ("1940", db.have(db.up_to(&start.techs, 1940)))] {
+        let nsb: super::dlc::Owned = ["No Step Back".to_string()].into();
+        let none = super::dlc::Owned::new();
+        for (lbl, have) in [("start", start.clone()), ("1940 without DLC", db.have(db.up_to(&start.techs, 1940, Some(&none)))), ("1940 with No Step Back", db.have(db.up_to(&start.techs, 1940, Some(&nsb))))] {
             let d = db.division(&t, &have);
             let g = |k: &str| d.get(k);
             eprintln!(

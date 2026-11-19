@@ -76,7 +76,15 @@ pub fn facts_of(cx: &Cx) -> Facts {
             f.unpinned += 1;
         }
     }
+    f.ports = cx.facts.ports.iter().map(|p| crate::content::navy::Port { province: p.province, level: p.level, name: p.name.clone(), tag: p.tag.clone() }).collect();
+    f.airbases = airfields(cx);
+    f.ground = super::army::ground_of(cx.facts);
     f
+}
+
+/// The air bases of the map, for the checks and the Air page.
+pub fn airfields(cx: &Cx) -> Vec<crate::content::air::Airfield> {
+    cx.facts.airbases.iter().map(|a| crate::content::air::Airfield { state: a.state, level: a.level, name: a.name.clone(), tag: a.tag.clone() }).collect()
 }
 
 pub fn check_page(ui: &mut egui::Ui, cx: &mut Cx, cs: &mut CheckState) {
@@ -144,6 +152,7 @@ pub fn check_page(ui: &mut egui::Ui, cx: &mut Cx, cs: &mut CheckState) {
     });
     ui.separator();
     let mut go = None;
+    let mut repair: Option<(String, String)> = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, 22.0, shown.len(), |ui, range| {
         for i in &shown[range] {
             ui.horizontal(|ui| {
@@ -160,6 +169,9 @@ pub fn check_page(ui: &mut egui::Ui, cx: &mut Cx, cs: &mut CheckState) {
                         go = Some(Nav::File { pkg: i.pkg.clone(), file: i.file.clone(), line: Some(i.line) });
                     }
                 }
+                if i.message.starts_with(crate::content::validate::LOOSE_ELSE) && ui.small_button("repair").on_hover_text("move the else inside the if before it (one undo step)").clicked() {
+                    repair = Some((i.pkg.clone(), i.file.clone()));
+                }
                 let r = ui.add(egui::Label::new(RichText::new(&i.message).color(c)).sense(egui::Sense::click()).truncate());
                 if let Some(d) = &i.def
                     && r.on_hover_text(format!("{}\n(click: edit {})", i.message, d.id)).clicked()
@@ -171,6 +183,12 @@ pub fn check_page(ui: &mut egui::Ui, cx: &mut Cx, cs: &mut CheckState) {
     });
     if let Some(n) = go {
         cx.go(n);
+    }
+    if let Some((pkg, file)) = repair {
+        cx.edit_file(&pkg, &file, "the else inside the if", None, |t, _| {
+            let n = crate::content::dlc::nest_elses(t);
+            (n != t).then_some(n)
+        });
     }
 }
 

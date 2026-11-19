@@ -30,6 +30,42 @@ impl Progress {
     }
 }
 
+/// Year, month (1..=12) and day (1..=31) of a day counted from 1970-01-01
+/// (Howard Hinnant's civil_from_days).
+pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// FNV-1a: a hash that stays the same across runs and Rust versions (file
+/// names of caches and working folders).
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3))
+}
+
+/// Hands the memory freed by a big job back to the system. Reading the
+/// base game parses thousands of files on every core: the parse trees are
+/// dropped as it goes, but the C allocator keeps the freed pages (scattered
+/// among what stays) for the process, about 450 MB of it. Linux (glibc)
+/// only; elsewhere nothing.
+pub fn release_freed_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        // SAFETY: malloc_trim only returns free pages of the allocator's heaps
+        unsafe { malloc_trim(0) };
+    }
+}
+
 pub fn fmt_bytes(b: usize) -> String {
     let b = b as f64;
     if b >= 1e9 {

@@ -10,10 +10,11 @@
 //! Every nation (one per city, town and village) becomes a country: a tag
 //! from its name, a procedural flag, a map colour unlike its neighbours',
 //! name lists by language, generic history (neutral, the starting techs of a
-//! vanilla minor, a militia) and no focus tree or leader of its own, so the
-//! game gives it the generic focus tree and generated leaders. Values set in
-//! the editor (terrain, manpower, state category, buildings, resources,
-//! victory points, tags, colours, ideology, units) win over derived ones.
+//! vanilla minor) and no focus tree, leader or divisions of its own, so the
+//! game gives it the generic focus tree and generated leaders; its divisions
+//! are those its content places (the Army page). Values set in the editor
+//! (terrain, manpower, state category, buildings, resources, victory
+//! points, tags, colours, ideology) win over derived ones.
 //!
 //! Writes `<mods>/<folder>/` and `<mods>/<folder>.mod`. The folder is built
 //! next to the old one and swapped in at the end; a folder of that name is
@@ -21,6 +22,7 @@
 
 pub mod ambient;
 pub mod bitmaps;
+pub mod buildings;
 pub mod countries;
 pub mod img;
 pub mod meta;
@@ -58,19 +60,6 @@ fn names_from(language: &str) -> &'static str {
         _ => "AUS",
     }
 }
-fn militia(language: &str) -> &'static str {
-    match language {
-        "it" | "rm" => "Milizia",
-        _ => "Landsturm",
-    }
-}
-fn divisions(place: &str) -> u32 {
-    match place {
-        "city" => 3,
-        "town" => 2,
-        _ => 1,
-    }
-}
 
 /// Building slots of the vanilla state categories (common/state_category).
 pub const CATEGORY_SLOTS: [(&str, u32); 13] = [
@@ -94,15 +83,15 @@ pub const IDEOLOGIES: [&str; 4] = ["democratic", "fascism", "communism", "neutra
 /// The technologies every nation starts with, as a vanilla minor
 /// (Luxembourg); a nation's own history in the content adds to them.
 pub const START_TECHS: [&str; 7] = ["infantry_weapons", "infantry_weapons1", "tech_trucks", "gw_artillery", "tech_support", "tech_engineers", "basic_train"];
-/// State category by the sealed (urban) km² of the state: (below, category, slots).
-const STATE_CATEGORIES: [(f64, &str, u32); 7] = [
-    (0.15, "pastoral", 1),
-    (0.5, "rural", 2),
-    (1.5, "town", 4),
-    (3.0, "large_town", 5),
-    (6.0, "city", 6),
-    (10.0, "large_city", 8),
-    (f64::INFINITY, "metropolis", 10),
+/// State category by the sealed (urban) km² of the state: (below, category).
+const STATE_CATEGORIES: [(f64, &str); 7] = [
+    (0.15, "pastoral"),
+    (0.5, "rural"),
+    (1.5, "town"),
+    (3.0, "large_town"),
+    (6.0, "city"),
+    (10.0, "large_city"),
+    (f64::INFINITY, "metropolis"),
 ];
 /// Building positions per state (vanilla buildings.txt has these per state).
 const STATE_BUILDINGS: [(&str, usize); 10] = [
@@ -146,16 +135,27 @@ pub struct Dirs {
 }
 
 fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    std::env::home_dir().unwrap_or_default()
 }
 
+/// Where Steam puts the game.
 pub fn default_game_dir() -> PathBuf {
+    if cfg!(windows) {
+        return PathBuf::from(r"C:\Program Files (x86)\Steam\steamapps\common\Hearts of Iron IV");
+    }
+    if cfg!(target_os = "macos") {
+        return home().join("Library/Application Support/Steam/steamapps/common/Hearts of Iron IV");
+    }
     let steam = home().join(".local/share/Steam/steamapps/common/Hearts of Iron IV");
     let alt = home().join(".steam/steam/steamapps/common/Hearts of Iron IV");
     if !steam.exists() && alt.exists() { alt } else { steam }
 }
 
+/// The game's user folder's `mod/`.
 pub fn default_mods_dir() -> PathBuf {
+    if cfg!(any(windows, target_os = "macos")) {
+        return home().join("Documents/Paradox Interactive/Hearts of Iron IV/mod");
+    }
     home().join(".local/share/Paradox Interactive/Hearts of Iron IV/mod")
 }
 
@@ -198,6 +198,15 @@ fn scaled(size: (u32, u32), vanilla_map: (u32, u32), map: (usize, usize)) -> (us
 pub fn slope_degrees(dem: &[f32], w: usize, h: usize, px_m: f64) -> Vec<f32> {
     let (gx, gy) = gradient(dem, w, h, px_m);
     gx.par_iter().zip(&gy).map(|(a, b)| a.hypot(*b).atan().to_degrees()).collect()
+}
+
+/// The category of a state when none is set: wasteland if impassable, else
+/// by its built-up (sealed) km².
+pub fn auto_category(impassable: bool, urban_km2: f64) -> &'static str {
+    if impassable {
+        return "wasteland";
+    }
+    STATE_CATEGORIES.iter().find(|c| urban_km2 < c.0).map_or("metropolis", |c| c.1)
 }
 
 /// Infrastructure of a state when none is set: 3 with 1.5 km² or more
@@ -384,13 +393,9 @@ pub fn build(map_dir: &Path, dirs: &Dirs, log: &dyn Fn(&str)) -> Result<PathBuf>
     let t0 = std::time::Instant::now();
     log("reading the map");
     let progress = Progress::default();
-    let model::Loaded { data: d, labels, extra, .. } = model::load(map_dir, &progress)?;
+    let model::Loaded { data: mut d, mut labels, extra, .. } = model::load(map_dir, &progress)?;
     let meta = d.mod_meta();
     meta.check()?;
-    let n = d.provinces.count();
-    if d.provinces.ids() != (1..=n as Id).collect::<Vec<_>>() {
-        bail!("province ids in provinces.json are not 1..n (save the map in the editor)");
-    }
     for (_, s) in d.states.iter() {
         match s.nation {
             None => bail!("state {} ({}) belongs to no nation", s.id, s.name),
@@ -403,6 +408,12 @@ pub fn build(map_dir: &Path, dirs: &Dirs, log: &dyn Fn(&str)) -> Result<PathBuf>
             bail!("strategic region {} ({}) has no provinces", r.id, r.name);
         }
     }
+    // the game wants ids 1..n; where the map has gaps (deleted provinces,
+    // merged states) the mod numbers them again, the content's numbers too
+    let ids = model::compact(&mut d, &mut labels);
+    if ids.is_some() {
+        log("  the map has gaps in its ids: the mod numbers provinces and states 1..n, so the game's ids differ from the editor's after the first gap");
+    }
 
     // the new folder is built next to the old one, which is replaced at the end
     let mod_dir = dirs.mods.join(&meta.folder);
@@ -413,7 +424,7 @@ pub fn build(map_dir: &Path, dirs: &Dirs, log: &dyn Fn(&str)) -> Result<PathBuf>
     if out.exists() {
         std::fs::remove_dir_all(&out).with_context(|| format!("cannot remove {}", out.display()))?;
     }
-    let result = build_into(&out, map_dir, dirs, &meta, &d, &labels, &extra, log);
+    let result = build_into(&out, map_dir, dirs, &meta, &d, &labels, &extra, ids.as_ref(), log);
     let report = match result {
         Ok(r) => r,
         Err(e) => {
@@ -445,6 +456,7 @@ fn build_into(
     d: &model::MapData,
     labels: &model::Labels,
     extra: &model::Bitmaps,
+    ids: Option<&model::Renumbering>,
     log: &dyn Fn(&str),
 ) -> Result<Vec<String>> {
     let (pmap, w, h): (&[Id], usize, usize) = (&labels.px, labels.w as usize, labels.h as usize);
@@ -558,7 +570,8 @@ fn build_into(
     }
     let (cw, ch) = scaled(v.cities.size, v.map_size, (w, h));
     img::write_bmp8(&mapdir.join("cities.bmp"), cw as u32, ch as u32, &vec![v.city_index; cw * ch], &v.cities.palette)?;
-    std::fs::copy(map_dir.join("provinces.bmp"), mapdir.join("provinces.bmp")).context("cannot copy provinces.bmp")?;
+    // from the pixels read at the start (a save while the build runs does not mix in)
+    img::write_bmp24_by(&mapdir.join("provinces.bmp"), w as u32, h as u32, |i| provs[pmap[i] as usize - 1].rgb)?;
 
     let sealed_f: Vec<f32> = lc.par_iter().map(|&c| (c == SEALED) as u8 as f32).collect();
     for name in vanilla::DDS_FILES {
@@ -942,7 +955,10 @@ fn build_into(
 
     // adjacency rules: from adjacency_rules.txt next to provinces.json, if there is one
     let rules_file = map_dir.join("adjacency_rules.txt");
-    let rules_txt = if rules_file.exists() { vanilla::read_text(&rules_file)? } else { String::new() };
+    let mut rules_txt = if rules_file.exists() { vanilla::read_text(&rules_file)? } else { String::new() };
+    if let Some(r) = ids.and_then(|ids| crate::content::build::renumber_ids("map/adjacency_rules.txt", &rules_txt, ids)) {
+        rules_txt = r.0;
+    }
     let rule_names: BTreeSet<String> = Regex::new(r#"\bname\s*=\s*"?(\w+)"?"#).unwrap().captures_iter(&rules_txt).map(|c| c[1].to_string()).collect();
     let mut adj_lines = vec!["From;To;Type;Through;start_x;start_y;stop_x;stop_y;adjacency_rule_name;Comment".to_string()];
     for x in adjs {
@@ -979,10 +995,9 @@ fn build_into(
                 let Some(k) = slots_of(c) else { bail!("state {} ({}): unknown state category {c}", s.id, s.name) };
                 (c.to_string(), k)
             }
-            None if s.impassable => ("wasteland".into(), 0),
             None => {
-                let c = STATE_CATEGORIES.iter().find(|c| state_urban[&s.id] < c.0).unwrap();
-                (c.1.to_string(), c.2)
+                let c = auto_category(s.impassable, state_urban[&s.id]);
+                (c.to_string(), slots_of(c).unwrap_or(0))
             }
         };
         cat_of.insert(s.id, cat);
@@ -1014,14 +1029,7 @@ fn build_into(
         let u = state_urban[&s.id];
         let is_cap = s.id == nations[&s.nation.unwrap()].capital_state;
         let cat = cat_of[&s.id].0.clone();
-        let manpower: u64 = match s.manpower {
-            Some(m) => m,
-            None if s.impassable => 100,
-            None => {
-                let base = if is_cap { meta.manpower_base } else { meta.manpower_base / 4.0 };
-                ((base + u * meta.manpower_urban) / 100.0).round_ties_even() as u64 * 100
-            }
-        };
+        let manpower: u64 = s.manpower.unwrap_or_else(|| auto_manpower(meta, is_cap, s.impassable, u));
         *categories.entry(cat.clone()).or_default() += 1;
         let country = country_of_state(s.id);
         // the owner, who holds it when another does, the cores (the owner's unless set)
@@ -1079,7 +1087,7 @@ fn build_into(
         )?;
     }
 
-    // countries: tags, colours, flags, names, history, militia
+    // countries: tags, colours, flags, names, history
     let mut colour = countries::nation_colours(&nat_adj, &mut rng);
     for x in nations.values() {
         if let Some(c) = x.color {
@@ -1117,13 +1125,12 @@ fn build_into(
         let cap = capital[t];
         let fname = fname_re.replace_all(&ascii_name(short_name(&nat.name)), "").trim().to_string();
         let fname = if fname.is_empty() { t.clone() } else { fname };
-        let oob = if nat.no_units { String::new() } else { format!("oob = \"{t}_1936\"\n") };
         history_of.insert(t.clone(), format!("history/countries/{t} - {fname}.txt"));
         write(
             &out.join("history/countries").join(format!("{t} - {fname}.txt")),
             &format!(
                 "capital = {cap}
-{oob}
+
 # Starting tech, as a vanilla minor (Luxembourg)
 set_technology = {{
 {techs}}}
@@ -1159,24 +1166,6 @@ set_popularities = {{
                 pop["communism"],
                 pop["neutrality"],
                 techs = START_TECHS.iter().map(|t| format!("\t{t} = 1\n")).collect::<String>()
-            ),
-        )?;
-        if nat.no_units {
-            continue;
-        }
-        let mil = militia(&nat.language);
-        let home_p = vp[&cap].0;
-        let divs: String = (1..=divisions(&nat.place))
-            .map(|k| {
-                format!(
-                    "\tdivision = {{\n\t\tname = \"{k}. {mil}\"\n\t\tlocation = {home_p}\n\t\tdivision_template = \"{mil}\"\n\t\tstart_experience_factor = 0.1\n\t\tstart_equipment_factor = 0.7\n\t}}\n"
-                )
-            })
-            .collect();
-        write(
-            &out.join("history/units").join(format!("{t}_1936.txt")),
-            &format!(
-                "division_template = {{\n\tname = \"{mil}\"\n\tregiments = {{\n\t\tinfantry = {{ x = 0 y = 0 }}\n\t\tinfantry = {{ x = 0 y = 1 }}\n\t}}\n}}\n\nunits = {{\n{divs}}}\n"
             ),
         )?;
     }
@@ -1326,7 +1315,7 @@ set_popularities = {{
 
     // ------------------------------------------------------------- content
     log("nation content");
-    let content_lines = crate::content::build::copy_into(out, map_dir, &history_of)?;
+    let content_lines = crate::content::build::copy_into(out, map_dir, &history_of, ids)?;
 
     // ------------------------------------------------------------- summary
     let mut tcount: BTreeMap<&str, usize> = BTreeMap::new();
@@ -1395,8 +1384,30 @@ set_popularities = {{
     Ok(report)
 }
 
+
+/// The population (`manpower`) the build gives a state not set by hand:
+/// the base of the project (a quarter outside the nation's capital state)
+/// and so many per km² of built-up land, to the hundred; 100 for an
+/// impassable one.
+pub fn auto_manpower(meta: &ModMeta, capital: bool, impassable: bool, urban_km2: f64) -> u64 {
+    if impassable {
+        return 100;
+    }
+    let base = if capital { meta.manpower_base } else { meta.manpower_base / 4.0 };
+    ((base + urban_km2 * meta.manpower_urban) / 100.0).round_ties_even() as u64 * 100
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_state_not_set_by_hand_gets_the_projects_population() {
+        let m = ModMeta::default();
+        assert_eq!(super::auto_manpower(&m, true, false, 0.5), 125_000, "capital: the base and 50,000 per km²");
+        assert_eq!(super::auto_manpower(&m, false, false, 0.5), 50_000, "elsewhere a quarter of the base");
+        assert_eq!(super::auto_manpower(&m, false, false, 0.0123), 25_600, "to the hundred");
+        assert_eq!(super::auto_manpower(&m, true, true, 3.0), 100);
+    }
+
     use super::*;
 
     #[test]

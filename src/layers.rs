@@ -78,9 +78,57 @@ impl LayerConfig {
 }
 
 pub enum LayerState {
+    /// Hidden: not in memory. It is read when shown, and dropped again
+    /// when hidden, so only the layers on screen take memory (a decoded
+    /// relief GeoTIFF can take a gigabyte).
+    Unloaded,
     Loading(Arc<Progress>),
     Ready(LayerData),
     Failed(String),
+}
+
+/// What to do with a layer for whether it is shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Residency {
+    /// Read it.
+    Load,
+    /// Drop its data (and a read still running).
+    Drop,
+    /// Forget that it failed: tried again when shown again.
+    Retry,
+    Keep,
+}
+
+impl LayerState {
+    /// Only shown layers are in memory.
+    pub fn residency(&self, shown: bool) -> Residency {
+        match (self, shown) {
+            (LayerState::Unloaded, true) => Residency::Load,
+            (LayerState::Ready(_) | LayerState::Loading(_), false) => Residency::Drop,
+            (LayerState::Failed(_), false) => Residency::Retry,
+            _ => Residency::Keep,
+        }
+    }
+}
+
+/// What is known of a layer once it was read: kept when it is dropped
+/// (hidden), so it can still be placed, framed and described.
+#[derive(Clone, Debug)]
+pub enum Known {
+    Raster { width: u32, height: u32, file_geo: FileGeoInfo, format: String, bytes: usize },
+    Vector { bounds: [f64; 4], summary: String },
+}
+
+impl Known {
+    pub fn of(data: &LayerData) -> Known {
+        match data {
+            LayerData::Raster(r) => Known::Raster { width: r.width, height: r.height, file_geo: r.file_geo.clone(), format: r.format.clone(), bytes: r.bytes },
+            LayerData::Vector(v) => Known::Vector {
+                bounds: v.bounds,
+                summary: format!("{} boundary ways · {} water lines · {} points · {} named areas", v.ways.len(), v.water.len(), v.n_points, v.areas.len()),
+            },
+        }
+    }
 }
 
 pub enum LayerData {
@@ -138,6 +186,8 @@ pub struct Layer {
     pub id: u64,
     pub cfg: LayerConfig,
     pub state: LayerState,
+    /// What was learnt when it was last read (None: never read).
+    pub known: Option<Known>,
 }
 
 /// Effective georeferencing of a raster layer.
@@ -159,34 +209,52 @@ impl Layer {
         matches!(self.state, LayerState::Loading(_))
     }
 
+    /// Not in memory (hidden).
+    pub fn is_unloaded(&self) -> bool {
+        matches!(self.state, LayerState::Unloaded)
+    }
+
+    /// A raster's size and the georeference of its file: from its data, or
+    /// from when it was last read.
+    pub fn shape(&self) -> Option<(u32, u32, &FileGeoInfo)> {
+        match (&self.state, &self.known) {
+            (LayerState::Ready(LayerData::Raster(r)), _) => Some((r.width, r.height, &r.file_geo)),
+            (_, Some(Known::Raster { width, height, file_geo, .. })) => Some((*width, *height, file_geo)),
+            _ => None,
+        }
+    }
+
     /// Georeferencing in effect: manual override, else the file's own.
     pub fn georef(&self) -> Option<Georef> {
         if let Some(o) = &self.cfg.georef_override {
             return Some(Georef { transform: o.transform, crs: o.crs, source: o.note.clone() });
         }
-        let r = self.raster()?;
-        let (gt, src) = r.file_geo.transform.clone()?;
-        let crs = r.file_geo.crs.as_ref().map(|c| c.0).unwrap_or(Crs::UNKNOWN);
+        let (_, _, fg) = self.shape()?;
+        let (gt, src) = fg.transform.clone()?;
+        let crs = fg.crs.as_ref().map(|c| c.0).unwrap_or(Crs::UNKNOWN);
         Some(Georef { transform: gt, crs, source: src })
     }
 
     /// Mapping between raster pixels and world coordinates, if known.
     pub fn placement(&self, project_crs: Crs) -> Option<Placement> {
         let g = self.georef()?;
-        let r = self.raster()?;
-        Placement::new(g.transform, g.crs, project_crs, self.cfg.offset, r.width, r.height)
+        let (w, h, _) = self.shape()?;
+        Placement::new(g.transform, g.crs, project_crs, self.cfg.offset, w, h)
     }
 
-    /// World-space bounds (min x, min y, max x, max y) of the layer.
+    /// World-space bounds (min x, min y, max x, max y) of the layer (also
+    /// of a hidden one read before).
     pub fn world_bounds(&self, project_crs: Crs) -> Option<[f64; 4]> {
-        match &self.state {
-            LayerState::Ready(LayerData::Raster(_)) => self.placement(project_crs).map(|p| p.bounds()),
-            LayerState::Ready(LayerData::Vector(v)) => {
-                let o = self.cfg.offset;
-                (v.bounds[0] <= v.bounds[2]).then(|| [v.bounds[0] + o[0], v.bounds[1] + o[1], v.bounds[2] + o[0], v.bounds[3] + o[1]])
-            }
-            _ => None,
+        if self.shape().is_some() {
+            return self.placement(project_crs).map(|p| p.bounds());
         }
+        let b = match (&self.state, &self.known) {
+            (LayerState::Ready(LayerData::Vector(v)), _) => v.bounds,
+            (_, Some(Known::Vector { bounds, .. })) => *bounds,
+            _ => return None,
+        };
+        let o = self.cfg.offset;
+        (b[0] <= b[2]).then(|| [b[0] + o[0], b[1] + o[1], b[2] + o[0], b[3] + o[1]])
     }
 }
 
@@ -275,5 +343,42 @@ impl Placement {
                 (a * b).sqrt()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_hidden_layer_keeps_its_place() {
+        let gt = GeoTransform::north_up(1000.0, 2000.0, 10.0, 10.0);
+        let file_geo = FileGeoInfo { transform: Some((gt, "file".into())), crs: Some((Crs::LAEA_EUROPE, "file".into())), nodata: None };
+        let mut l = Layer { id: 1, cfg: LayerConfig::new(PathBuf::from("a.tif")), state: LayerState::Unloaded, known: None };
+        // never read: nothing known
+        assert!(l.world_bounds(Crs::LAEA_EUROPE).is_none() && l.georef().is_none() && l.is_unloaded());
+        // read once, then dropped: still placed
+        l.known = Some(Known::Raster { width: 30, height: 20, file_geo, format: "x".into(), bytes: 600 });
+        assert_eq!(l.world_bounds(Crs::LAEA_EUROPE), Some([1000.0, 1800.0, 1300.0, 2000.0]));
+        assert_eq!(l.georef().map(|g| g.source), Some("file".to_string()));
+        l.cfg.offset = [5.0, -5.0];
+        assert_eq!(l.world_bounds(Crs::LAEA_EUROPE), Some([1005.0, 1795.0, 1305.0, 1995.0]));
+        // an OSM layer: its bounds
+        let mut v = Layer { id: 2, cfg: LayerConfig::new(PathBuf::from("a.osm.pbf")), state: LayerState::Unloaded, known: Some(Known::Vector { bounds: [1.0, 2.0, 3.0, 4.0], summary: String::new() }) };
+        assert_eq!(v.world_bounds(Crs::LAEA_EUROPE), Some([1.0, 2.0, 3.0, 4.0]));
+        v.known = Some(Known::Vector { bounds: [f64::MAX, f64::MAX, f64::MIN, f64::MIN], summary: String::new() });
+        assert_eq!(v.world_bounds(Crs::LAEA_EUROPE), None, "an empty extract has no bounds");
+    }
+
+    #[test]
+    fn only_shown_layers_are_in_memory() {
+        let loading = LayerState::Loading(Arc::new(Progress::default()));
+        let failed = LayerState::Failed("gone".into());
+        assert_eq!(LayerState::Unloaded.residency(true), Residency::Load);
+        assert_eq!(LayerState::Unloaded.residency(false), Residency::Keep);
+        assert_eq!(loading.residency(false), Residency::Drop, "hidden while it is read");
+        assert_eq!(loading.residency(true), Residency::Keep);
+        assert_eq!(failed.residency(true), Residency::Keep, "no retry while shown");
+        assert_eq!(failed.residency(false), Residency::Retry);
     }
 }

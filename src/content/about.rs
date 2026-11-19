@@ -37,8 +37,32 @@ const OF_KIND: &[(Kind, &str, About)] = &[
         K::CountryHistory,
         "oob",
         a(
-            "Order of battle: the file of division templates and divisions the country starts with, history/units/<name>.txt, written without the .txt. The build writes oob = \"TAG_1936\" with the divisions it places from the map (unless the nation has no units in the map editor); an oob here comes later, and the game uses the last one, so the country starts with the divisions of your file instead. Make the file on the Division templates page. To give divisions later in the game, use the effect load_oob in a focus or an event.",
-            "oob = \"TAG_1936\"",
+            "Order of battle: the file of division templates and divisions the country starts with, history/units/<name>.txt, written without the .txt. The game takes the templates of that file, and its divisions (units = { division = { name location division_template start_experience_factor start_equipment_factor start_manpower_factor } }), each of one of those templates and standing in a province. Experience is 0 to 1 (Trained from 0.1, Regular from 0.3); the equipment factor is the share it gets, not from the stockpile; without start_manpower_factor its men come out of the country's reserves, as many as there are. The build places no divisions: without an oob the country starts with none. The Army page (below Division templates) makes the file and this line, and places the divisions by clicking provinces on the map; the templates are made in the division designer. To give divisions later in the game, use the effect load_oob in a focus or an event.",
+            "oob = \"TAG_army\"",
+        ),
+    ),
+    (
+        K::CountryHistory,
+        "set_naval_oob",
+        a(
+            "The country's starting navy: the file of its fleets, history/units/<name>.txt, written without the .txt. Each fleet is stationed at a naval base (naval_base = <province>), and has task forces (location = <province>) of ships, each of a design of the country (version_name = the design's name) on a hull. Make and edit it on the Navy page (below Division templates), which also makes this line; the naval bases are those placed in the map editor (Supply level, the port tool). The game's own histories load it inside if = { limit = { has_dlc = \"Man the Guns\" } } with a file of ships without designs in its else, from before Man the Guns became part of the game: that check now always holds.",
+            "set_naval_oob = \"TAG_naval\"",
+        ),
+    ),
+    (
+        K::CountryHistory,
+        "set_air_oob",
+        a(
+            "The country's starting air force: the file of its air wings, history/units/<name>.txt, written without the .txt. It has air_wings = { <state> = { <equipment> = { owner = \"TAG\" amount = 50 version_name = \"...\" } name = \"...\" } }: each state is an air base (placed in the map editor: a state's buildings, air_base; a level holds 200 planes), each wing an amount of planes of one equipment, of a design of the country when version_name is given. With By Blood Alone the planes are airframes with modules (small_plane_airframe_1 ...); without it they are the old models (fighter_equipment_1 ...), so the game's histories load one file inside if = { limit = { has_dlc = \"By Blood Alone\" } set_air_oob = \"TAG_air_bba\" } and another in its else = { set_air_oob = \"TAG_air_legacy\" }. The Air page makes both files and these lines, and keeps the file without the DLC in step with the other.",
+            "set_air_oob = \"TAG_air_bba\"",
+        ),
+    ),
+    (
+        K::CountryHistory,
+        "create_equipment_variant",
+        a(
+            "A design the country has at the start: for a ship, a hull (type = ship_hull_light_1 ...) with a module in each slot (modules = { fixed_ship_battery_slot = ship_light_battery_1 ... }; a slot left out keeps the hull's default, empty leaves it empty). The fleets name it in version_name; the country builds it in its dockyards. The country needs the technologies of the hull and of each module; obsolete = yes keeps it out of the production list. The Navy page is the ship designer: it lists the slots, the modules the country has, the checks and the stats. Planes are designed the same way on the Air page (type = an airframe such as small_plane_airframe_1, which only exists with By Blood Alone: those designs go inside if = { limit = { has_dlc = \"By Blood Alone\" } }); for players without it, a design of the same name on an old model with upgrades instead of modules (type = fighter_equipment_1 upgrades = { plane_gun_upgrade = 2 }) goes in an if with NOT = { has_dlc = \"By Blood Alone\" }. Tanks have designs the same way (type = a chassis).",
+            "create_equipment_variant = {\n\tname = \"Etsch Class\"\n\ttype = ship_hull_light_1\n\tmodules = {\n\t\tfixed_ship_battery_slot = ship_light_battery_1\n\t\tfixed_ship_engine_slot = light_ship_engine_1\n\t}\n}",
         ),
     ),
     (
@@ -78,6 +102,14 @@ const OF_KIND: &[(Kind, &str, About)] = &[
         K::CountryHistory,
         "set_technology",
         a("Technologies the country has at the start: the id of each, = 1. The build gives every nation the starting technologies of a minor (infantry weapons, trucks, artillery, support, engineers, trains); these come on top.", "set_technology = {\n\tinfantry_weapons1 = 1\n\tsupport_weapons = 1\n}"),
+    ),
+    (
+        K::CountryHistory,
+        "add_equipment_to_stockpile",
+        a(
+            "Puts equipment in the country's stockpile at the start: type is the model (infantry_equipment_1, not the family infantry_equipment), amount how many (a negative amount takes some away). producer is the country that made it, as the stockpile shows it (with a negative amount, leaving it out takes from every maker's); variant_name a design of that model made with create_equipment_variant (a tank design). Divisions take equipment from the stockpile, so a model the country cannot make yet can still equip them. Some models belong to a DLC: without No Step Back the light tanks are light_tank_equipment_1, with it light_tank_chassis_1; give each inside if = { limit = { has_dlc = \"No Step Back\" } } and its else, as the game's own history does.",
+            "add_equipment_to_stockpile = {\n\ttype = infantry_equipment_1\n\tamount = 1000\n}",
+        ),
     ),
     (
         K::CountryHistory,

@@ -124,7 +124,7 @@ pub fn data_dir() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join(".local/share"))
+        .unwrap_or_else(|| std::env::home_dir().unwrap_or_default().join(".local/share"))
         .join("mod-helper")
 }
 
